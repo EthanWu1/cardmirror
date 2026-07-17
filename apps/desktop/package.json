@@ -1,0 +1,175 @@
+{
+  "name": "@cardmirror/desktop",
+  "version": "0.1.0-beta.14",
+  "description": "CardMirror — Electron desktop wrapper",
+  "author": "Anthony Trufanov",
+  "homepage": "https://github.com/EthanWu1/cardmirror",
+  "private": true,
+  "type": "commonjs",
+  "main": "dist/main.js",
+  "scripts": {
+    "build:main": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json",
+    "build:renderer": "npm --prefix ../.. run build -- --base=./",
+    "start:web": "npm --prefix ../.. run dev",
+    "start:electron": "wait-on http://localhost:5173 && electron .",
+    "dev": "npm run build:native && npm run build:main && concurrently --kill-others-on-fail --names \"vite,electron\" --prefix-colors \"cyan,magenta\" \"npm:start:web\" \"npm:start:electron\"",
+    "fetch:voice": "node scripts/fetch-voice-assets.cjs",
+    "build:native": "node scripts/build-ax-suppress.cjs",
+    "bake:relay": "node scripts/inject-relay-token.cjs",
+    "pack": "npm run bake:relay && npm run fetch:voice && npm run build:native && npm run build:renderer && npm run build:main && electron-builder --dir",
+    "dist": "npm run bake:relay && npm run fetch:voice && npm run build:native && npm run build:renderer && npm run build:main && electron-builder",
+    "release": "npm run bake:relay && npm run fetch:voice && npm run build:native && npm run build:renderer && npm run build:main && electron-builder --publish always"
+  },
+  "build": {
+    "appId": "com.cardmirror.app",
+    "productName": "CardMirror",
+    "executableName": "cardmirror",
+    "electronVersion": "42.2.0",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "dist/voice/**",
+      "node_modules/koffi/**",
+      "node_modules/@koromix/**"
+    ],
+    "toolsets": {
+      "winCodeSign": "1.1.0"
+    },
+    "extraResources": [
+      {
+        "from": "../../dist",
+        "to": "renderer",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "resources/new-template.cmir",
+        "to": "new-template.cmir"
+      },
+      {
+        "from": "resources/voice",
+        "to": "voice"
+      },
+      {
+        "from": "resources/native",
+        "to": "native"
+      },
+      {
+        "from": "resources/flow",
+        "to": "flow"
+      }
+    ],
+    "fileAssociations": [
+      {
+        "ext": "docx",
+        "name": "Word Document",
+        "description": "Microsoft Word document",
+        "role": "Editor"
+      },
+      {
+        "ext": "cmir",
+        "name": "CardMirror Document",
+        "description": "CardMirror native document",
+        "role": "Editor"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "artifactName": "CardMirror-${version}-${arch}.${ext}",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "extendInfo": {
+        "NSAppSleepDisabled": true,
+        "NSMicrophoneUsageDescription": "CardMirror uses the microphone for voice control and dictation."
+      },
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "linux": {
+      "category": "Office",
+      "maintainer": "Anthony Trufanov <ant981228@gmail.com>",
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "pacman",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "cardmirror-${version}.${ext}"
+    },
+    "pacman": {
+      "depends": [
+        "c-ares",
+        "ffmpeg",
+        "gtk3",
+        "libevent",
+        "libnotify",
+        "libvpx",
+        "libxslt",
+        "libxss",
+        "minizip",
+        "nss",
+        "re2",
+        "snappy",
+        "libxcrypt-compat"
+      ]
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "EthanWu1",
+      "repo": "cardmirror"
+    }
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.3",
+    "koffi": "^3.0.2"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "electron": "^42.2.0",
+    "electron-builder": "^26.8.1",
+    "typescript": "^5.7.2",
+    "wait-on": "^8.0.1"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "format": "cardmirror-doc",
+  "formatVersion": 1,
+  "createdBy": "CardMirror (new-file template)",
+  "createdAt": "2026-05-31T00:33:37.303Z",
+  "doc": {
+    "type": "doc",
+    "content": [
+      {
+        "type": "paragraph",
+        "attrs": {
+          "alignment": null,
+          "indent": 0,
+          "spacing": null
+        }
+      }
+    ]
+  }
+}

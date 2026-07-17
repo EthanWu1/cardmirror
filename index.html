@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="A debate-card editor that interoperates with Advanced Verbatim — cut, format, and organize evidence offline." />
+    <meta name="theme-color" content="#2563eb" />
+    <link rel="icon" type="image/png" href="favicon.png" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <title>CardMirror</title>
+    <link rel="stylesheet" href="/src/editor/style.css" />
+    <link rel="stylesheet" href="/src/editor/icons.css" />
+  </head>
+  <body>
+    <header id="ribbon">
+      <!-- Timer panel — mounted by `timer-ui.ts`. Hidden until the
+           user toggles it via the ⏱ button in the right stack
+           (per-window transient setting). Lives at the LEFT edge
+           of the ribbon when shown; the rest of the ribbon shifts
+           right to accommodate it. -->
+      <section id="timer-panel" class="ribbon-section pmd-timer-panel" hidden></section>
+      <div class="ribbon-section ribbon-left">
+        <!-- Undo / redo stack — hidden unless the showUndoRedoButtons
+             setting is on (html.pmd-undoredo-hidden, mirroring the
+             quick-cards cluster). Sits left of the file buttons;
+             right of the timer panel when that's shown on the left. -->
+        <div id="undo-redo-stack" class="ribbon-button-stack">
+          <button id="undo-btn" type="button" title="Undo" aria-label="Undo"><span class="pmd-icon pmd-icon-undo" aria-hidden="true"></span></button>
+          <button id="redo-btn" type="button" title="Redo" aria-label="Redo"><span class="pmd-icon pmd-icon-redo" aria-hidden="true"></span></button>
+        </div>
+        <div id="file-command-stack" class="ribbon-button-stack ribbon-file-command-stack">
+          <button id="open-btn" type="button" title="Open a document" aria-label="Open"><span class="pmd-icon pmd-icon-open" aria-hidden="true"></span></button>
+          <button id="autosave-btn" type="button" aria-pressed="false"
+                  title="Autosave is off — click to turn on" aria-label="Toggle autosave"><span class="pmd-icon pmd-icon-autosave" aria-hidden="true"></span></button>
+          <button id="new-btn" type="button" title="New document" aria-label="New document"><span class="pmd-icon pmd-icon-new" aria-hidden="true"></span></button>
+          <button id="home-btn" type="button" class="ribbon-home-btn"
+                  title="Home" aria-label="Home"><span class="pmd-icon pmd-icon-home" aria-hidden="true"></span></button>
+          <button id="export-btn" type="button" disabled title="Save" aria-label="Save"><span class="pmd-icon pmd-icon-save" aria-hidden="true"></span></button>
+          <button id="settings-btn" type="button" title="Settings" aria-label="Settings"><span class="pmd-icon pmd-icon-settings" aria-hidden="true"></span></button>
+        </div>
+        <!-- Speech-doc buttons. Same 2-row stack rhythm as the file
+             buttons so they line up. Visible only in multi-doc mode
+             (a CSS rule hides the whole stack in single-doc — the
+             commands don't make sense without a second pane). Order
+             with `grid-auto-flow: row` so HTML reads:
+                 new          mark/unmark
+                 send-cursor  send-end          -->
+        <div id="speech-stack" class="ribbon-button-stack ribbon-speech-stack">
+          <button id="speech-new-btn" type="button"
+                  title="New speech document" aria-label="New speech document"><span class="pmd-icon pmd-icon-mic" aria-hidden="true"></span></button>
+          <button id="speech-mark-btn" type="button"
+                  aria-pressed="false" title="Mark / unmark the active doc as the speech doc"
+                  aria-label="Mark active doc as speech doc"><span class="pmd-icon pmd-icon-speech-mark" aria-hidden="true"></span></button>
+          <button id="speech-send-cursor-btn" type="button"
+                  title="Send to speech doc at cursor (`)" aria-label="Send to speech at cursor"><span class="pmd-icon pmd-icon-send-cursor" aria-hidden="true"></span></button>
+          <button id="speech-send-end-btn" type="button"
+                  title="Send to speech doc at end (Alt-`)" aria-label="Send to speech at end"><span class="pmd-icon pmd-icon-send-end" aria-hidden="true"></span></button>
+        </div>
+        <!-- Quick Cards 2×2 cluster (row-major):
+               search   tag picker
+               manage   add
+             Visible in BOTH single- and multi-doc (quick cards work
+             everywhere). Search / Tag Picker / Manage are stubbed for
+             now; Add is live. -->
+        <div id="quickcards-stack" class="ribbon-button-stack ribbon-quickcards-stack" role="group" aria-label="Quick Cards">
+          <button id="qc-search-btn" type="button"
+                  title="Toggle command bar" aria-label="Toggle command bar"><span class="pmd-icon pmd-icon-search" aria-hidden="true"></span></button>
+          <button id="qc-tagpicker-btn" type="button"
+                  title="Filter quick cards by tag" aria-label="Quick card tag picker"><span class="pmd-icon pmd-icon-tag" aria-hidden="true"></span></button>
+          <button id="qc-manage-btn" type="button"
+                  title="Manage quick cards" aria-label="Manage quick cards"><span class="pmd-icon pmd-icon-manage" aria-hidden="true"></span></button>
+          <button id="qc-add-btn" type="button"
+                  title="Add quick card from selection" aria-label="Add quick card"><span class="pmd-icon pmd-icon-add" aria-hidden="true"></span></button>
+        </div>
+        <div id="formatting-panel" class="ribbon-formatting-panel" role="group" aria-label="Formatting panel">
+          <!-- Column-major order so the 3×2 grid lays out as:
+                 Pocket   Hat      Analytic
+                 Tag      Block    Undertag -->
+          <button id="style-pocket-btn" class="formatting-panel-btn formatting-panel-pocket" type="button">Pocket</button>
+          <button id="style-tag-btn" class="formatting-panel-btn formatting-panel-tag" type="button">Tag</button>
+          <button id="style-hat-btn" class="formatting-panel-btn formatting-panel-hat" type="button">Hat</button>
+          <button id="style-block-btn" class="formatting-panel-btn formatting-panel-block" type="button">Block</button>
+          <button id="style-analytic-btn" class="formatting-panel-btn formatting-panel-analytic" type="button">Analytic</button>
+          <button id="style-undertag-btn" class="formatting-panel-btn formatting-panel-undertag" type="button">Undertag</button>
+        </div>
+        <div id="cite-panel" class="ribbon-cite-panel" role="group" aria-label="Inline marks">
+          <!-- Column-major 2×2 layout:
+                 Cite       Emphasis
+                 Underline  Normal -->
+          <button id="cite-btn" class="formatting-panel-btn formatting-panel-cite" type="button">Cite</button>
+          <button id="underline-btn" class="formatting-panel-btn formatting-panel-underline" type="button">Underline</button>
+          <button id="emphasis-btn" class="formatting-panel-btn formatting-panel-emphasis" type="button">Emphasis</button>
+          <button id="normal-btn" class="formatting-panel-btn formatting-panel-normal" type="button">Clear</button>
+        </div>
+        <div id="color-panel" class="ribbon-color-panel" role="group" aria-label="Colors">
+          <!-- Three split buttons: main click applies current color, arrow
+               opens a swatch picker. Each control shows a colored bar at
+               the bottom reflecting the active selection. -->
+          <div class="ribbon-color-control" data-control="highlight">
+            <button id="highlight-btn" class="ribbon-color-main" type="button" title="Highlight (F11)">
+              <span class="ribbon-color-glyph pmd-icon pmd-icon-highlight" aria-hidden="true"></span>
+              <span class="ribbon-color-bar" id="highlight-bar"></span>
+            </button>
+            <button id="highlight-picker-btn" class="ribbon-color-arrow" type="button" title="Highlight color"
+                    aria-haspopup="true" aria-expanded="false"><span class="pmd-icon pmd-icon-chevron-down" aria-hidden="true"></span></button>
+          </div>
+          <div class="ribbon-color-control" data-control="shading">
+            <button id="shading-btn" class="ribbon-color-main" type="button" title="Background color">
+              <span class="ribbon-color-glyph pmd-icon pmd-icon-shading" aria-hidden="true"></span>
+              <span class="ribbon-color-bar" id="shading-bar"></span>
+            </button>
+            <button id="shading-picker-btn" class="ribbon-color-arrow" type="button" title="Background color"
+                    aria-haspopup="true" aria-expanded="false"><span class="pmd-icon pmd-icon-chevron-down" aria-hidden="true"></span></button>
+          </div>
+          <div class="ribbon-color-control" data-control="fontcolor">
+            <button id="fontcolor-btn" class="ribbon-color-main" type="button" title="Font color">
+              <span class="ribbon-color-glyph" id="fontcolor-glyph">A</span>
+              <span class="ribbon-color-bar" id="fontcolor-bar"></span>
+            </button>
+            <button id="fontcolor-picker-btn" class="ribbon-color-arrow" type="button" title="Font color"
+                    aria-haspopup="true" aria-expanded="false"><span class="pmd-icon pmd-icon-chevron-down" aria-hidden="true"></span></button>
+          </div>
+          <!-- Font size split-control: input for the current pt
+               (Enter / blur applies), arrow opens a preset-size
+               dropdown. Sits in the 4th cell of the color panel's
+               2×2 grid. -->
+          <div class="ribbon-color-control ribbon-font-size-control" data-control="fontsize">
+            <input id="font-size-input" class="ribbon-font-size-input" type="text"
+                   inputmode="numeric" autocomplete="off" spellcheck="false"
+                   aria-label="Font size at cursor" title="Font size — Enter to apply" />
+            <button id="font-size-picker-btn" class="ribbon-color-arrow" type="button" title="Font size"
+                    aria-haspopup="true" aria-expanded="false"><span class="pmd-icon pmd-icon-chevron-down" aria-hidden="true"></span></button>
+          </div>
+          <!-- 3rd column: increment/decrement font size of selection. -->
+          <button id="font-size-up-btn" class="ribbon-font-size-step" type="button"
+                  title="Increase font size" aria-label="Increase font size"
+                  ><span>A</span><span class="ribbon-font-size-step-arrow ribbon-font-size-step-up-arrow pmd-icon pmd-icon-chevron-up" aria-hidden="true"></span></button>
+          <button id="font-size-down-btn" class="ribbon-font-size-step" type="button"
+                  title="Decrease font size" aria-label="Decrease font size"
+                  ><span>A</span><span class="ribbon-font-size-step-arrow pmd-icon pmd-icon-chevron-down" aria-hidden="true"></span></button>
+        </div>
+        <!-- Document/card-level utility menus. "Doc" holds doc-wide
+             operations (Verbatim's Doc menu — standardize highlighting
+             across the whole document, etc.). "Card" holds operations
+             scoped to a selection (typically: a card the user is
+             actively editing). Stacked vertically like the other
+             two-button panels. -->
+        <div id="doc-menu-panel" class="ribbon-doc-menu-panel" role="group" aria-label="Document utilities">
+          <button id="doc-menu-btn" class="ribbon-doc-menu-btn" type="button"
+                  title="Document utilities" aria-haspopup="true" aria-expanded="false">Doc <span class="ribbon-doc-menu-arrow pmd-icon pmd-icon-chevron-down" aria-hidden="true"></span></button>
+          <button id="card-menu-btn" class="ribbon-doc-menu-btn" type="button"
+                  title="Card utilities" aria-haspopup="true" aria-expanded="false">Card <span class="ribbon-doc-menu-arrow pmd-icon pmd-icon-chevron-down" aria-hidden="true"></span></button>
+        </div>
+        <div id="view-ops-panel" class="ribbon-doc-ops-panel" role="group" aria-label="View tools">
+          <!-- View tools stacked vertically: read mode on top,
+               nav-pane toggle below. Word-count selection summary
+               lives on the status bar (next to the live read-aloud
+               counter) since they answer the same family of
+               question. -->
+          <button id="read-mode-btn" class="ribbon-doc-ops-btn" type="button"
+                  title="Read mode" aria-label="Read mode"><span class="pmd-icon pmd-icon-read-mode" aria-hidden="true"></span></button>
+          <button id="nav-pane-toggle-btn" class="ribbon-doc-ops-btn" type="button"
+                  aria-pressed="true" title="Show / hide the navigation pane"
+                  aria-label="Toggle nav pane"><span class="pmd-icon pmd-icon-nav-toggle" aria-hidden="true"></span></button>
+        </div>
+        <!-- Custom user-configured buttons (up to 6), populated from settings
+             by renderCustomRibbonButtons(). Sits to the right of the comments
+             cluster; hidden entirely when none are configured, and the third
+             panel to disappear in the ribbon's narrow cascade. -->
+        <div id="custom-ribbon-panel" class="ribbon-doc-ops-panel ribbon-doc-ops-panel-3col" role="group" aria-label="Custom buttons" hidden></div>
+      </div>
+      <div class="ribbon-section ribbon-center">
+        <!-- Active doc filename chip. Opt-in via Settings →
+             Appearance → "Show doc name in ribbon" (default off),
+             gated by `html.pmd-doc-name-chip-on`. Even when on, the
+             chip is auto-hidden in multi-pane mode (each per-pane
+             chip already shows its slot's filename) and when the
+             active doc has no filename yet. The ribbon resizer
+             will hide it after the formatting panel when the
+             ribbon runs out of horizontal room. -->
+        <!-- Starts `hidden` — the chip shouldn't appear (even as an
+             empty pill) until JS confirms there's a filename to put
+             in it. `updateWindowTitle` toggles `[hidden]` on / off
+             based on the active filename; the setting class on <html>
+             gates the chip behind the user opt-in. -->
+        <div id="doc-name-chip" class="pmd-doc-name-chip" title="" hidden>
+          <span class="pmd-doc-name-chip-text" id="doc-name-chip-text"></span>
+        </div>
+      </div>
+      <div class="ribbon-section ribbon-right">
+        <div id="collab-top-presence" class="pmd-collab-top-presence" hidden
+             aria-label="People editing this document"></div>
+        <!-- Right-side utility grid. Desktop adds custom window controls
+             because the Electron BrowserWindow is frameless. -->
+        <div class="ribbon-right-grid">
+          <button id="window-minimize-btn" class="ribbon-window-btn" type="button"
+                  title="Minimize" aria-label="Minimize window"><span class="pmd-icon pmd-icon-minus" aria-hidden="true"></span></button>
+          <button id="window-maximize-btn" class="ribbon-window-btn" type="button"
+                  title="Maximize or restore" aria-label="Maximize or restore window"><span class="pmd-icon pmd-icon-expand" aria-hidden="true"></span></button>
+          <button id="window-close-btn" class="ribbon-window-btn ribbon-window-close-btn" type="button"
+                  title="Close" aria-label="Close window"><span class="pmd-icon pmd-icon-close" aria-hidden="true"></span></button>
+        </div>
+      </div>
+    </header>
+    <div id="nav-panel"></div>
+    <div id="speech-doc-banner" hidden>
+      <span class="pmd-speech-doc-banner-icon pmd-icon pmd-icon-mic" aria-hidden="true"></span>
+      <span class="pmd-speech-doc-banner-label">Speech document</span>
+    </div>
+    <main id="app">
+      <!-- Inner flex row wrapping the editor + comments column.
+           Lives INSIDE #app rather than #app itself owning the
+           flex because #app is `position: fixed` + `overflow-y:
+           auto` (the bounded scroller for single-doc), so its
+           flex container's cross-axis would be viewport-bounded
+           — leaving the comments column's background stranded
+           at the top viewport. The inner row sizes to content
+           (`min-height: 100%`), letting the column stretch to
+           the editor's full doc-content height so its background
+           covers the column for the whole scroll extent. Hidden
+           in multi-doc layout via the existing `body.pmd-multi-
+           doc #editor / #comments-column` display:none rule (and
+           via the wrapper's own rule in style.css). -->
+      <div class="pmd-editor-row">
+        <section id="editor"></section>
+        <!-- Right-side comments column. Hidden by default.
+             When visible it sits flex-side-by-side with
+             #editor; when hidden it has display:none and the
+             editor takes full width. -->
+        <aside id="comments-column" class="pmd-comments-column" aria-label="Comments" hidden></aside>
+      </div>
+    </main>
+    <button id="nav-pane-pull-tab" type="button"
+            title="Show navigation pane" aria-label="Show navigation pane"><span class="pmd-icon pmd-icon-chevron-right" aria-hidden="true"></span></button>
+    <div id="status-bar">
+      <button id="word-count-btn" class="status-bar-btn" type="button"
+              title="Word Count Selection" aria-label="Word count selection summary">Σ</button>
+      <div id="word-count-display" class="status-segment" title="Read-aloud word count and read time">
+        <span id="word-count-text">—</span>
+      </div>
+      <!-- Cursor-position color readout. Visible only when at
+           least one of the highlight / shading display overrides
+           is on; reports the ACTUAL stored colors at the cursor
+           (not the rendered override colors) so the user retains
+           awareness of what's encoded in the doc. -->
+      <div id="cursor-color-display" class="status-segment" hidden
+           title="Highlight and shading colors stored on the run at the cursor">
+        <span id="cursor-color-text">—</span>
+      </div>
+      <!-- Collaboration-session sync status. Hidden unless a session is
+           active (the lazily-loaded collab-ui module owns its text). -->
+      <div id="collab-chip" class="status-segment" hidden
+           title="Collaboration session status"></div>
+      <div id="pairing-status-controls" class="status-segment pmd-status-pairing-controls"
+           title="Send and receive shared cards"></div>
+      <div class="status-spacer"></div>
+      <div class="zoom-controls" title="Zoom">
+        <button id="zoom-out-btn" type="button" aria-label="Zoom out"><span class="pmd-icon pmd-icon-minus" aria-hidden="true"></span></button>
+        <span id="zoom-pct">100%</span>
+        <button id="zoom-in-btn" type="button" aria-label="Zoom in"><span class="pmd-icon pmd-icon-plus" aria-hidden="true"></span></button>
+        <button id="zoom-reset-btn" type="button" aria-label="Reset zoom to 100%" title="Reset to 100%"><span class="pmd-icon pmd-icon-reset" aria-hidden="true"></span></button>
+      </div>
+    </div>
+    <script type="module" src="/src/editor/index.ts"></script>
+  </body>
+</html>

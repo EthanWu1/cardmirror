@@ -1,0 +1,22 @@
+// Cloudflare Workers config for the WEB edition (cardmirror.app).
+// Assets-only deployment: no Worker script, just the Vite build output
+// served as static files from Cloudflare's edge. Deployed by the
+// Workers Builds Git integration (`npx wrangler deploy` after
+// `npm run build`); the desktop/Electron builds don't touch this.
+{
+  "name": "cardmirror",
+  "compatibility_date": "2026-07-13",
+  // The app's ONE canonical origin is https://cardmirror.app (attached as a
+  // custom domain in the dashboard). The default workers.dev route is
+  // disabled so users can't accidentally adopt a second origin — per-origin
+  // browser storage would silently split their settings/recents between the
+  // two. Per-branch preview URLs stay on (they're for us, not users).
+  "workers_dev": false,
+  "preview_urls": true,
+  "assets": {
+    "directory": "./dist",
+    // Unknown paths serve index.html — the app is a single page, and
+    // this keeps deep links / stale PWA navigations from 404ing.
+    "not_found_handling": "single-page-application"
+  }
+}
