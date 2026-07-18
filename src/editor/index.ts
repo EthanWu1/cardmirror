@@ -161,11 +161,11 @@ import {
   flowDirtyEquals,
   flowBaselineForRound,
   flowFormatForFilename,
-  resolveFlowReplacementDecision,
   shouldClearFlowStateBeforeBlankDocMount,
   suggestedFlowSaveName,
   type OpenedFlowFormat,
 } from './flow/flow-single-pane.js';
+import { shouldPromptBeforeRoute, isAutosaveBackedRoute } from './autosave-route-policy.js';
 import './flow/flow-workspace.css';
 import {
   readModePlugin,
@@ -2002,14 +2002,7 @@ async function onNewDocClicked(): Promise<void> {
   // Web edition: no other window to open into, so New replaces
   // what's here. Only prompt to save if there are actual edits to
   // lose — the pristine starter is disposable.
-  if (activeContentDirty()) {
-    const choice = await confirmNewDocOverwrite();
-    if (choice === 'cancel') return;
-    if (choice === 'save') {
-      const saved = await runSaveFlow();
-      if (!saved) return;
-    }
-  }
+  if (!(await prepareActiveContentForReplacement())) return;
   // Drop the old session's journal before swapping in a new doc —
   // the user's choice (or the pristine-starter shortcut) above is
   // the authoritative signal that they're done with the previous
@@ -2039,14 +2032,7 @@ async function onNewDocClicked(): Promise<void> {
  *  join without touching the room). */
 async function replaceWithSessionDoc(): Promise<boolean> {
   if (multiDocActive) return false; // sessions are single-doc-window only
-  if (activeContentDirty()) {
-    const choice = await confirmNewDocOverwrite();
-    if (choice === 'cancel') return false;
-    if (choice === 'save') {
-      const saved = await runSaveFlow();
-      if (!saved) return false;
-    }
-  }
+  if (!(await prepareActiveContentForReplacement())) return false;
   void clearCurrentJournal();
   mountView(makeNewDocBody());
   currentDocFilename = null;
@@ -2063,10 +2049,23 @@ async function replaceWithSessionDoc(): Promise<boolean> {
 }
 
 function confirmNewDocOverwrite(): Promise<'save' | 'discard' | 'cancel'> {
-  return confirmCloseUnsaved({
-    title: 'Save your current document before creating a new one?',
-    ...activeCloseUnsavedOptions(),
-  });
+  return confirmCloseUnsaved(activeCloseUnsavedOptions());
+}
+
+async function prepareActiveContentForReplacement(): Promise<boolean> {
+  if (!activeNeedsManualSavePrompt()) {
+    if (!(await flushActiveAutosaveBackedContent())) {
+      showToast('Autosave could not finish. The document stays open.');
+      return false;
+    }
+    if (!(await closeActiveCoeditingSessionWithoutPrompt())) return false;
+    return true;
+  }
+  const choice = await confirmNewDocOverwrite();
+  if (choice === 'cancel') return false;
+  if (choice === 'save') return runSaveFlow();
+  clearCloseSaveLocationForActiveFile();
+  return true;
 }
 /** The Settings subtree (settings-ui + keybindings editor + benchmark
  *  harness) is the largest UI module in the app and most sessions never
@@ -5434,6 +5433,67 @@ function activeContentDirty(): boolean {
   return activeFlowWorkspace ? activeFlowIsDirty() : currentDocDirty;
 }
 
+function activeAutosaveBackedRoute(): boolean {
+  if (activeFlowWorkspace) {
+    return isAutosaveBackedRoute({
+      dirty: activeFlowIsDirty(),
+      format: activeFlowFormat,
+      handle: activeFlowHandle,
+      supportsInPlaceSave: getHost().supportsInPlaceSave,
+      autosaveEnabled: settings.get('autosaveEnabled'),
+    });
+  }
+  const file = activeFile();
+  return isAutosaveBackedRoute({
+    dirty: currentDocDirty,
+    format: file.format,
+    handle: file.handle,
+    supportsInPlaceSave: getHost().supportsInPlaceSave,
+    autosaveEnabled: settings.get('autosaveEnabled'),
+    forcedAutosave: sharedDocAutosaveForced(),
+  });
+}
+
+function activeNeedsManualSavePrompt(): boolean {
+  if (activeFlowWorkspace) {
+    return shouldPromptBeforeRoute({
+      dirty: activeFlowIsDirty(),
+      format: activeFlowFormat,
+      handle: activeFlowHandle,
+      supportsInPlaceSave: getHost().supportsInPlaceSave,
+      autosaveEnabled: settings.get('autosaveEnabled'),
+    });
+  }
+  const file = activeFile();
+  return shouldPromptBeforeRoute({
+    dirty: currentDocDirty,
+    format: file.format,
+    handle: file.handle,
+    supportsInPlaceSave: getHost().supportsInPlaceSave,
+    autosaveEnabled: settings.get('autosaveEnabled'),
+    forcedAutosave: sharedDocAutosaveForced(),
+  });
+}
+
+async function flushActiveAutosaveBackedContent(): Promise<boolean> {
+  if (!activeContentDirty()) return true;
+  if (!activeAutosaveBackedRoute()) return true;
+  await runAutosaveAttempt();
+  // Participants in a live shared CMIR do not write the Dropbox file; their
+  // changes live in the shared session. Do not block close/replacement on a
+  // dirty flag only the host can clear.
+  if (!activeFlowWorkspace && activeSharedDoc() != null && !activeSharedDocDiskWriter()) {
+    return true;
+  }
+  return !activeContentDirty();
+}
+
+async function closeActiveCoeditingSessionWithoutPrompt(): Promise<boolean> {
+  if (activeFlowWorkspace) return true;
+  if (!collabCopresenceFor(currentDocUid)) return true;
+  return collabEndOrLeaveSession(currentDocUid);
+}
+
 function captureActiveFlowCleanToken(): () => boolean {
   const workspace = activeFlowWorkspace;
   const gen = activeFlowEditGen;
@@ -5881,17 +5941,7 @@ function saveFiltersForFormat(format: 'cmir' | 'docx'): { name: string; extensio
 }
 
 async function confirmFlowInPlaceReplacement(): Promise<boolean> {
-  const decision = await resolveFlowReplacementDecision({
-    activeDirty: activeContentDirty(),
-    pristineStarter: isPristineStarter,
-    prompt: confirmNewDocOverwrite,
-    save: runSaveFlow,
-    discard: async () => {
-      clearCloseSaveLocationForActiveFile();
-      await clearCurrentJournal().catch(() => {});
-    },
-  });
-  return decision === 'proceed';
+  return prepareActiveContentForReplacement();
 }
 
 async function mountOpenedFlowInPlace(opened: OpenedFile): Promise<boolean> {
@@ -6467,6 +6517,15 @@ async function handleCloseDocToHomeInner(): Promise<void> {
     mountFreshBlankDoc();
     homeScreen.show();
   };
+  if (activeAutosaveBackedRoute()) {
+    if (!(await flushActiveAutosaveBackedContent())) {
+      showToast('Autosave could not finish. The document stays open.');
+      return;
+    }
+    if (!(await closeActiveCoeditingSessionWithoutPrompt())) return;
+    finish();
+    return;
+  }
   // A co-edited doc gets the session-aware close first (keep resumable vs
   // end/leave), naming the doc.
   const co = activeFlowWorkspace
@@ -6527,6 +6586,7 @@ async function pickAndLoadInPlace(): Promise<boolean> {
     showToast(`"${src.name}" is already open in another window.`);
     return false;
   }
+  if (!isPristineStarter && !(await prepareActiveContentForReplacement())) return false;
   try {
     await loadFileInPlace({
       filename: src.name,
@@ -6914,6 +6974,7 @@ async function openRecentInPlace(recent: RecentFile): Promise<void> {
     }
     return;
   }
+  if (!isPristineStarter && !(await prepareActiveContentForReplacement())) return;
   try {
     await loadFileInPlace({
       filename: file.name,
@@ -8488,6 +8549,15 @@ async function handleUserCloseRequestInner(
     } else await electronHost.cancelClose?.();
     return;
   }
+  if (activeAutosaveBackedRoute()) {
+    if ((await flushActiveAutosaveBackedContent()) && (await closeActiveCoeditingSessionWithoutPrompt())) {
+      await electronHost.closeSelf();
+    } else {
+      showToast('Autosave could not finish. The window stays open.');
+      await electronHost.cancelClose?.();
+    }
+    return;
+  }
   // Single-doc: a co-edited doc gets the session-aware close (keep resumable vs
   // end/leave), naming the doc.
   if (!activeFlowWorkspace) {
@@ -9059,6 +9129,7 @@ async function mountFromSpawnPayload(
     });
     return;
   }
+  if (!isPristineStarter && !(await prepareActiveContentForReplacement())) return;
   try {
     let docNode: PMNode;
     let docThreads: Thread[] | undefined;

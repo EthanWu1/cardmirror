@@ -3,7 +3,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { serializeNative } from '../../src/native/index.js';
 import { schema, newHeadingId } from '../../src/schema/index.js';
-import { capResultsForRender } from '../../src/editor/quick-card-search-ui.js';
+import {
+  capResultsForRender,
+  clampPaletteToViewport,
+} from '../../src/editor/quick-card-search-ui.js';
 
 function installElectronApi(api: Record<string, unknown>): void {
   Object.defineProperty(window, 'electronAPI', {
@@ -79,6 +82,22 @@ describe('capResultsForRender', () => {
     expect(capResultsForRender(rows).at(-1)).toBe(179);
     expect(capResultsForRender(rows, 80)).toEqual(rows.slice(0, 80));
     expect(rows).toHaveLength(500);
+  });
+});
+
+describe('clampPaletteToViewport', () => {
+  it('keeps the whole search palette visible inside the viewport', () => {
+    expect(
+      clampPaletteToViewport({
+        left: 720,
+        top: 740,
+        width: 540,
+        height: 320,
+        viewportWidth: 900,
+        viewportHeight: 800,
+        margin: 8,
+      }),
+    ).toEqual({ left: 352, top: 472 });
   });
 });
 

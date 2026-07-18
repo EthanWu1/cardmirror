@@ -4,15 +4,13 @@
  * The "read-aloud" predicate:
  *   - All text inside a `tag` paragraph
  *   - All text inside an `analytic` paragraph
- *   - Text carrying the `cite_mark` mark (typically inside `cite_paragraph`)
+ *   - Text carrying the `cite_mark` mark, typically inside `cite_paragraph`
  *   - Text in body-level paragraphs (`card_body` / `paragraph` / `undertag`)
- *     iff carrying the `highlight` mark AND NOT the `shading` mark
- *
- * Shading (the D2D2D2 protected-highlight via `HighlightToBackgroundColor`)
- * is excluded — that text is reference-style and not read aloud.
+ *     iff carrying normal highlighter or protected/background highlighting.
  */
 
 import type { Node as PMNode } from 'prosemirror-model';
+import { hasReadModeBodyMark } from './read-mode-visibility.js';
 
 /** Reader profile: name + words-per-minute. */
 export interface Reader {
@@ -49,9 +47,7 @@ function isReadAloudText(node: PMNode, parent: PMNode): boolean {
   if (parentType === 'tag' || parentType === 'analytic') return true;
   if (node.marks.some((m) => m.type.name === 'cite_mark')) return true;
   if (parentType === 'card_body' || parentType === 'paragraph' || parentType === 'undertag') {
-    const hasHighlight = node.marks.some((m) => m.type.name === 'highlight');
-    const hasShading = node.marks.some((m) => m.type.name === 'shading');
-    return hasHighlight && !hasShading;
+    return hasReadModeBodyMark(node.marks);
   }
   return false;
 }
@@ -64,7 +60,7 @@ function countWords(s: string): number {
 
 /** Format reading time as "M:SS" given a word count and reader's WPM. */
 export function formatReadTime(words: number, wpm: number): string {
-  if (wpm <= 0) return '-';
+  if (wpm <= 0) return '—';
   const seconds = (words / wpm) * 60;
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);

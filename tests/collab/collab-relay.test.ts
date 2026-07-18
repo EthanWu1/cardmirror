@@ -39,12 +39,22 @@ describe('collab relay URL normalization', () => {
     ).toEqual({ url: 'https://verba.top/relay', token: 'baked-token' });
   });
 
-  it('uses a custom token only with a custom relay URL', () => {
+  it('keeps baked private relay defaults ahead of stale saved custom settings', () => {
+    expect(
+      resolveRelayClientConfig({
+        settingsUrl: 'http://5.78.181.236:8410/relay',
+        settingsToken: 'old-wrong-token',
+        baked: { url: 'https://verba.top/relay', token: 'baked-token' },
+      }),
+    ).toEqual({ url: 'https://verba.top/relay', token: 'baked-token' });
+  });
+
+  it('uses custom relay settings only when no baked private relay is available', () => {
     expect(
       resolveRelayClientConfig({
         settingsUrl: 'https://relay.example.com',
         settingsToken: 'custom-token',
-        baked: { url: 'https://verba.top/relay', token: 'baked-token' },
+        baked: { url: '', token: '' },
       }),
     ).toEqual({ url: 'https://relay.example.com/relay', token: 'custom-token' });
   });

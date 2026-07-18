@@ -157,6 +157,24 @@ describe('transformForExport — read mode', () => {
     expect(c.child(2).textContent).toBe('important');
   });
 
+  it('keeps protected background highlighting in card body read text', () => {
+    const doc = makeDoc(
+      card(
+        tag('T'),
+        cardBody(
+          txt('plain '),
+          txt('protected', 'shading'),
+          txt(' '),
+          txt('normal', 'highlight'),
+        ),
+      ),
+    );
+    const out = transformForExport(doc, RM);
+    const body = out.firstChild!.child(1);
+    expect(body.type.name).toBe('card_body');
+    expect(body.textContent).toBe('protected normal');
+  });
+
   it('drops a card_body entirely when nothing inside it is highlighted', () => {
     const doc = makeDoc(card(tag('T'), cardBody(txt('plain body — no highlight'))));
     const out = transformForExport(doc, RM);

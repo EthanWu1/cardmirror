@@ -81,6 +81,15 @@ function clipboardEventWithHtml(html: string): ClipboardEvent {
   } as ClipboardEvent;
 }
 
+function clipboardEventWithData(data: Record<string, string>, types: string[]): ClipboardEvent {
+  return {
+    clipboardData: {
+      types,
+      getData: (type: string) => data[type] ?? '',
+    },
+  } as unknown as ClipboardEvent;
+}
+
 describe('Word HTML paste formatting', () => {
   it('treats Word text/html as text even when the clipboard also carries an image preview', () => {
     expect(clipboardHasTextPayload(dataTransferWith({ 'text/html': '<p>Card text</p>' }))).toBe(true);
@@ -540,7 +549,7 @@ describe('Word HTML paste formatting', () => {
     expect(html).toContain('text-decoration:underline');
   });
 
-  it('does not export guessed direct heading or cite typography that overrides Word styles', () => {
+  it('exports canonical direct typography so Word pastes match Verbatim styles', () => {
     const doc = schema.nodes['doc']!.create(null, [
       schema.nodes['pocket']!.create({ id: 'p1' }, schema.text('Pocket')),
       schema.nodes['hat']!.create({ id: 'h1' }, schema.text('Hat')),
@@ -560,18 +569,22 @@ describe('Word HTML paste formatting', () => {
     for (const selector of ['.pmd-pocket', '.pmd-hat', '.pmd-block', '.pmd-tag']) {
       const style = wrap.querySelector<HTMLElement>(selector)?.getAttribute('style') ?? '';
       expect(style).toContain('mso-style-name');
-      expect(style).not.toMatch(/font-size\s*:/i);
-      expect(style).not.toMatch(/font-weight\s*:/i);
+      expect(style).toMatch(/font-weight\s*:\s*bold/i);
     }
+    expect(wrap.querySelector<HTMLElement>('.pmd-pocket')?.getAttribute('style') ?? '').toMatch(/font-size\s*:\s*26pt/i);
+    expect(wrap.querySelector<HTMLElement>('.pmd-hat')?.getAttribute('style') ?? '').toMatch(/font-size\s*:\s*22pt/i);
+    expect(wrap.querySelector<HTMLElement>('.pmd-block')?.getAttribute('style') ?? '').toMatch(/font-size\s*:\s*16pt/i);
+    expect(wrap.querySelector<HTMLElement>('.pmd-tag')?.getAttribute('style') ?? '').toMatch(/font-size\s*:\s*13pt/i);
 
     const citeParaStyle = wrap.querySelector<HTMLElement>('.pmd-cite-para')?.getAttribute('style') ?? '';
     const citeStyle = wrap.querySelector<HTMLElement>('.pmd-cite')?.getAttribute('style') ?? '';
     expect(citeParaStyle).toContain('mso-style-name:Normal');
     expect(citeParaStyle).toMatch(/font-family:\s*Calibri\b/);
     expect(citeParaStyle).not.toMatch(/font-size\s*:/i);
+    expect(citeParaStyle).not.toMatch(/font-weight\s*:\s*bold/i);
     expect(citeStyle).toContain('mso-style-name:"Style13ptBold"');
-    expect(citeStyle).not.toMatch(/font-size\s*:/i);
-    expect(citeStyle).not.toMatch(/font-weight\s*:/i);
+    expect(citeStyle).toMatch(/font-size\s*:\s*13pt/i);
+    expect(citeStyle).toMatch(/font-weight\s*:\s*bold/i);
   });
 
   it('recognizes Mac Word Tag linked to Heading 3 and keeps the citation tail normal', () => {
@@ -726,6 +739,27 @@ describe('Word HTML paste formatting', () => {
       'tag',
       'cite_paragraph',
     ]);
+    expect(markNames(textRunInSlice(slice!, 'turns case'))).toContain('emphasis_mark');
+    expect(markNames(textRunInSlice(slice!, 'turns case'))).not.toContain('italic');
+  });
+
+  it('recovers Mac Word RTF-only Tag, Cite, and Emphasis styles when HTML is missing', () => {
+    const rtf = String.raw`{\rtf1\ansi\deff0{\fonttbl{\f0 Calibri;}}{\stylesheet{\s1\sbasedon0\snext0 Tag;}{\*\cs10\additive Style13ptBold;}{\*\cs11\additive Emphasis;}}\pard\s1\b\fs26 Healthcare costs\par\pard\plain\f0\fs22 {\cs10\b\fs26 McCuskey 24.} plain tail {\cs11\i turns case}\par}`;
+    const slice = reparseClipboardStructuralSlice(
+      clipboardEventWithData(
+        {
+          'text/html': '',
+          'text/plain': 'Healthcare costs\nMcCuskey 24. plain tail turns case',
+          'text/rtf': rtf,
+        },
+        ['text/rtf', 'text/plain'],
+      ),
+    );
+
+    expect(slice).not.toBeNull();
+    expect(sliceTopNodeNames(slice!)).toEqual(['tag', 'cite_paragraph']);
+    expect(markNames(textRunInSlice(slice!, 'McCuskey 24.'))).toEqual(['cite_mark']);
+    expect(markNames(textRunInSlice(slice!, ' plain tail '))).toEqual([]);
     expect(markNames(textRunInSlice(slice!, 'turns case'))).toContain('emphasis_mark');
     expect(markNames(textRunInSlice(slice!, 'turns case'))).not.toContain('italic');
   });

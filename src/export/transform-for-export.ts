@@ -20,7 +20,7 @@
  *   - cite_paragraph: kept, inlines filtered to those carrying
  *     cite_mark.
  *   - card_body / paragraph / undertag: kept, inlines filtered to
- *     those carrying the `highlight` mark.
+ *     those carrying normal highlighter or protected/background highlighting.
  *   - Cards / analytic_units: recursed; container kept iff at least
  *     one survivor child exists.
  *   - Tables: dropped (read mode plugin doesn't model them).
@@ -30,6 +30,7 @@ import type { Node as PMNode, Schema } from 'prosemirror-model';
 import { Transform } from 'prosemirror-transform';
 import { isReadingMarkerColor, READING_MARKER_COLOR } from '../editor/reading-marker.js';
 import { computeUnreadDecorations } from '../editor/mark-unread-plugin.js';
+import { textHasReadModeMark } from '../editor/read-mode-visibility.js';
 
 export interface ExportTransformOptions {
   includeComments: boolean;
@@ -172,7 +173,7 @@ function transformContainerForReadMode(container: PMNode, schema: Schema): PMNod
 function filterInlinesByMark(node: PMNode, markName: string, schema: Schema): PMNode[] {
   const kept: PMNode[] = [];
   node.forEach((child) => {
-    if (child.isText && child.marks.some((m) => m.type.name === markName)) {
+    if (child.isText && textHasReadModeMark(child, markName)) {
       appendToMergeBuffer(kept, child, schema);
     }
   });

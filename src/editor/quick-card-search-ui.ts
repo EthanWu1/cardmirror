@@ -927,6 +927,24 @@ function canSearchInsideFile(r: PaletteResult | undefined): boolean {
 
 const SEARCH_PLACEHOLDER = 'Search…';
 
+export function clampPaletteToViewport(opts: {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  margin?: number;
+}): { left: number; top: number } {
+  const margin = opts.margin ?? 8;
+  const maxLeft = Math.max(margin, opts.viewportWidth - opts.width - margin);
+  const maxTop = Math.max(margin, opts.viewportHeight - opts.height - margin);
+  return {
+    left: Math.round(Math.min(Math.max(margin, opts.left), maxLeft)),
+    top: Math.round(Math.min(Math.max(margin, opts.top), maxTop)),
+  };
+}
+
 class QuickCardSearchUI {
   private root: HTMLDivElement | null = null;
   private input!: HTMLInputElement;
@@ -1088,9 +1106,16 @@ class QuickCardSearchUI {
       /* Fall back to a centered pane position when the view has no measurable caret. */
     }
 
-    const maxLeft = Math.max(8, window.innerWidth - width - 8);
-    this.root.style.left = `${Math.round(Math.min(Math.max(8, left), maxLeft))}px`;
-    this.root.style.top = `${Math.round(Math.min(Math.max(8, top), Math.max(8, window.innerHeight - 64)))}px`;
+    const clamped = clampPaletteToViewport({
+      left,
+      top,
+      width,
+      height: Math.max(this.root.offsetHeight, 180),
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    });
+    this.root.style.left = `${clamped.left}px`;
+    this.root.style.top = `${clamped.top}px`;
   }
 
   private onResize = (): void => this.reposition();
@@ -2056,6 +2081,7 @@ class QuickCardSearchUI {
       this.resultsEl.appendChild(more);
     }
     this.resultsEl.querySelector('.pmd-qcs-row-active')?.scrollIntoView({ block: 'nearest' });
+    this.reposition();
   }
 
   /** Move the active-row highlight without rebuilding the list.

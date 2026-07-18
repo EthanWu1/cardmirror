@@ -312,10 +312,10 @@ describe('Mac Word-like chrome theme tokens', () => {
     );
   });
 
-  it('routes the new-document dirty prompt through the shared unsaved dialog', () => {
-    expect(editorIndexSource).toContain("title: 'Save your current document before creating a new one?'");
-    expect(editorIndexSource).toContain('return confirmCloseUnsaved({');
-    expect(editorIndexSource).toContain('if (activeContentDirty()) {');
+  it('routes manual-save replacement prompts through the shared unsaved dialog without before-creating wording', () => {
+    expect(editorIndexSource).not.toContain("title: 'Save your current document before creating a new one?'");
+    expect(editorIndexSource).toContain('return confirmCloseUnsaved(activeCloseUnsavedOptions());');
+    expect(editorIndexSource).toContain('activeNeedsManualSavePrompt()');
     expect(editorIndexSource).not.toContain('if (!isPristineStarter || activeContentDirty()) {');
     expect(editorIndexSource).not.toContain("header.className = 'pmd-route-header';");
     expect(editorIndexSource).not.toContain("saveBtn.innerHTML = '<strong>Save</strong><br><span>");

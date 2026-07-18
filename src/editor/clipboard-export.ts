@@ -24,6 +24,8 @@ const BLOCK_STYLE_RULES: WordStyleRule[] = [
     outlineLevel: 1,
     css: {
       'text-align': 'center',
+      'font-weight': 'bold',
+      'font-size': '26pt',
       border: '1.5pt solid #000',
     },
   },
@@ -33,6 +35,8 @@ const BLOCK_STYLE_RULES: WordStyleRule[] = [
     outlineLevel: 2,
     css: {
       'text-align': 'center',
+      'font-weight': 'bold',
+      'font-size': '22pt',
       'text-decoration': 'underline double',
     },
   },
@@ -42,6 +46,8 @@ const BLOCK_STYLE_RULES: WordStyleRule[] = [
     outlineLevel: 3,
     css: {
       'text-align': 'center',
+      'font-weight': 'bold',
+      'font-size': '16pt',
       'text-decoration': 'underline',
     },
   },
@@ -49,13 +55,18 @@ const BLOCK_STYLE_RULES: WordStyleRule[] = [
     selector: '.pmd-tag',
     styleName: 'Tag',
     outlineLevel: 4,
-    css: {},
+    css: {
+      'font-weight': 'bold',
+      'font-size': '13pt',
+    },
   },
   {
     selector: '.pmd-analytic',
     styleName: 'Analytic',
     outlineLevel: 4,
     css: {
+      'font-weight': 'bold',
+      'font-size': '13pt',
       color: '#1F3864',
     },
   },
@@ -82,7 +93,10 @@ const MARK_STYLE_RULES: WordStyleRule[] = [
   {
     selector: '.pmd-cite',
     styleName: '"Style13ptBold"',
-    css: {},
+    css: {
+      'font-weight': 'bold',
+      'font-size': '13pt',
+    },
   },
   {
     selector: '.pmd-underline',
@@ -97,6 +111,9 @@ const MARK_STYLE_RULES: WordStyleRule[] = [
     css: {
       'text-decoration': 'underline',
       'font-style': 'normal',
+      'font-weight': 'normal',
+      'font-size': '11pt',
+      border: '1pt solid #000',
     },
   },
   {

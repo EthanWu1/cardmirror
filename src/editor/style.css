@@ -9868,6 +9868,7 @@ body.pmd-recovery-active.pmd-multi-doc #app {
   transform: none;
   width: 540px;
   max-width: 92vw;
+  max-height: calc(100vh - 16px);
   z-index: 1300;
   background: var(--pmd-c-bg);
   border: 1px solid var(--pmd-c-border);
@@ -9889,6 +9890,8 @@ body.pmd-recovery-active.pmd-multi-doc #app {
 }
 .pmd-qcs-results {
   max-height: 320px;
+  flex: 0 1 auto;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;

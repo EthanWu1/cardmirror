@@ -61,14 +61,10 @@ export function resolveRelayClientConfig(input: {
   const devUrl = normalizeRelayBaseUrl(input.dev?.url ?? '');
   const devToken = (input.dev?.token ?? '').trim();
 
-  if (customUrl) {
-    const token = customUrl === bakedUrl && bakedToken ? bakedToken : customToken;
-    return customUrl && token ? { url: customUrl, token } : null;
-  }
-
-  const url = devUrl || bakedUrl;
-  const token = devToken || bakedToken;
-  return url && token ? { url, token } : null;
+  if (devUrl && devToken) return { url: devUrl, token: devToken };
+  if (bakedUrl && bakedToken) return { url: bakedUrl, token: bakedToken };
+  if (customUrl && customToken) return { url: customUrl, token: customToken };
+  return null;
 }
 
 export function relayClient(): RoomsClient | null {

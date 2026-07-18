@@ -21,6 +21,7 @@ import {
 
 function tag(text: string) { return schema.nodes['tag']!.create({ id: newHeadingId() }, schema.text(text)); }
 function cardBody(text: string) { return schema.nodes['card_body']!.create(null, schema.text(text)); }
+function cardBodyRuns(...runs: any[]) { return schema.nodes['card_body']!.create(null, runs); }
 function card(...c: any[]) { return schema.nodes['card']!.createChecked(null, c); }
 function makeDoc(...c: any[]) { return schema.nodes['doc']!.createChecked(null, c); }
 
@@ -140,6 +141,38 @@ describe('read mode edit lock (filterTransaction)', () => {
     s = s.applyTransaction(s.tr.setMeta(PMD_READ_MODE_TOGGLE, false)).state;
     const after = s.applyTransaction(s.tr.insertText('Z', s.selection.head)).state;
     expect(after.doc.textContent).toContain('Z');
+  });
+});
+
+describe('read-mode visibility decorations', () => {
+  it('keeps protected background highlighting visible in body text', () => {
+    const shading = schema.marks['shading']!.create({ color: 'D2D2D2' });
+    const highlight = schema.marks['highlight']!.create({ color: 'yellow' });
+    const doc = makeDoc(
+      card(
+        tag('TAG'),
+        cardBodyRuns(
+          schema.text('plain '),
+          schema.text('protected', [shading]),
+          schema.text(' '),
+          schema.text('normal', [highlight]),
+        ),
+      ),
+    );
+    let state = EditorState.create({ doc, plugins: [readModePlugin] });
+    state = state.applyTransaction(state.tr.setMeta(PMD_READ_MODE_TOGGLE, true)).state;
+
+    const classesByText = new Map<string, string | undefined>();
+    const decorations = readModePlugin.getState(state)?.decorations.find() ?? [];
+    for (const deco of decorations) {
+      const text = state.doc.textBetween(deco.from, deco.to);
+      if (!text) continue;
+      classesByText.set(text, (deco as any).type?.attrs?.class);
+    }
+
+    expect(classesByText.get('plain ')).toBe('pmd-rm-hide');
+    expect(classesByText.get('protected')).toBe('pmd-rm-keep');
+    expect(classesByText.get('normal')).toBe('pmd-rm-keep');
   });
 });
 

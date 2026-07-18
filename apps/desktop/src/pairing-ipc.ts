@@ -39,6 +39,10 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { createPairingKeystore, routingId, type PairingKeystore, type SealedBundle } from './pairing-crypto.js';
 import { BUILT_IN_RELAY_TOKEN, BUILT_IN_RELAY_URL } from './pairing-build.js';
+import {
+  normalizeRelayBaseUrl,
+  resolvePairingRelayConfig,
+} from './pairing-relay-config.js';
 import { RelayStream } from './relay-stream.js';
 import {
   entitlementIfValid,
@@ -71,25 +75,6 @@ import {
 const DEFAULT_RELAY_URL = (process.env.PAIRING_RELAY_URL || BUILT_IN_RELAY_URL).trim();
 const DEFAULT_RELAY_TOKEN = (process.env.PAIRING_TOKEN || BUILT_IN_RELAY_TOKEN).trim();
 
-function normalizeRelayBaseUrl(input: string): string {
-  const trimmed = input.trim().replace(/\/+$/, '');
-  if (!trimmed) return '';
-  try {
-    const url = new URL(trimmed);
-    if (!url.pathname || url.pathname === '/') {
-      url.pathname = '/relay';
-      return url.toString().replace(/\/+$/, '');
-    }
-    if (!url.pathname.toLowerCase().endsWith('/relay')) {
-      url.pathname = `${url.pathname.replace(/\/+$/, '')}/relay`;
-      return url.toString().replace(/\/+$/, '');
-    }
-  } catch {
-    /* Relative/test URL fallback below. */
-  }
-  return /(?:^|\/)relay$/i.test(trimmed) ? trimmed : `${trimmed}/relay`;
-}
-
 interface PairingConfig {
   enabled: boolean;
   displayName: string;
@@ -106,8 +91,13 @@ interface PairingConfig {
 
 /** Effective relay base URL: settings override → env/baked default. */
 function relayUrl(): string {
-  const custom = normalizeRelayBaseUrl(config.relayUrl);
-  return custom || normalizeRelayBaseUrl(DEFAULT_RELAY_URL);
+  return resolvePairingRelayConfig({
+    settingsUrl: config.relayUrl,
+    settingsToken: config.relayToken,
+    defaultUrl: DEFAULT_RELAY_URL,
+    defaultToken: DEFAULT_RELAY_TOKEN,
+    entitlementToken: validEntitlement()?.entitlement,
+  }).url;
 }
 
 /** Effective bearer. This supplier is the single seam of the
@@ -118,26 +108,25 @@ function relayUrl(): string {
  *  during the beta and gates nothing); custom self-hosted relays always
  *  use their own token, never entitlements. */
 function relayToken(): string {
-  const customUrl = config.relayUrl.trim();
-  const custom = customUrl ? config.relayToken.trim() : '';
-  if (custom) return custom;
-  if (!customUrl) {
-    const ent = validEntitlement();
-    if (ent) return ent.entitlement;
-  }
-  return DEFAULT_RELAY_TOKEN;
+  return resolvePairingRelayConfig({
+    settingsUrl: config.relayUrl,
+    settingsToken: config.relayToken,
+    defaultUrl: DEFAULT_RELAY_URL,
+    defaultToken: DEFAULT_RELAY_TOKEN,
+    entitlementToken: validEntitlement()?.entitlement,
+  }).token;
 }
 
 /** Rooms/co-editing auth must be the shared relay token. Pairing delivery may
  *  use an optional account entitlement, but a self-hosted rooms relay only
  *  knows RELAY_TOKEN and will reject an account entitlement as 401. */
 function sharedRelayToken(): string {
-  const customUrl = normalizeRelayBaseUrl(config.relayUrl);
-  const defaultUrl = normalizeRelayBaseUrl(DEFAULT_RELAY_URL);
-  if (customUrl && customUrl !== defaultUrl && config.relayToken.trim()) {
-    return config.relayToken.trim();
-  }
-  return DEFAULT_RELAY_TOKEN;
+  return resolvePairingRelayConfig({
+    settingsUrl: config.relayUrl,
+    settingsToken: config.relayToken,
+    defaultUrl: DEFAULT_RELAY_URL,
+    defaultToken: DEFAULT_RELAY_TOKEN,
+  }).token;
 }
 
 interface SendItem {

@@ -129,9 +129,11 @@ import { coordinatorBlocks, flashLockedLeases } from './ai/edit-coordinator.js';
 import {
   tagCollabTransaction,
   collabCopresenceFor,
+  collabEndOrLeaveSession,
   onCollabCopresenceChange,
 } from './collab/collab-hooks.js';
 import { icon, setIcon } from './icons';
+import { isAutosaveBackedRoute, shouldPromptBeforeRoute } from './autosave-route-policy.js';
 
 type SlotId = 'slot1' | 'slot2' | 'slot3';
 const SLOT_IDS: SlotId[] = ['slot1', 'slot2', 'slot3'];
@@ -274,6 +276,57 @@ function sharedDocDiskWriter(record: DocRecord): boolean {
   if (record.format !== 'cmir' || record.sharedDoc == null) return true;
   const copresence = collabCopresenceFor(record.uid);
   return copresence == null || copresence.role === 'host';
+}
+
+function recordAutosaveBackedRoute(record: PaneRecord): boolean {
+  if (isDocRecord(record)) {
+    return isAutosaveBackedRoute({
+      dirty: record.dirty,
+      format: record.format,
+      handle: record.handle,
+      supportsInPlaceSave: getHost().supportsInPlaceSave,
+      autosaveEnabled: record.autosaveEnabled,
+      forcedAutosave: sharedDocAutosaveForced(record),
+    });
+  }
+  return isAutosaveBackedRoute({
+    dirty: record.dirty,
+    format: record.format,
+    handle: record.handle,
+    supportsInPlaceSave: getHost().supportsInPlaceSave,
+    autosaveEnabled: true,
+  });
+}
+
+function recordNeedsManualSavePrompt(record: PaneRecord): boolean {
+  if (isDocRecord(record)) {
+    return shouldPromptBeforeRoute({
+      dirty: record.dirty,
+      format: record.format,
+      handle: record.handle,
+      supportsInPlaceSave: getHost().supportsInPlaceSave,
+      autosaveEnabled: record.autosaveEnabled,
+      forcedAutosave: sharedDocAutosaveForced(record),
+    });
+  }
+  return shouldPromptBeforeRoute({
+    dirty: record.dirty,
+    format: record.format,
+    handle: record.handle,
+    supportsInPlaceSave: getHost().supportsInPlaceSave,
+    autosaveEnabled: true,
+  });
+}
+
+async function flushAutosaveBackedRecord(record: PaneRecord): Promise<boolean> {
+  if (!record.dirty) return true;
+  if (!recordAutosaveBackedRoute(record)) return true;
+  if (isDocRecord(record)) {
+    await runAutosaveForRecord(record);
+    if (record.sharedDoc != null && !sharedDocDiskWriter(record)) return true;
+    return !record.dirty;
+  }
+  return record.save();
 }
 
 /** Per-DocRecord autosave attempt. Like the single-doc
@@ -1008,6 +1061,7 @@ class Slot {
     // kept doc auto-resumes), so prompting per co-edited pane would be noise —
     // but a DIRTY non-focused doc still gets its normal save prompt below.
     const coedited = isDocRecord(closing) && !opts?.modeSwitch && collabCopresenceFor(closing.uid) != null;
+    const autosaveBacked = recordAutosaveBackedRoute(closing);
     // Focus this pane so the confirm dialogs + save commands (which route via
     // `activeFile()`) target THIS doc, not whichever pane happened to be focused
     // when the user clicked ×.
@@ -1029,15 +1083,21 @@ class Slot {
       clearCloseSaveLocationForActiveFile();
       return true; // discard: fall through; existing journal-clear path runs.
     };
-    if (coedited) {
+    if (autosaveBacked) {
+      if (!(await flushAutosaveBackedRecord(closing))) {
+        showToast('Autosave could not finish. The document stays open.');
+        return false;
+      }
+      if (coedited && !(await collabEndOrLeaveSession(closing.uid))) return false;
+    } else if (coedited) {
       // Session-aware close: keep it resumable, or end/leave. Naming the doc.
       const co = await resolveCoEditedClose(closing.uid, closing.filename);
       if (co === 'cancel') return false;
       // 'keep' → the session record holds the content; close without a file
       // prompt. 'run-normal' → the session was ended/left; still offer to save
       // the local file if it's dirty.
-      if (co === 'run-normal' && closing.dirty && !(await runDirtyPrompt())) return false;
-    } else if (closing.dirty && !(await runDirtyPrompt())) {
+      if (co === 'run-normal' && recordNeedsManualSavePrompt(closing) && !(await runDirtyPrompt())) return false;
+    } else if (recordNeedsManualSavePrompt(closing) && !(await runDirtyPrompt())) {
       return false;
     }
     this.detachVisible();
@@ -1116,9 +1176,20 @@ class Slot {
    *  drops that doc's recovery journal so it doesn't resurface next launch. */
   async promptSaveDirtyForQuit(): Promise<boolean> {
     for (const rec of [...this.stack]) {
-      if (!rec.dirty) continue;
+      const coedited = isDocRecord(rec) && collabCopresenceFor(rec.uid) != null;
+      if (!rec.dirty && !coedited) continue;
       this.showRecord(rec); // surface it so the prompt has context
       this.shell.focusSlot(this); // save commands route via the focused doc
+      if (recordAutosaveBackedRoute(rec)) {
+        if (!(await flushAutosaveBackedRecord(rec))) {
+          showToast('Autosave could not finish. The window stays open.');
+          return false;
+        }
+        if (coedited && isDocRecord(rec) && !(await collabEndOrLeaveSession(rec.uid))) {
+          return false;
+        }
+        continue;
+      }
       const choice = await confirmCloseUnsaved({
         locationLabel: locationLabelFromHandle(rec.handle),
         ...(isDocRecord(rec) ? { onChooseLocation: chooseCloseSaveLocationForActiveFile } : {}),

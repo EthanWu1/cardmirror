@@ -104,6 +104,440 @@ export function buildPlainTextSlice(text: string): Slice {
   return new Slice(Fragment.fromArray(paragraphs), 1, 1);
 }
 
+interface RtfStyleInfo {
+  id: number;
+  name: string;
+  token: string;
+  outlineLevel: number | null;
+}
+
+interface RtfRunState {
+  pStyleId: number | null;
+  cStyleId: number | null;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  fontSizePt: number | null;
+}
+
+interface RtfSegment extends RtfRunState {
+  text: string;
+}
+
+interface RtfParagraph {
+  pStyleId: number | null;
+  segments: RtfSegment[];
+}
+
+interface RtfStyleMaps {
+  paragraph: Map<number, RtfStyleInfo>;
+  character: Map<number, RtfStyleInfo>;
+}
+
+const RTF_SKIP_DESTINATIONS = new Set([
+  'stylesheet',
+  'fonttbl',
+  'colortbl',
+  'info',
+  'generator',
+  'listtable',
+  'listoverridetable',
+  'themedata',
+  'colorschememapping',
+]);
+
+function readClipboardRtf(data: DataTransfer | null | undefined): string {
+  if (!data) return '';
+  for (const type of ['text/rtf', 'application/rtf', 'public.rtf']) {
+    const value = data.getData(type);
+    if (value.trim()) return value;
+  }
+  return '';
+}
+
+function sameRtfRunShape(a: RtfSegment, state: RtfRunState): boolean {
+  return (
+    a.pStyleId === state.pStyleId &&
+    a.cStyleId === state.cStyleId &&
+    a.bold === state.bold &&
+    a.italic === state.italic &&
+    a.underline === state.underline &&
+    a.fontSizePt === state.fontSizePt
+  );
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function escapeAttr(text: string): string {
+  return escapeHtml(text).replace(/"/g, '&quot;');
+}
+
+function cssStyleName(name: string): string {
+  const clean = name.trim();
+  return /[\s"'();:]/.test(clean) ? `"${clean.replace(/["\\]/g, '\\$&')}"` : clean;
+}
+
+function findMatchingRtfBrace(rtf: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < rtf.length; i += 1) {
+    const ch = rtf[i];
+    if (ch === '\\') {
+      i += 1;
+      continue;
+    }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return rtf.length - 1;
+}
+
+function destinationControlAt(rtf: string, groupOpen: number): string | null {
+  let i = groupOpen + 1;
+  while (/\s/.test(rtf[i] ?? '')) i += 1;
+  if (rtf[i] !== '\\') return null;
+  i += 1;
+  if (rtf[i] === '*') {
+    i += 1;
+    while (/\s/.test(rtf[i] ?? '')) i += 1;
+    if (rtf[i] !== '\\') return null;
+    i += 1;
+  }
+  const start = i;
+  while (/[a-zA-Z]/.test(rtf[i] ?? '')) i += 1;
+  return start === i ? null : rtf.slice(start, i).toLowerCase();
+}
+
+function extractRtfDestinationGroup(rtf: string, destination: string): string | null {
+  for (let i = 0; i < rtf.length; i += 1) {
+    if (rtf[i] !== '{') continue;
+    if (destinationControlAt(rtf, i) !== destination) continue;
+    const close = findMatchingRtfBrace(rtf, i);
+    return rtf.slice(i, close + 1);
+  }
+  return null;
+}
+
+function rtfTextFromGroup(group: string): string {
+  let out = '';
+  for (let i = 0; i < group.length; i += 1) {
+    const ch = group[i];
+    if (ch === '{' || ch === '}') continue;
+    if (ch !== '\\') {
+      out += ch;
+      continue;
+    }
+    i += 1;
+    const next = group[i] ?? '';
+    if (next === "'" && /^[0-9a-fA-F]{2}$/.test(group.slice(i + 1, i + 3))) {
+      out += String.fromCharCode(Number.parseInt(group.slice(i + 1, i + 3), 16));
+      i += 2;
+      continue;
+    }
+    if (next === '\\' || next === '{' || next === '}') {
+      out += next;
+      continue;
+    }
+    if (!/[a-zA-Z]/.test(next)) continue;
+    while (/[a-zA-Z]/.test(group[i] ?? '')) i += 1;
+    if (group[i] === '-' || /\d/.test(group[i] ?? '')) {
+      i += 1;
+      while (/\d/.test(group[i] ?? '')) i += 1;
+    }
+    if (group[i] !== ' ') i -= 1;
+  }
+  return out;
+}
+
+function parseRtfStyles(rtf: string): RtfStyleMaps {
+  const maps: RtfStyleMaps = {
+    paragraph: new Map(),
+    character: new Map(),
+  };
+  const stylesheet = extractRtfDestinationGroup(rtf, 'stylesheet');
+  if (!stylesheet) return maps;
+  const innerStart = stylesheet.indexOf('\\stylesheet');
+  const stylesheetBody = innerStart >= 0
+    ? stylesheet.slice(innerStart + '\\stylesheet'.length, -1)
+    : stylesheet.slice(1, -1);
+
+  for (let i = 0; i < stylesheetBody.length; i += 1) {
+    if (stylesheetBody[i] !== '{') continue;
+    const close = findMatchingRtfBrace(stylesheetBody, i);
+    const group = stylesheetBody.slice(i, close + 1);
+    i = close;
+    const paraMatch = /\\s(-?\d+)\b/.exec(group);
+    const charMatch = /\\cs(-?\d+)\b/.exec(group);
+    if (!paraMatch?.[1] && !charMatch?.[1]) continue;
+    const plain = rtfTextFromGroup(group).replace(/\s+/g, ' ').trim();
+    const name = plain.replace(/;[\s\S]*$/, '').trim();
+    if (!name) continue;
+    const outlineMatch = /\\outlinelevel(-?\d+)\b/.exec(group);
+    const outlineLevel = outlineMatch?.[1] ? Number(outlineMatch[1]) + 1 : null;
+    if (charMatch?.[1]) {
+      const id = Number(charMatch[1]);
+      maps.character.set(id, {
+        id,
+        name,
+        token: normalizeWordStyleToken(name),
+        outlineLevel,
+      });
+      continue;
+    }
+    if (paraMatch?.[1]) {
+      const id = Number(paraMatch[1]);
+      maps.paragraph.set(id, {
+        id,
+        name,
+        token: normalizeWordStyleToken(name),
+        outlineLevel,
+      });
+    }
+  }
+  return maps;
+}
+
+function emptyRtfState(): RtfRunState {
+  return {
+    pStyleId: null,
+    cStyleId: null,
+    bold: false,
+    italic: false,
+    underline: false,
+    fontSizePt: null,
+  };
+}
+
+function parseRtfControlWord(rtf: string, start: number): { word: string; param: number | null; next: number } {
+  let i = start;
+  while (/[a-zA-Z]/.test(rtf[i] ?? '')) i += 1;
+  const word = rtf.slice(start, i).toLowerCase();
+  let sign = 1;
+  if (rtf[i] === '-') {
+    sign = -1;
+    i += 1;
+  }
+  const numberStart = i;
+  while (/\d/.test(rtf[i] ?? '')) i += 1;
+  const raw = rtf.slice(numberStart, i);
+  const param = raw ? sign * Number(raw) : null;
+  if (rtf[i] === ' ') i += 1;
+  return { word, param, next: i };
+}
+
+function parseRtfParagraphs(rtf: string, styles: RtfStyleMaps): RtfParagraph[] {
+  const paragraphs: RtfParagraph[] = [];
+  const stack: RtfRunState[] = [];
+  let state = emptyRtfState();
+  let para: RtfParagraph = { pStyleId: null, segments: [] };
+  let ucSkip = 1;
+  let skipPlainChars = 0;
+
+  const addText = (text: string): void => {
+    if (!text) return;
+    if (state.pStyleId !== null && para.pStyleId === null) para.pStyleId = state.pStyleId;
+    const last = para.segments[para.segments.length - 1];
+    if (last && sameRtfRunShape(last, state)) {
+      last.text += text;
+      return;
+    }
+    para.segments.push({ ...state, text });
+  };
+
+  const flushParagraph = (): void => {
+    const hasText = para.segments.some((segment) => segment.text.replace(/\s+/g, ' ').trim());
+    if (hasText) paragraphs.push(para);
+    para = { pStyleId: state.pStyleId, segments: [] };
+  };
+
+  for (let i = 0; i < rtf.length; ) {
+    const ch = rtf[i];
+    if (ch === '{') {
+      const destination = destinationControlAt(rtf, i);
+      if (destination && RTF_SKIP_DESTINATIONS.has(destination)) {
+        i = findMatchingRtfBrace(rtf, i) + 1;
+        continue;
+      }
+      stack.push({ ...state });
+      i += 1;
+      continue;
+    }
+    if (ch === '}') {
+      state = stack.pop() ?? state;
+      i += 1;
+      continue;
+    }
+    if (ch !== '\\') {
+      if (skipPlainChars > 0) {
+        skipPlainChars -= 1;
+      } else {
+        addText(ch ?? '');
+      }
+      i += 1;
+      continue;
+    }
+
+    i += 1;
+    const next = rtf[i] ?? '';
+    if (next === "'" && /^[0-9a-fA-F]{2}$/.test(rtf.slice(i + 1, i + 3))) {
+      if (skipPlainChars > 0) {
+        skipPlainChars -= 1;
+      } else {
+        addText(String.fromCharCode(Number.parseInt(rtf.slice(i + 1, i + 3), 16)));
+      }
+      i += 3;
+      continue;
+    }
+    if (next === '\\' || next === '{' || next === '}') {
+      if (skipPlainChars > 0) skipPlainChars -= 1;
+      else addText(next);
+      i += 1;
+      continue;
+    }
+    if (next === '~') {
+      addText('\u00a0');
+      i += 1;
+      continue;
+    }
+    if (next === '-') {
+      addText('\u00ad');
+      i += 1;
+      continue;
+    }
+    if (next === '_') {
+      addText('\u2011');
+      i += 1;
+      continue;
+    }
+    if (next === '*') {
+      i += 1;
+      continue;
+    }
+    if (!/[a-zA-Z]/.test(next)) {
+      i += 1;
+      continue;
+    }
+
+    const control = parseRtfControlWord(rtf, i);
+    i = control.next;
+    const { word, param } = control;
+    switch (word) {
+      case 'par':
+        flushParagraph();
+        break;
+      case 'line':
+        addText('\n');
+        break;
+      case 'tab':
+        addText('\t');
+        break;
+      case 'emdash':
+        addText('\u2014');
+        break;
+      case 'endash':
+        addText('\u2013');
+        break;
+      case 'bullet':
+        addText('\u2022');
+        break;
+      case 'pard':
+        state.pStyleId = null;
+        if (para.segments.length === 0) para.pStyleId = null;
+        break;
+      case 'plain':
+        state = { ...state, cStyleId: null, bold: false, italic: false, underline: false, fontSizePt: null };
+        break;
+      case 's':
+        state.pStyleId = param !== null && styles.paragraph.has(param) ? param : state.pStyleId;
+        if (para.segments.length === 0) para.pStyleId = state.pStyleId;
+        break;
+      case 'cs':
+        state.cStyleId = param !== null && styles.character.has(param) ? param : state.cStyleId;
+        break;
+      case 'b':
+        state.bold = param !== 0;
+        break;
+      case 'i':
+        state.italic = param !== 0;
+        break;
+      case 'ul':
+      case 'ulw':
+      case 'uldb':
+        state.underline = param !== 0;
+        break;
+      case 'ulnone':
+        state.underline = false;
+        break;
+      case 'fs':
+        state.fontSizePt = param !== null && param > 0 ? param / 2 : state.fontSizePt;
+        break;
+      case 'uc':
+        ucSkip = Math.max(0, param ?? 1);
+        break;
+      case 'u':
+        if (param !== null) {
+          const code = param < 0 ? param + 65536 : param;
+          addText(String.fromCharCode(code));
+          skipPlainChars = ucSkip;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  flushParagraph();
+  return paragraphs;
+}
+
+function rtfParagraphStyleDeclarations(style: RtfStyleInfo | undefined): string {
+  if (!style) return '';
+  const decls = [`mso-style-name:${cssStyleName(style.name)}`];
+  if (style.outlineLevel !== null) decls.push(`mso-outline-level:${style.outlineLevel}`);
+  return decls.join('; ');
+}
+
+function rtfSegmentStyleDeclarations(segment: RtfSegment, styles: RtfStyleMaps): string {
+  const decls: string[] = [];
+  const charStyle = segment.cStyleId !== null ? styles.character.get(segment.cStyleId) : undefined;
+  if (charStyle) decls.push(`mso-style-name:${cssStyleName(charStyle.name)}`);
+  if (segment.bold) decls.push('font-weight:bold');
+  if (segment.italic) decls.push('font-style:italic');
+  if (segment.underline) decls.push('text-decoration:underline');
+  if (segment.fontSizePt !== null && Math.abs(segment.fontSizePt - 11) > 0.01) {
+    decls.push(`font-size:${segment.fontSizePt}pt`);
+  }
+  return decls.join('; ');
+}
+
+function rtfParagraphHtml(paragraph: RtfParagraph, styles: RtfStyleMaps): string {
+  const paraStyle = paragraph.pStyleId !== null ? styles.paragraph.get(paragraph.pStyleId) : undefined;
+  const style = rtfParagraphStyleDeclarations(paraStyle);
+  const attrs = style ? ` style="${escapeAttr(style)}"` : '';
+  const body = paragraph.segments
+    .map((segment) => {
+      const text = escapeHtml(segment.text);
+      const segmentStyle = rtfSegmentStyleDeclarations(segment, styles);
+      return segmentStyle ? `<span style="${escapeAttr(segmentStyle)}">${text}</span>` : text;
+    })
+    .join('');
+  return `<p${attrs}>${body}</p>`;
+}
+
+export function rtfClipboardToHtml(rtf: string): string | null {
+  if (!/^\s*\{\\rtf/i.test(rtf)) return null;
+  const styles = parseRtfStyles(rtf);
+  const paragraphs = parseRtfParagraphs(rtf, styles);
+  if (paragraphs.length === 0) return null;
+  return paragraphs.map((paragraph) => rtfParagraphHtml(paragraph, styles)).join('');
+}
+
 const WORD_BLOCK_STYLE_CLASSES: Record<string, { tag: string; className: string }> = {
   heading1: { tag: 'h1', className: 'pmd-pocket' },
   heading1char: { tag: 'h1', className: 'pmd-pocket' },
@@ -1830,7 +2264,11 @@ function fitBlocks(
  */
 export function reparseClipboardStructuralSlice(event: ClipboardEvent): Slice | null {
   if (typeof document === 'undefined') return null;
-  const html = event.clipboardData?.getData('text/html') ?? '';
+  let html = event.clipboardData?.getData('text/html') ?? '';
+  if (!html.trim()) {
+    const rtf = readClipboardRtf(event.clipboardData);
+    html = rtf ? (rtfClipboardToHtml(rtf) ?? '') : '';
+  }
   if (!html) return null;
   const wrap = document.createElement('div');
   wrap.innerHTML = normalizeWordClipboardHtml(html);

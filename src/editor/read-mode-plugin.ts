@@ -8,7 +8,8 @@
  * The decision is made per text node based on its parent paragraph and
  * its marks:
  *   - In `cite_paragraph`: keep iff carrying `cite_mark`.
- *   - In `card_body` / `paragraph` / `undertag`: keep iff carrying `highlight`.
+ *   - In `card_body` / `paragraph` / `undertag`: keep iff carrying normal
+ *     highlighter or protected/background highlighting.
  *   - Elsewhere (heading paragraphs etc.): no decoration — block-level
  *     CSS handles whether they show.
  *
@@ -46,6 +47,7 @@ import {
   READ_MODE_UNDO_META,
   READ_MODE_DRAG_META,
 } from './reading-marker.js';
+import { textHasReadModeMark } from './read-mode-visibility.js';
 
 /** Meta key that flips read mode on or off for a specific view.
  *  The meta value is the *desired* state — `true` on, `false` off.
@@ -190,10 +192,11 @@ export const readModeAwareRedo: Command = (state, dispatch, view) => {
  *  read-aloud mark — or is a red reading-position marker (so the marker
  *  you drop while reading actually shows). */
 function isReadKept(child: PMNode, markName: string): boolean {
-  return child.marks.some(
-    (m) =>
-      m.type.name === markName ||
-      (m.type.name === 'font_color' && isReadingMarkerColor(m.attrs['color'] as string)),
+  return (
+    textHasReadModeMark(child, markName) ||
+    child.marks.some(
+      (m) => m.type.name === 'font_color' && isReadingMarkerColor(m.attrs['color'] as string),
+    )
   );
 }
 
