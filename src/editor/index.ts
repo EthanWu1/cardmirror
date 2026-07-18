@@ -594,7 +594,9 @@ async function copyCurrentHeadingIn(sourceView: EditorView): Promise<void> {
   const range = resolveCursorStructureRange(sourceView);
   if (!range) return;
   const slice = sourceView.state.doc.slice(range.from, range.to);
-  const html = serializeCardMirrorClipboardHtml(slice.content, sourceView.state.schema);
+  const html = serializeCardMirrorClipboardHtml(slice.content, sourceView.state.schema, {
+    bodyFont: () => settings.get('bodyFont'),
+  });
   const text = slice.content.textBetween(0, slice.content.size, '\n', '\n');
   try {
     if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined') {
@@ -4938,7 +4940,9 @@ export function buildEditorPlugins(targetUid?: string | null): Plugin[] {
           }
           return clipboard;
         },
-        clipboardSerializer: cardMirrorClipboardSerializer(schema),
+        clipboardSerializer: cardMirrorClipboardSerializer(schema, {
+          bodyFont: () => settings.get('bodyFont'),
+        }),
       },
     }),
   ];
@@ -8008,7 +8012,11 @@ const SHARED_DOC_AUTOSAVE_DELAY_MS = 1000;
 
 function sharedDocAutosaveForced(): boolean {
   const file = activeFile();
-  return file.format === 'cmir' && activeSharedDoc() != null;
+  return (
+    file.format === 'cmir' &&
+    activeSharedDoc() != null &&
+    collabCopresenceFor(activeDocIdentity().sessionUid)?.role === 'host'
+  );
 }
 const JOURNAL_DELAY_MS = 3000;
 let autosaveTimer: number | null = null;

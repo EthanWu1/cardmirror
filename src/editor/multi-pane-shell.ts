@@ -263,7 +263,11 @@ const AUTOSAVE_DELAY_MS = 5000;
 const SHARED_DOC_AUTOSAVE_DELAY_MS = 1000;
 
 function sharedDocAutosaveForced(record: DocRecord): boolean {
-  return record.format === 'cmir' && record.sharedDoc != null;
+  return (
+    record.format === 'cmir' &&
+    record.sharedDoc != null &&
+    collabCopresenceFor(record.uid)?.role === 'host'
+  );
 }
 
 /** Per-DocRecord autosave attempt. Like the single-doc

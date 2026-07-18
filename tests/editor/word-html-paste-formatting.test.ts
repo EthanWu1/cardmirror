@@ -433,6 +433,53 @@ describe('Word HTML paste formatting', () => {
     expect(markNames(textRunInSlice(slice, ' normal body'))).toEqual([]);
   });
 
+  it('exports cite paragraph tails without applying cite styling to the whole paragraph', () => {
+    const doc = schema.nodes['doc']!.create(null, [
+      schema.nodes['card']!.create(null, [
+        schema.nodes['tag']!.create({ id: 't1' }, schema.text('Healthcare costs')),
+        schema.nodes['cite_paragraph']!.create(null, [
+          schema.text('Author 24.', [schema.marks['cite_mark']!.create()]),
+          schema.text(' explanatory tail'),
+        ]),
+      ]),
+    ]);
+    const html = serializeCardMirrorClipboardHtml(doc.content, schema);
+    const wrap = document.createElement('div');
+    wrap.innerHTML = html;
+
+    const paraStyle = wrap.querySelector<HTMLElement>('.pmd-cite-para')?.getAttribute('style') ?? '';
+    const citeStyle = wrap.querySelector<HTMLElement>('.pmd-cite')?.getAttribute('style') ?? '';
+
+    expect(paraStyle).not.toMatch(/Style13ptBold|font-weight\s*:\s*bold|font-size\s*:\s*13/i);
+    expect(citeStyle).toContain('mso-style-name:"Style13ptBold"');
+
+    const slice = parseSliceHtml(normalizeWordClipboardHtml(html));
+    expect(markNames(textRunInSlice(slice, 'Author 24.'))).toEqual(['cite_mark']);
+    expect(markNames(textRunInSlice(slice, ' explanatory tail'))).toEqual([]);
+  });
+
+  it('exports the document body font for Word without reimporting it as a direct mark', () => {
+    const doc = schema.nodes['doc']!.create(null, [
+      schema.nodes['paragraph']!.create(null, [schema.text('normal body')]),
+    ]);
+    const html = serializeCardMirrorClipboardHtml(doc.content, schema, { bodyFont: 'Calibri' });
+
+    expect(html).toMatch(/font-family:\s*Calibri\b/);
+
+    const nativeHtml = serializeCardMirrorClipboardHtml(
+      schema.nodes['doc']!.create(null, [
+        schema.nodes['card']!.create(null, [
+          schema.nodes['tag']!.create({ id: 't1' }, schema.text('Tag')),
+          schema.nodes['card_body']!.create(null, [schema.text('normal body')]),
+        ]),
+      ]).content,
+      schema,
+      { bodyFont: 'Calibri' },
+    );
+    const slice = parseSliceHtml(normalizeWordClipboardHtml(nativeHtml));
+    expect(markNames(textRunInSlice(slice, 'normal body'))).not.toContain('font_family');
+  });
+
   it('uses Mac Word heading metadata even when every heading element is h1', () => {
     const slice = parseSliceHtml(normalizeWordClipboardHtml(`
       <h1 style='mso-style-name:"Heading 1"; mso-outline-level:1'>Pocket title</h1>
@@ -447,6 +494,25 @@ describe('Word HTML paste formatting', () => {
       'block',
       'tag',
     ]);
+  });
+
+  it('uses a Mac Word Tag character style over generic Heading 3 metadata', () => {
+    const slice = parseSliceHtml(normalizeWordClipboardHtml(`
+      <style>
+        h1.MsoHeading3 { mso-style-name:"Heading 3"; mso-outline-level:3; font-weight:bold; }
+        span.MsoTagChar { mso-style-name:"Tag Char"; font-weight:bold; font-size:13.0pt; }
+        span.WordCite { mso-style-name:"Style13ptBold"; font-weight:bold; font-size:13.0pt; }
+      </style>
+      <h1 class="MsoHeading3"><span class="MsoTagChar">Healthcare costs</span></h1>
+      <p class="MsoNormal">
+        <span class="WordCite">Author 24.</span>
+        <span> plain cite tail</span>
+      </p>
+    `));
+
+    expect(sliceTopNodeNames(slice)).toEqual(['tag', 'cite_paragraph']);
+    expect(markNames(textRunInSlice(slice, 'Author 24.'))).toEqual(['cite_mark']);
+    expect(markNames(textRunInSlice(slice, ' plain cite tail'))).toEqual([]);
   });
 
   it('exports CardMirror clipboard HTML with Word-readable heading and mark styles', () => {

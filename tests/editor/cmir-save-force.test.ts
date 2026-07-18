@@ -19,4 +19,9 @@ describe('.cmir save conflict handling', () => {
     expect(multiPaneSource).toContain("await host.saveExisting(record.handle, bytes, { force: true })");
     expect(multiPaneSource).toContain("await getHost().saveExisting(rec.handle, bytes, { force: true })");
   });
+
+  it('only lets the host force-autosave a live shared .cmir to the sync folder', () => {
+    expect(editorIndexSource).toContain("collabCopresenceFor(activeDocIdentity().sessionUid)?.role === 'host'");
+    expect(multiPaneSource).toContain("collabCopresenceFor(record.uid)?.role === 'host'");
+  });
 });

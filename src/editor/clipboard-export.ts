@@ -11,6 +11,12 @@ interface WordStyleRule {
   css: Record<string, string>;
 }
 
+export interface CardMirrorClipboardOptions {
+  bodyFont?: string | (() => string | null | undefined) | null;
+}
+
+const BODY_FONT_SELECTOR = 'p,h1,h2,h3,h4,h5,h6,li,td,th';
+
 const BLOCK_STYLE_RULES: WordStyleRule[] = [
   {
     selector: '.pmd-pocket',
@@ -73,10 +79,9 @@ const BLOCK_STYLE_RULES: WordStyleRule[] = [
   },
   {
     selector: '.pmd-cite-para',
-    styleName: '"Style13ptBold"',
+    styleName: 'Normal',
     css: {
-      'font-weight': 'bold',
-      'font-size': '13pt',
+      'font-size': '11pt',
     },
   },
   {
@@ -191,7 +196,16 @@ function cssFontFamilyValue(name: string): string {
   return `"${clean.replace(/["\\]/g, '\\$&')}"`;
 }
 
-function decorateElement(el: HTMLElement): void {
+function resolveBodyFont(options: CardMirrorClipboardOptions | undefined): string | null {
+  const raw = typeof options?.bodyFont === 'function' ? options.bodyFont() : options?.bodyFont;
+  const font = String(raw ?? '').trim();
+  return font || null;
+}
+
+function decorateElement(el: HTMLElement, bodyFont: string | null): void {
+  if (bodyFont && el.matches(BODY_FONT_SELECTOR)) {
+    addStyles(el, { 'font-family': cssFontFamilyValue(bodyFont) });
+  }
   for (const rule of BLOCK_STYLE_RULES) {
     if (el.matches(rule.selector)) addWordStyle(el, rule);
   }
@@ -209,27 +223,40 @@ function decorateElement(el: HTMLElement): void {
   if (fontFamily) addStyles(el, { 'font-family': cssFontFamilyValue(fontFamily) });
 }
 
-export function decorateCardMirrorClipboardFragment<T extends ParentNode>(root: T): T {
-  if (root instanceof HTMLElement) decorateElement(root);
+export function decorateCardMirrorClipboardFragment<T extends ParentNode>(
+  root: T,
+  options?: CardMirrorClipboardOptions,
+): T {
+  const bodyFont = resolveBodyFont(options);
+  if (root instanceof HTMLElement) decorateElement(root, bodyFont);
   for (const el of Array.from(root.querySelectorAll<HTMLElement>('*'))) {
-    decorateElement(el);
+    decorateElement(el, bodyFont);
   }
   return root;
 }
 
-export function serializeCardMirrorClipboardHtml(fragment: Fragment, schema: Schema): string {
+export function serializeCardMirrorClipboardHtml(
+  fragment: Fragment,
+  schema: Schema,
+  options?: CardMirrorClipboardOptions,
+): string {
   const serializer = DOMSerializer.fromSchema(schema);
   const container = document.createElement('div');
-  container.appendChild(decorateCardMirrorClipboardFragment(serializer.serializeFragment(fragment)));
+  container.appendChild(
+    decorateCardMirrorClipboardFragment(serializer.serializeFragment(fragment), options),
+  );
   return container.innerHTML;
 }
 
-export function cardMirrorClipboardSerializer(schema: Schema): DOMSerializer {
+export function cardMirrorClipboardSerializer(
+  schema: Schema,
+  clipboardOptions?: CardMirrorClipboardOptions,
+): DOMSerializer {
   const base = DOMSerializer.fromSchema(schema);
   return {
     serializeFragment(fragment: Fragment, options?: Parameters<DOMSerializer['serializeFragment']>[1], target?: Parameters<DOMSerializer['serializeFragment']>[2]) {
       const root = base.serializeFragment(fragment, options, target);
-      return decorateCardMirrorClipboardFragment(root);
+      return decorateCardMirrorClipboardFragment(root, clipboardOptions);
     },
     serializeNode: base.serializeNode.bind(base),
   } as unknown as DOMSerializer;

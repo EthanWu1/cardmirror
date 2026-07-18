@@ -529,6 +529,28 @@ function stripItalicFormatting(el: HTMLElement): void {
   }
 }
 
+function stripNamedStyleDirectFormatting(el: HTMLElement, className: string): void {
+  if (className === 'pmd-cite') {
+    removeStyleDeclarations(el, [
+      'font-weight',
+      'mso-bidi-font-weight',
+      'font-size',
+    ]);
+    return;
+  }
+  if (className === 'pmd-emphasis') {
+    stripItalicFormatting(el);
+    return;
+  }
+  if (className === 'pmd-underline') {
+    removeStyleDeclarations(el, ['text-decoration', 'text-decoration-line']);
+    return;
+  }
+  if (className === 'pmd-undertag-mark' || className === 'pmd-analytic-mark') {
+    removeStyleDeclarations(el, ['color']);
+  }
+}
+
 function wrapElementChildrenWithMark(el: HTMLElement, className: string): HTMLElement {
   const wrapper = document.createElement('span');
   wrapper.className = className;
@@ -762,6 +784,7 @@ function stripNativeCardMirrorClipboardStyles(el: HTMLElement): void {
     'text-decoration-line',
     'border',
     'color',
+    'font-family',
   ];
   if (nativeCardMirrorBlockTag(el) || hasNativeCardMirrorMarkClass(el)) {
     removeStyleDeclarations(el, strip);
@@ -825,7 +848,7 @@ function normalizeWordNamedStyles(html: string): string {
       : el;
     if (className) addClass(target, className);
     applyWordClassFormatting(target, classInfo);
-    if (className === 'pmd-emphasis') stripItalicFormatting(target);
+    if (className) stripNamedStyleDirectFormatting(target, className);
   }
 
   for (const el of Array.from(wrap.querySelectorAll<HTMLElement>('p,h1,h2,h3,h4'))) {
@@ -833,8 +856,8 @@ function normalizeWordNamedStyles(html: string): string {
     if (!className || el.querySelector(`.${className}`)) continue;
     const target = wrapElementChildrenWithMark(el, className);
     applyWordClassFormatting(target, classInfo);
+    stripNamedStyleDirectFormatting(target, className);
     if (className === 'pmd-emphasis') {
-      stripItalicFormatting(target);
       removeStyleDeclarations(el, ['font-style', 'mso-bidi-font-style']);
     }
   }
