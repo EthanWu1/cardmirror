@@ -1,0 +1,31 @@
+# One-command self-hosted CardMirror relay:
+#   RELAY_TOKEN=$(openssl rand -hex 24) docker compose up -d
+# Then set Settings -> Collaboration -> Custom relay URL to
+# http://<host>:8410/relay and Custom relay token to the same token.
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: relay
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+    volumes:
+      - relay_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay"]
+      interval: 3s
+      retries: 10
+
+  relay:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://relay:relay@postgres:5432/relay
+      RELAY_TOKEN: ${RELAY_TOKEN:?set RELAY_TOKEN}
+    ports:
+      - "8410:8000"
+
+volumes:
+  relay_pgdata:

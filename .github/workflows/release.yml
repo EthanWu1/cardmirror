@@ -1,0 +1,222 @@
+name: Release
+
+# Triggered when a git tag matching `v*.*.*` (e.g. `v0.1.0-alpha.1`)
+# is pushed. Two stages:
+#
+#   1. `prepare-release` (one runner) creates an empty draft on
+#      GitHub Releases for the tag. Idempotent — if a draft already
+#      exists (e.g., a re-triggered run), it's a no-op.
+#   2. `build` (3-OS matrix) builds desktop installers and uploads
+#      them to the draft via electron-builder's GitHub provider.
+#
+# The two-stage shape avoids the matrix-race we hit on alpha.2:
+# without a pre-existing draft, three matrix jobs concurrently
+# checked GitHub Releases, all saw "no release for this tag," and
+# each created its own draft — assets ended up split across two
+# drafts that needed manual reconciliation. The dependent
+# `prepare-release` step makes sure every matrix job sees the same
+# draft.
+#
+# Builds are unsigned for the beta. README documents the
+# right-click → Open / More info → Run anyway workaround for the
+# first-launch warnings on macOS Gatekeeper and Windows SmartScreen.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  prepare-release:
+    name: Create draft release for tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract release notes from CHANGELOG.md
+        # Two-step extraction:
+        #   1. `awk` pulls the section between the matching version
+        #      header and the next `## ` header. Falls back to an
+        #      empty file if no matching section exists; the next
+        #      step then creates the draft with a placeholder body.
+        #      Strip a leading `v` from the tag because CHANGELOG
+        #      uses bare versions (`## 0.1.0-alpha.3 — DATE`) while
+        #      tags carry the `v` prefix.
+        #   2. `unwrap` collapses CHANGELOG's hand-wrapped lines
+        #      within each bullet into a single line. GitHub
+        #      renders single newlines in release notes as `<br>`,
+        #      which makes our ~62-col wrapping show up as visible
+        #      line breaks mid-sentence. Joining continuation lines
+        #      (indented more than the bullet's `-` marker, with
+        #      non-blank content) into the bullet itself preserves
+        #      the visual paragraph while keeping nested bullets,
+        #      headings, and blank lines as-is.
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          if [ -f CHANGELOG.md ]; then
+            awk -v ver="$VERSION" '
+              $0 ~ "^## " ver { flag=1; next }
+              /^## / && flag { flag=0 }
+              flag { print }
+            ' CHANGELOG.md | awk '
+              function flush() {
+                if (buf != "") {
+                  for (i = 0; i < indent; i++) printf " "
+                  printf "- %s\n", buf
+                  buf = ""
+                  indent = -1
+                }
+              }
+              BEGIN { buf = ""; indent = -1 }
+              /^( *)- / {
+                flush()
+                match($0, /^( *)- /)
+                indent = RLENGTH - 2
+                buf = substr($0, RLENGTH + 1)
+                next
+              }
+              indent >= 0 && /^[ \t]+[^ \t]/ {
+                # Continuation: strip leading whitespace, join.
+                sub(/^[ \t]+/, "")
+                buf = buf " " $0
+                next
+              }
+              { flush(); print }
+              END { flush() }
+            ' > release-notes.md
+          else
+            : > release-notes.md
+          fi
+          if [ ! -s release-notes.md ]; then
+            echo "Release notes not found in CHANGELOG for $VERSION — using fallback body." >&2
+            echo "_(Release notes not yet pasted from CHANGELOG.md — maintainer should edit.)_" > release-notes.md
+          fi
+          echo "Wrote $(wc -l < release-notes.md) lines of notes."
+
+      - name: Ensure draft release exists
+        # `gh release view` exits non-zero if no release exists for
+        # the tag, so the `||` falls through to creating one. If
+        # the release already exists (e.g., a re-run of the
+        # workflow), update its notes in place from CHANGELOG so a
+        # re-trigger after a CHANGELOG fix actually refreshes the
+        # draft.
+        #
+        # Pre-release detection: SemVer treats any tag with a `-`
+        # after the version (e.g., `v0.1.0-alpha.3`, `v1.2.0-rc.1`,
+        # `v0.1.0-beta`) as a pre-release. Pass `--prerelease` so
+        # GitHub flags it accordingly in the Releases UI and
+        # auto-update consumers know not to treat it as stable.
+        # Stable tags (`v1.0.0`) skip the flag.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # The tag is `vX.Y.Z[-prerelease]`; check for `-` after `v`.
+          PRERELEASE_FLAG=""
+          if [[ "${TAG#v}" == *-* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+            echo "Detected pre-release tag $TAG — applying --prerelease."
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file release-notes.md $PRERELEASE_FLAG
+            echo "Updated existing release $TAG with refreshed notes."
+          else
+            gh release create "$TAG" --draft --title "$TAG" --notes-file release-notes.md $PRERELEASE_FLAG
+            echo "Created draft release $TAG."
+          fi
+
+  build:
+    name: Build & publish (${{ matrix.os }})
+    needs: prepare-release
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install desktop dependencies
+        # apps/desktop is intentionally NOT in the workspaces array
+        # (electron-builder's internal install step prunes hoisted
+        # dev-deps mid-build under npm workspaces — separate install
+        # is the workaround). Each platform's runner does its own
+        # install here.
+        run: npm --prefix apps/desktop ci
+
+      - name: Bundle both macOS koffi arch binaries
+        # macos-latest runners are Apple Silicon, so the `ci` above only
+        # installs koffi's arm64 native package — the @koromix/koffi-darwin-*
+        # binaries are optional deps gated on `cpu`, so the x64 one is
+        # skipped. electron-builder then builds BOTH the x64 and arm64 dmgs
+        # from that single install, so the x64 dmg would ship with no koffi
+        # binary and Intel Macs (or Apple Silicon under Rosetta) hit
+        # "Cannot find the native Koffi module". Force-install both arch
+        # packages at koffi's own version so each dmg carries the binary it
+        # needs. --force bypasses the cpu guard; --no-save keeps the lockfile
+        # untouched (the package still lands in the hidden lockfile, so
+        # electron-builder's dependency collector bundles it).
+        if: matrix.os == 'macos-latest'
+        run: |
+          KOFFI_VER=$(node -p "require('./apps/desktop/node_modules/koffi/package.json').version")
+          npm --prefix apps/desktop install --no-save --force \
+            "@koromix/koffi-darwin-x64@$KOFFI_VER" \
+            "@koromix/koffi-darwin-arm64@$KOFFI_VER"
+
+      - name: Install Linux build tools
+        # fpm (the Ruby tool electron-builder shells out to for
+        # .pacman / .deb) needs `bsdtar` to assemble the package's
+        # .MTREE file. Ubuntu runners don't ship libarchive-tools
+        # by default — install it here.
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libarchive-tools
+
+      - name: Run tests
+        # Same as the CI workflow — runs against ubuntu but we let
+        # the other platforms skip to save build minutes; the
+        # build itself catches any platform-specific issues.
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          # Heavy transclusion/collab fuzz suites peak past the default ~4 GB
+          # V8 heap on a CI runner — give the vitest fork workers more room.
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: npm test
+
+      - name: Bake relay defaults into the build
+        # Cross-machine card sharing: a packaged app can't read shell env, so
+        # private relay defaults have to be compiled in. This writes optional
+        # PAIRING_RELAY_URL and PAIRING_TOKEN secrets into pairing-build.ts in
+        # this ephemeral checkout only — the token is never committed. Card
+        # payloads are end-to-end encrypted, so the token is only light
+        # gating. No-op (empty defaults) if the secrets are not set.
+        env:
+          PAIRING_RELAY_URL: ${{ secrets.PAIRING_RELAY_URL }}
+          PAIRING_TOKEN: ${{ secrets.PAIRING_TOKEN }}
+        run: node apps/desktop/scripts/inject-relay-token.cjs
+
+      - name: Build and publish desktop installer
+        env:
+          # electron-builder reads GH_TOKEN (not GITHUB_TOKEN) for
+          # GitHub Releases publishing. The `prepare-release` job
+          # above already created the draft for this tag, so
+          # electron-builder's "always" publish mode finds and
+          # uploads to it instead of racing to create a new draft.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm --prefix apps/desktop run release

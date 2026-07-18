@@ -1,0 +1,91 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Node / future build artifacts (placeholders for when we have code)
+node_modules/
+dist/
+build/
+.next/
+.turbo/
+*.log
+.env
+.env.local
+
+# Word lock files (when example docs are open in Word)
+~$*.docx
+~$*.dotm
+
+# Local extracted-template scratch (we extract Debate.dotm to /tmp/, but
+# guard against accidental in-repo extraction)
+/_extracted/
+
+# Vite build output
+dist/
+.vite/
+
+# Reference docs (Verbatim upstream, example .docx files, Debate.dotm,
+# custom macro exports). Kept locally for development reference but
+# not part of the repo.
+reference-docs/
+
+# Compiled Electron main/preload output (apps/desktop/dist).
+# Already covered by the root `dist/` rule above, but called out
+# here since the desktop workspace builds into apps/desktop/dist.
+apps/desktop/dist/
+
+# Electron-builder artifacts (Phase 5).
+release/
+
+# Voice recognition assets (libvosk + the 128 MB vosk model) — fetched
+# by apps/desktop/scripts/fetch-voice-assets.cjs at build time, never
+# committed.
+apps/desktop/resources/voice/
+
+# macOS AX-suppression dylib — compiled from native/ax-suppress.m by
+# apps/desktop/scripts/build-ax-suppress.cjs at build time (the .m source
+# is committed; the built binary is not).
+apps/desktop/resources/native/
+
+# `build/` is gitignored above as a generic build-output directory,
+# but electron-builder's `buildResources` lives at
+# apps/desktop/build/ and holds tracked source assets (icon.png).
+# Re-include that specific path.
+!apps/desktop/build/
+!apps/desktop/build/**
+
+# Local-only running notes / wishlist / scratchpad files. WISHLIST.md
+# is the running queue of usability ideas and feedback to act on
+# before the next release. WISHLIST.assets/ holds screenshots and
+# other binary attachments referenced from the wishlist.
+WISHLIST.md
+WISHLIST.assets/
+
+# Local-only investigation / audit working docs (white-screen crash
+# investigation, crash-reporting scoping, perf & housecleaning audit)
+# and the white-screen repro harness.
+WHITE_SCREEN_AUDIT.md
+WHITE_SCREEN_FIX_PLAN.md
+CRASH_REPORTING_SCOPE.md
+PERF_HOUSECLEANING_AUDIT.md
+repro-white-screen.ts
+COLOR_AUDIT.md
+PAIRING_V2_PLAN.md
+PAIRING_AUTH_TURNKEY.md
+COLLAB_CRDT_PLAN.md
+COLLAB_MULTIDOC_PLAN.md
+TRANSCLUSION_PLAN.md
+NUMBERING_PLAN.md
+UNTESTED_CHANGES.md
+
+# Collab bake-off harness (M1 measurement rig — throwaway, deps installed
+# with --no-save; see COLLAB_CRDT_PLAN.md §9 M1)
+bakeoff/
+
+# Python bytecode (relay/ smoke tests)
+__pycache__/
