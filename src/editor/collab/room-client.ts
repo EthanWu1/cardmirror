@@ -315,6 +315,9 @@ export interface RoomStreamOptions {
   retryMissingRoom?: boolean;
 }
 
+const DEFAULT_STREAM_MIN_BACKOFF_MS = 150;
+const DEFAULT_STREAM_MAX_BACKOFF_MS = 8_000;
+
 export class RoomStream {
   private controller: AbortControllerLike | null = null;
   private stopped = true;
@@ -326,7 +329,7 @@ export class RoomStream {
   private authRejectedNotified = false;
 
   constructor(private readonly opts: RoomStreamOptions) {
-    this.backoffMs = opts.minBackoffMs ?? 1000;
+    this.backoffMs = opts.minBackoffMs ?? DEFAULT_STREAM_MIN_BACKOFF_MS;
   }
 
   get running(): boolean {
@@ -342,7 +345,7 @@ export class RoomStream {
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
-    this.backoffMs = this.opts.minBackoffMs ?? 1000;
+    this.backoffMs = this.opts.minBackoffMs ?? DEFAULT_STREAM_MIN_BACKOFF_MS;
     this.initialFullSince = 0;
     void this.connectLoop();
   }
@@ -364,7 +367,7 @@ export class RoomStream {
    *  hello, and the stream never connects while the user types. */
   restart(): void {
     if (this.stopped) return;
-    this.backoffMs = this.opts.minBackoffMs ?? 1000;
+    this.backoffMs = this.opts.minBackoffMs ?? DEFAULT_STREAM_MIN_BACKOFF_MS;
     if (this.retryTimer !== null) {
       // Sitting out a backoff wait — wake-from-sleep must not serve the
       // remainder of a pre-sleep delay before reconnecting (audit find,
@@ -384,7 +387,7 @@ export class RoomStream {
     if (this.retryTimer !== null) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
-      this.backoffMs = this.opts.minBackoffMs ?? 1000;
+      this.backoffMs = this.opts.minBackoffMs ?? DEFAULT_STREAM_MIN_BACKOFF_MS;
       void this.connectLoop();
     }
   }
@@ -395,7 +398,7 @@ export class RoomStream {
       this.helloed = false;
       this.opts.callbacks.onDown?.();
     }
-    const max = this.opts.maxBackoffMs ?? 60_000;
+    const max = this.opts.maxBackoffMs ?? DEFAULT_STREAM_MAX_BACKOFF_MS;
     // ±30% jitter so a fleet doesn't reconnect in lockstep.
     const jitter = 0.7 + Math.random() * 0.6;
     const delay = Math.min(this.backoffMs, max) * jitter;
@@ -408,7 +411,7 @@ export class RoomStream {
 
   private dispatchFrame(eventName: string, dataText: string): void {
     if (eventName === 'hello') {
-      this.backoffMs = this.opts.minBackoffMs ?? 1000;
+      this.backoffMs = this.opts.minBackoffMs ?? DEFAULT_STREAM_MIN_BACKOFF_MS;
       this.helloed = true;
       this.everHelloed = true;
       this.initialFullSince = 0;

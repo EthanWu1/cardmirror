@@ -182,6 +182,39 @@ describe('RoomStream', () => {
     stream.stop();
   });
 
+  it('uses quick default reconnects so a live shared document does not require reopening', async () => {
+    const roomId = await client.createRoom();
+    const hellos: number[] = [];
+    const stream = new RoomStream({
+      baseUrl: () => mock.url,
+      token: () => mock.token,
+      roomId,
+      callbacks: {
+        onHello: (n) => hellos.push(n),
+        onUpdate: () => {},
+        onPresence: () => {},
+        onEnded: () => {},
+        onFull: () => {},
+      },
+    });
+    stream.start();
+    try {
+      await sleep(80);
+      expect(hellos.length).toBe(1);
+
+      mock.pause();
+      stream.restart();
+      await sleep(60);
+      mock.resume();
+      await sleep(500);
+
+      expect(hellos.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      stream.stop();
+      mock.resume();
+    }
+  });
+
   it('can keep durable document streams alive across transient missing-room responses', async () => {
     const attemptsBefore = mock.streamAttempts();
     let ended = 0;

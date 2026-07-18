@@ -7820,6 +7820,14 @@ async function runSaveFlowInner(): Promise<boolean> {
     return runSaveAsFlow();
   }
   const documentFormat = file.format;
+  if (!activeSharedDocDiskWriter()) {
+    const commitClean = captureActiveDocCleanToken();
+    commitClean();
+    flashSaveSuccess();
+    reportAutosaveSuccess();
+    showToast('Saved to live session');
+    return true;
+  }
   // Request write access (browser: the readwrite permission prompt) NOW, while
   // this Save's user-activation is fresh and BEFORE the potentially slow
   // serialize — so the prompt only appears on real save intent, in context.
@@ -8018,6 +8026,13 @@ function sharedDocAutosaveForced(): boolean {
     collabCopresenceFor(activeDocIdentity().sessionUid)?.role === 'host'
   );
 }
+
+function activeSharedDocDiskWriter(): boolean {
+  const file = activeFile();
+  if (file.format !== 'cmir' || activeSharedDoc() == null) return true;
+  const copresence = collabCopresenceFor(activeDocIdentity().sessionUid);
+  return copresence == null || copresence.role === 'host';
+}
 const JOURNAL_DELAY_MS = 3000;
 let autosaveTimer: number | null = null;
 let journalTimer: number | null = null;
@@ -8040,6 +8055,7 @@ export function notifyEditForAutosave(): void {
 
 function scheduleAutosaveAttempt(): void {
   if (!settings.get('autosaveEnabled') && !sharedDocAutosaveForced()) return;
+  if (!activeSharedDocDiskWriter()) return;
   if (autosaveTimer !== null) window.clearTimeout(autosaveTimer);
   const delay = sharedDocAutosaveForced() ? SHARED_DOC_AUTOSAVE_DELAY_MS : AUTOSAVE_DELAY_MS;
   autosaveTimer = window.setTimeout(() => {
@@ -8156,6 +8172,7 @@ async function runAutosaveAttempt(): Promise<void> {
     }
     return;
   }
+  if (!activeSharedDocDiskWriter()) return;
   const file = activeFile();
   // Autosave only saves `.cmir` files. The toDocx path is too
   // expensive for background firing; users keep manual control

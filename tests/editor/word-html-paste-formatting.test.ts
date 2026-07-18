@@ -540,6 +540,58 @@ describe('Word HTML paste formatting', () => {
     expect(html).toContain('text-decoration:underline');
   });
 
+  it('does not export guessed direct heading or cite typography that overrides Word styles', () => {
+    const doc = schema.nodes['doc']!.create(null, [
+      schema.nodes['pocket']!.create({ id: 'p1' }, schema.text('Pocket')),
+      schema.nodes['hat']!.create({ id: 'h1' }, schema.text('Hat')),
+      schema.nodes['block']!.create({ id: 'b1' }, schema.text('Block')),
+      schema.nodes['card']!.create(null, [
+        schema.nodes['tag']!.create({ id: 't1' }, schema.text('Tag')),
+        schema.nodes['cite_paragraph']!.create(null, [
+          schema.text('Author 24', [schema.marks['cite_mark']!.create()]),
+          schema.text(' plain tail'),
+        ]),
+      ]),
+    ]);
+    const html = serializeCardMirrorClipboardHtml(doc.content, schema, { bodyFont: 'Calibri' });
+    const wrap = document.createElement('div');
+    wrap.innerHTML = html;
+
+    for (const selector of ['.pmd-pocket', '.pmd-hat', '.pmd-block', '.pmd-tag']) {
+      const style = wrap.querySelector<HTMLElement>(selector)?.getAttribute('style') ?? '';
+      expect(style).toContain('mso-style-name');
+      expect(style).not.toMatch(/font-size\s*:/i);
+      expect(style).not.toMatch(/font-weight\s*:/i);
+    }
+
+    const citeParaStyle = wrap.querySelector<HTMLElement>('.pmd-cite-para')?.getAttribute('style') ?? '';
+    const citeStyle = wrap.querySelector<HTMLElement>('.pmd-cite')?.getAttribute('style') ?? '';
+    expect(citeParaStyle).toContain('mso-style-name:Normal');
+    expect(citeParaStyle).toMatch(/font-family:\s*Calibri\b/);
+    expect(citeParaStyle).not.toMatch(/font-size\s*:/i);
+    expect(citeStyle).toContain('mso-style-name:"Style13ptBold"');
+    expect(citeStyle).not.toMatch(/font-size\s*:/i);
+    expect(citeStyle).not.toMatch(/font-weight\s*:/i);
+  });
+
+  it('recognizes Mac Word Tag linked to Heading 3 and keeps the citation tail normal', () => {
+    const slice = parseSliceHtml(normalizeWordClipboardHtml(`
+      <style>
+        p.MsoHeading3 { mso-style-name:"Heading 3"; mso-style-link:"Tag"; mso-outline-level:3; font-weight:bold; }
+        span.WordCite { mso-style-name:"Style13ptBold"; font-weight:bold; font-size:13.0pt; }
+      </style>
+      <p class="MsoHeading3"><span>Healthcare costs</span></p>
+      <p class="MsoNormal">
+        <span class="WordCite">McCuskey 24.</span>
+        <span> Journal of Health Economics.</span>
+      </p>
+    `));
+
+    expect(sliceTopNodeNames(slice)).toEqual(['tag', 'cite_paragraph']);
+    expect(markNames(textRunInSlice(slice, 'McCuskey 24.'))).toEqual(['cite_mark']);
+    expect(markNames(textRunInSlice(slice, ' Journal of Health Economics.'))).toEqual([]);
+  });
+
   it('exports font-family as standard clipboard CSS for other apps', () => {
     const doc = schema.nodes['doc']!.create(null, [
       schema.nodes['paragraph']!.create(null, [

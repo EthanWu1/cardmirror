@@ -23,8 +23,6 @@ const BLOCK_STYLE_RULES: WordStyleRule[] = [
     styleName: '"Heading 1"',
     outlineLevel: 1,
     css: {
-      'font-weight': 'bold',
-      'font-size': '18pt',
       'text-align': 'center',
       border: '1.5pt solid #000',
     },
@@ -34,8 +32,6 @@ const BLOCK_STYLE_RULES: WordStyleRule[] = [
     styleName: '"Heading 2"',
     outlineLevel: 2,
     css: {
-      'font-weight': 'bold',
-      'font-size': '16pt',
       'text-align': 'center',
       'text-decoration': 'underline double',
     },
@@ -45,8 +41,6 @@ const BLOCK_STYLE_RULES: WordStyleRule[] = [
     styleName: '"Block Headings"',
     outlineLevel: 3,
     css: {
-      'font-weight': 'bold',
-      'font-size': '14pt',
       'text-align': 'center',
       'text-decoration': 'underline',
     },
@@ -55,18 +49,13 @@ const BLOCK_STYLE_RULES: WordStyleRule[] = [
     selector: '.pmd-tag',
     styleName: 'Tag',
     outlineLevel: 4,
-    css: {
-      'font-weight': 'bold',
-      'font-size': '13pt',
-    },
+    css: {},
   },
   {
     selector: '.pmd-analytic',
     styleName: 'Analytic',
     outlineLevel: 4,
     css: {
-      'font-weight': 'bold',
-      'font-size': '13pt',
       color: '#1F3864',
     },
   },
@@ -80,16 +69,12 @@ const BLOCK_STYLE_RULES: WordStyleRule[] = [
   {
     selector: '.pmd-cite-para',
     styleName: 'Normal',
-    css: {
-      'font-size': '11pt',
-    },
+    css: {},
   },
   {
     selector: '.pmd-card-body',
     styleName: 'Normal',
-    css: {
-      'font-size': '11pt',
-    },
+    css: {},
   },
 ];
 
@@ -97,10 +82,7 @@ const MARK_STYLE_RULES: WordStyleRule[] = [
   {
     selector: '.pmd-cite',
     styleName: '"Style13ptBold"',
-    css: {
-      'font-weight': 'bold',
-      'font-size': '13pt',
-    },
+    css: {},
   },
   {
     selector: '.pmd-underline',

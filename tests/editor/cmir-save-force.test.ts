@@ -24,4 +24,13 @@ describe('.cmir save conflict handling', () => {
     expect(editorIndexSource).toContain("collabCopresenceFor(activeDocIdentity().sessionUid)?.role === 'host'");
     expect(multiPaneSource).toContain("collabCopresenceFor(record.uid)?.role === 'host'");
   });
+
+  it('prevents non-host live shared .cmir autosave/manual saves from writing the Dropbox file', () => {
+    expect(editorIndexSource).toContain('activeSharedDocDiskWriter()');
+    expect(editorIndexSource).toContain('if (!activeSharedDocDiskWriter()) return');
+    expect(editorIndexSource).toContain('if (!activeSharedDocDiskWriter()) {');
+    expect(multiPaneSource).toContain('sharedDocDiskWriter(record)');
+    expect(multiPaneSource).toContain('if (!sharedDocDiskWriter(record)) return');
+    expect(multiPaneSource).toContain('if (!sharedDocDiskWriter(rec)) {');
+  });
 });

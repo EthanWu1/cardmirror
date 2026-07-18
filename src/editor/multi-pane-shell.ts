@@ -270,6 +270,12 @@ function sharedDocAutosaveForced(record: DocRecord): boolean {
   );
 }
 
+function sharedDocDiskWriter(record: DocRecord): boolean {
+  if (record.format !== 'cmir' || record.sharedDoc == null) return true;
+  const copresence = collabCopresenceFor(record.uid);
+  return copresence == null || copresence.role === 'host';
+}
+
 /** Per-DocRecord autosave attempt. Like the single-doc
  *  `runAutosaveAttempt`, but bound to `record` instead of the
  *  module-level focused view — so edits in pane A flush to A's
@@ -277,6 +283,7 @@ function sharedDocAutosaveForced(record: DocRecord): boolean {
  *  per-record, .cmir + saved-once only, supportsInPlaceSave host. */
 async function runAutosaveForRecord(record: DocRecord): Promise<void> {
   if (!record.autosaveEnabled && !sharedDocAutosaveForced(record)) return;
+  if (!sharedDocDiskWriter(record)) return;
   if (record.format !== 'cmir') return;
   if (typeof record.handle !== 'string' || !record.handle) return;
   const host = getHost();
@@ -316,6 +323,7 @@ async function runAutosaveForRecord(record: DocRecord): Promise<void> {
  *  inner check short-circuits before scheduling. */
 function scheduleAutosaveForRecord(record: DocRecord): void {
   if (!record.autosaveEnabled && !sharedDocAutosaveForced(record)) return;
+  if (!sharedDocDiskWriter(record)) return;
   if (record.autosaveTimer !== null) window.clearTimeout(record.autosaveTimer);
   const delay = sharedDocAutosaveForced(record) ? SHARED_DOC_AUTOSAVE_DELAY_MS : AUTOSAVE_DELAY_MS;
   record.autosaveTimer = window.setTimeout(() => {
@@ -3037,6 +3045,9 @@ class MultiPaneShell {
     if (rec.format !== 'cmir') return;
     if (typeof rec.handle !== 'string' || !rec.handle) return;
     if (!getHost().supportsInPlaceSave) return;
+    if (!sharedDocDiskWriter(rec)) {
+      return;
+    }
     const commitClean = captureCleanToken({
       editGen: () => rec.editGen,
       markClean: () => {
