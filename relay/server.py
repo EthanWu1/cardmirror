@@ -224,6 +224,16 @@ MAX_UPDATE_BYTES = 5 * 1024 * 1024        # one appended blob (chunked client-si
 ROOM_CAP_BYTES = 200 * 1024 * 1024        # total stored per room (updates + snapshot)
 MAX_UPDATES_PER_PAGE = 200
 MAX_STREAMS_PER_ROOM = int(os.getenv("MAX_STREAMS_PER_ROOM", "30"))  # participant ceiling, enforced at stream connect
+# Hard ceiling on how long ONE SSE stream stays open before the server closes
+# it (the client reconnects with backoff + catch-up). This is the reap-of-last-
+# resort for a slot whose client vanished without the server ever seeing the
+# socket close — which happens whenever a TLS-terminating proxy holds the
+# upstream connection open after the browser/app drops (observed on the hosted
+# relay: closed connections kept a room 409-"full" for 75s+, i.e. effectively
+# forever, filling every room with ghosts). With per-client reclaim (below)
+# handling the common reconnect case, this only has to age out true orphans, so
+# it can be generous. 0 disables.
+MAX_STREAM_LIFETIME_SECONDS = int(os.getenv("MAX_STREAM_LIFETIME_SECONDS", "1800"))  # 30 min
 ROOM_IDLE_GC = timedelta(days=7)          # must exceed travel day + tournament weekend
 
 # routing code → open stream queues (single-worker only; see module doc)
@@ -251,6 +261,13 @@ def _push_to_streams(recipient: str, message: dict) -> None:
 
 # room id → open stream queues (single-worker only, like _streams)
 _room_streams: dict[str, set["asyncio.Queue[dict]"]] = {}
+
+# room id → { client id → that client's live stream queue }. Lets a
+# reconnecting client RECLAIM its own slot: when the same client opens a new
+# stream, its previous stream (often a proxy-orphaned ghost the server never
+# saw close) is evicted instead of counted a second time. This is what stops a
+# single user's normal reconnect/reopen churn from filling their own room.
+_room_stream_owners: dict[str, dict[str, "asyncio.Queue[dict]"]] = {}
 
 
 def _push_to_room(room_id: str, frame: dict) -> None:
@@ -783,6 +800,23 @@ async def stream_room(
         raise HTTPException(404, "no such room")
     if room.tombstoned:
         raise HTTPException(410, "session ended")
+
+    # Per-client slot reclaim: a client passes a stable `cid` (its install id).
+    # If it already holds a stream in this room, evict that one FIRST — a
+    # reconnect must reclaim its own slot, not stack a second onto it. Done
+    # before the cap check (and synchronously, no awaits) so the reclaimed
+    # slot is available immediately and there's no interleaving with gen().
+    cid = request.query_params.get("cid") or None
+    if cid:
+        owners = _room_stream_owners.setdefault(room_id, {})
+        prev = owners.pop(cid, None)
+        if prev is not None:
+            _room_streams.get(room_id, set()).discard(prev)
+            try:
+                prev.put_nowait({"t": "__evict__"})  # wake its gen so it returns
+            except asyncio.QueueFull:
+                pass  # its watchdog / lifetime cap will still end it
+
     open_count = len(_room_streams.get(room_id, set()))
     if open_count >= MAX_STREAMS_PER_ROOM:
         raise HTTPException(409, "room is full")
@@ -792,15 +826,30 @@ async def stream_room(
 
     queue: "asyncio.Queue[dict]" = asyncio.Queue(maxsize=STREAM_QUEUE_MAX)
     _room_streams.setdefault(room_id, set()).add(queue)
+    if cid:
+        _room_stream_owners.setdefault(room_id, {})[cid] = queue
 
     async def gen() -> AsyncIterator[str]:
+        deadline = (
+            time.monotonic() + MAX_STREAM_LIFETIME_SECONDS
+            if MAX_STREAM_LIFETIME_SECONDS > 0
+            else None
+        )
         try:
             yield f'event: hello\ndata: {{"lastSeq":{last_seq}}}\n\n'
             while True:
                 if await request.is_disconnected():
                     return
+                # Reap-of-last-resort: force this stream closed once it has been
+                # open too long. The client reconnects (and reclaims its slot
+                # via cid), but a vanished client's orphan stops occupying a
+                # slot forever even when the proxy hid its disconnect.
+                if deadline is not None and time.monotonic() >= deadline:
+                    return
                 try:
                     frame = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_SECONDS)
+                    if frame.get("t") == "__evict__":
+                        return  # a newer stream from the same client replaced us
                     yield f"data: {json.dumps(frame, separators=(',', ':'))}\n\n"
                     if frame.get("t") == "end":
                         return
@@ -812,6 +861,14 @@ async def stream_room(
                 peers.discard(queue)
                 if not peers:
                     _room_streams.pop(room_id, None)
+            # Only clear the owner slot if it's still OURS — a reconnect that
+            # replaced us already re-pointed it at the newer queue.
+            if cid:
+                owners = _room_stream_owners.get(room_id)
+                if owners is not None and owners.get(cid) is queue:
+                    owners.pop(cid, None)
+                    if not owners:
+                        _room_stream_owners.pop(room_id, None)
 
     return StreamingResponse(
         gen(),

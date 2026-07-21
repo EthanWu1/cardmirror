@@ -56,6 +56,18 @@ a VPS…). Requirements:
 - Optional: `MAX_STREAMS_PER_ROOM` controls the per-room SSE cap. The
   default is `30`, which leaves room for stale sockets from laptops that
   slept or crashed before the relay notices they closed.
+- Optional: `MAX_STREAM_LIFETIME_SECONDS` (default `1800` = 30 min) caps how
+  long any one SSE stream stays open before the server closes it and the app
+  reconnects. This is the reap-of-last-resort for a slot whose client vanished
+  without the server ever seeing the socket close — which is common when a
+  TLS-terminating proxy (nginx/Caddy/most PaaS routers) holds the upstream
+  connection open after the browser/app drops. Without it, such "ghost" slots
+  accumulate until a room answers 409 "room is full" to its own participants
+  and stays that way until the process restarts (the stream registry is
+  in-memory, so a restart clears every ghost immediately). Reconnecting clients
+  reclaim their own slot by `?cid=` (a stable per-install id the app sends), so
+  this only has to age out true orphans; keep it well above your heartbeat.
+  Set `0` to disable (not recommended behind a proxy).
 - Required: `--timeout-graceful-shutdown 5` (the Dockerfile sets this).
   Without it a stopped instance waits forever for its open SSE streams
   and lingers as an unbound zombie that keeps heartbeating old clients

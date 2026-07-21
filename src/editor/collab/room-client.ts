@@ -290,6 +290,16 @@ export interface RoomStreamCallbacks {
   onEnded: () => void;
   /** Room stayed at participant capacity (409) after the retry window. */
   onFull: () => void;
+  /** Fired ONCE when a `retryFullRoom` stream has been stuck on 409 for an
+   *  extended stretch — the relay is still holding dead connections for the
+   *  room. Purely informational; retrying continues. */
+  onFullPersisting?: () => void;
+  /** Fired ONCE when a `retryMissingRoom` stream has been getting 404/410 for
+   *  an extended stretch without ever connecting — the durable room is very
+   *  likely gone for good (relay redeploy / wiped storage). Retrying
+   *  continues, but the owner can re-probe and re-host from the local file so
+   *  the doc doesn't sit on "reconnecting" forever (field bug 2026-07-19). */
+  onMissingRoomPersisting?: () => void;
   /** The stream endpoint rejected the bearer (401/403). Retrying continues,
    *  but the UI should not present this as a generic network reconnect. */
   onAuthRejected?: () => void;
@@ -305,6 +315,12 @@ export interface RoomStreamOptions {
   roomId: string;
   callbacks: RoomStreamCallbacks;
   fetchImpl?: RoomsFetch;
+  /** Stable per-install client id, sent as `?cid=` so the relay reclaims THIS
+   *  client's slot on reconnect instead of counting a second stream against
+   *  the room's participant cap (prevents self-inflicted "room full"). Omitted
+   *  in tests / older callers — the relay then falls back to its stream-
+   *  lifetime reaper. */
+  clientId?: () => string;
   /** Backoff bounds, injectable for tests. */
   minBackoffMs?: number;
   maxBackoffMs?: number;
@@ -313,10 +329,27 @@ export interface RoomStreamOptions {
   /** Durable shared-document rooms should treat 404/410 during reconnect as
    *  retryable transport state, not as proof the local session should die. */
   retryMissingRoom?: boolean;
+  /** Durable shared-document rooms can hit the relay's stream cap after sleep
+   *  because dead sockets may take time to reap. Keep retrying instead of
+   *  downgrading the shared file to a local copy. */
+  retryFullRoom?: boolean;
+  /** How long a `retryMissingRoom` stream stays on 404/410 before firing
+   *  `onMissingRoomPersisting`; injectable for tests. */
+  missingRoomNoticeMs?: number;
+  /** Abort a "connected" stream that has received no bytes for this long.
+   *  A healthy stream always has traffic well inside this window — the relay
+   *  emits SSE heartbeat comments and broadcasts this client's own membership
+   *  presence (~5s cadence) back to it — so silence this long means a NAT/
+   *  proxy/sleep half-open socket that will never close on its own. 0
+   *  disables (tests that freeze streams on purpose). */
+  stallTimeoutMs?: number;
 }
 
 const DEFAULT_STREAM_MIN_BACKOFF_MS = 150;
 const DEFAULT_STREAM_MAX_BACKOFF_MS = 8_000;
+const DEFAULT_STREAM_STALL_MS = 90_000;
+const FULL_RETRY_NOTICE_MS = 45_000;
+const MISSING_ROOM_NOTICE_MS = 20_000;
 
 export class RoomStream {
   private controller: AbortControllerLike | null = null;
@@ -326,6 +359,10 @@ export class RoomStream {
   private helloed = false;
   private everHelloed = false;
   private initialFullSince = 0;
+  private fullRetrySince = 0;
+  private fullRetryNotified = false;
+  private missingRoomSince = 0;
+  private missingRoomNotified = false;
   private authRejectedNotified = false;
 
   constructor(private readonly opts: RoomStreamOptions) {
@@ -415,6 +452,10 @@ export class RoomStream {
       this.helloed = true;
       this.everHelloed = true;
       this.initialFullSince = 0;
+      this.fullRetrySince = 0;
+      this.fullRetryNotified = false;
+      this.missingRoomSince = 0;
+      this.missingRoomNotified = false;
       this.authRejectedNotified = false;
       let lastSeq = 0;
       try {
@@ -451,7 +492,11 @@ export class RoomStream {
     }
     const fetchImpl = this.opts.fetchImpl ?? boundFetch;
     try {
-      const res = await fetchImpl(`${this.opts.baseUrl()}/rooms/${this.opts.roomId}/stream`, {
+      const cid = this.opts.clientId?.();
+      const streamUrl =
+        `${this.opts.baseUrl()}/rooms/${this.opts.roomId}/stream` +
+        (cid ? `?cid=${encodeURIComponent(cid)}` : '');
+      const res = await fetchImpl(streamUrl, {
         method: 'GET',
         headers: { Accept: 'text/event-stream', Authorization: `Bearer ${this.opts.token()}` },
         signal: this.controller.signal,
@@ -459,6 +504,17 @@ export class RoomStream {
       if (res.status === 410 || res.status === 404) {
         // Tombstoned (or GC'd all the way to gone): the session is over.
         if (this.opts.retryMissingRoom) {
+          // Durable rooms retry a missing room (a transient 404 during
+          // reconnect must not tear down the editor). But a PERMANENTLY gone
+          // room would then loop on "reconnecting" forever — so after a
+          // stretch, tell the owner so it can re-probe and re-host.
+          const now = Date.now();
+          if (!this.missingRoomSince) this.missingRoomSince = now;
+          const noticeMs = this.opts.missingRoomNoticeMs ?? MISSING_ROOM_NOTICE_MS;
+          if (!this.missingRoomNotified && now - this.missingRoomSince > noticeMs) {
+            this.missingRoomNotified = true;
+            this.opts.callbacks.onMissingRoomPersisting?.();
+          }
           this.scheduleRetry();
           return;
         }
@@ -479,6 +535,16 @@ export class RoomStream {
         // clients, so retry for a short window before surfacing "full".
         // On a reconnect, the count may include this client's own
         // not-yet-reaped old stream, so retry without a separate budget.
+        if (this.opts.retryFullRoom) {
+          const now = Date.now();
+          if (!this.fullRetrySince) this.fullRetrySince = now;
+          if (!this.fullRetryNotified && now - this.fullRetrySince > FULL_RETRY_NOTICE_MS) {
+            this.fullRetryNotified = true;
+            this.opts.callbacks.onFullPersisting?.();
+          }
+          this.scheduleRetry();
+          return;
+        }
         if (!this.everHelloed) {
           const retryMs = this.opts.initialFullRetryMs ?? 35_000;
           const now = Date.now();
@@ -506,30 +572,51 @@ export class RoomStream {
       // browser ReadableStream is not async-iterable everywhere.
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let buf = '';
-      let eventName = '';
-      let dataLines: string[] = [];
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let nl: number;
-        while ((nl = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, nl).replace(/\r$/, '');
-          buf = buf.slice(nl + 1);
-          if (line === '') {
-            this.dispatchFrame(eventName, dataLines.join('\n'));
-            eventName = '';
-            dataLines = [];
-            if (this.stopped) return;
-          } else if (line.startsWith(':')) {
-            continue;
-          } else if (line.startsWith('event:')) {
-            eventName = line.slice(6).trim();
-          } else if (line.startsWith('data:')) {
-            dataLines.push(line.slice(5).trimStart());
+      // Read-stall watchdog: a half-open socket (sleep, NAT reap, network
+      // switch) neither delivers bytes nor closes, so `reader.read()` would
+      // block forever while the stream still reports connected. Abort it
+      // when the byte flow stops; the normal retry path reconnects.
+      let lastReadAt = Date.now();
+      const stallMs = this.opts.stallTimeoutMs ?? DEFAULT_STREAM_STALL_MS;
+      let stallTimer: ReturnType<typeof setInterval> | null = null;
+      if (stallMs > 0) {
+        const streamController = this.controller;
+        stallTimer = setInterval(
+          () => {
+            if (Date.now() - lastReadAt > stallMs) streamController.abort();
+          },
+          Math.max(250, Math.min(stallMs / 3, 15_000)),
+        );
+      }
+      try {
+        let buf = '';
+        let eventName = '';
+        let dataLines: string[] = [];
+        for (;;) {
+          const { done, value } = await reader.read();
+          lastReadAt = Date.now();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let nl: number;
+          while ((nl = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, nl).replace(/\r$/, '');
+            buf = buf.slice(nl + 1);
+            if (line === '') {
+              this.dispatchFrame(eventName, dataLines.join('\n'));
+              eventName = '';
+              dataLines = [];
+              if (this.stopped) return;
+            } else if (line.startsWith(':')) {
+              continue;
+            } else if (line.startsWith('event:')) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+              dataLines.push(line.slice(5).trimStart());
+            }
           }
         }
+      } finally {
+        if (stallTimer !== null) clearInterval(stallTimer);
       }
       // Server closed (deploy, idle reap) — reconnect.
       this.scheduleRetry();

@@ -45,8 +45,15 @@ import {
   importRoomKey,
 } from './collab-crypto.js';
 import { RoomsClient, RoomsError, RoomStream, type RoomUpdate } from './room-client.js';
+import { collabClientId } from './collab-client-id.js';
 
 export const DEFAULT_COLLAB_FLUSH_MS = 120;
+
+/** How often to poll for remote updates while the push stream is DOWN. The
+ *  relay still serves REST in that state, so polling keeps the document
+ *  syncing (a few seconds behind) instead of waiting for the slow
+ *  belt-and-suspenders catch-up. */
+export const DEGRADED_POLL_MS = 4_000;
 
 type SyncDoc = Parameters<typeof LoroSyncPlugin>[0]['doc'];
 
@@ -67,7 +74,15 @@ function configTextStyle(doc: LoroDoc): void {
 
 export interface CollabSessionCallbacks {
   /** Connection or queue state changed (drives the sync-status UI). */
-  onStatus?: (status: { connected: boolean; queuedUpdates: number }) => void;
+  onStatus?: (status: {
+    connected: boolean;
+    queuedUpdates: number;
+    /** The relay answers our REST calls even when the live push stream is
+     *  unavailable (e.g. the room's stream slots are exhausted). Sync still
+     *  works in that state via polling, so the UI must not call it
+     *  "offline" — the doc really is syncing (field bug 2026-07-20). */
+     relayReachable?: boolean;
+  }) => void;
   /** The relay rejected our credentials (401/403) MID-SESSION — fired once
    *  per session so the UI can say so (otherwise the retry loop is
    *  indistinguishable from being offline). Retrying continues at the
@@ -77,6 +92,13 @@ export interface CollabSessionCallbacks {
   onEnded?: () => void;
   /** The room is at participant capacity. Terminal for this attempt. */
   onFull?: () => void;
+  /** A durable room has been answering "full" for an extended stretch
+   *  (stale connections not yet reaped). Informational; retrying continues. */
+  onFullPersisting?: () => void;
+  /** A durable room has been answering 404/410 for an extended stretch — it
+   *  is very likely gone for good. The owner can re-host from the local file
+   *  instead of sitting on "reconnecting" forever. */
+  onMissingRoomPersisting?: () => void;
   /** Encrypted presence blob from a peer (cursor layer decodes). */
   onPresence?: (blob: Uint8Array) => void;
   /** A catch-up just imported a LARGE offline backlog (`count` update
@@ -99,6 +121,9 @@ export interface CollabSessionOptions {
   /** Stream backoff bounds, injectable for tests. */
   minBackoffMs?: number;
   maxBackoffMs?: number;
+  /** Stream read-stall watchdog deadline (see RoomStreamOptions);
+   *  injectable for tests. */
+  stallTimeoutMs?: number;
   /** Host compaction cadence: upload an encrypted snapshot every N
    *  posted updates. */
   snapshotEvery?: number;
@@ -167,6 +192,11 @@ export class CollabSession {
   private auditKickoff: ReturnType<typeof setTimeout> | null = null;
   private sendRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private connected = false;
+  /** Last REST call to the relay succeeded. Independent of the push stream:
+   *  a room whose stream slots are exhausted still accepts posts and serves
+   *  catch-up, so the doc keeps syncing — just without live push. */
+  private relayReachable = false;
+  private lastCatchUpAt = 0;
   private ended = false;
   private postedCount = 0;
   private catchUpRunning = false;
@@ -206,10 +236,11 @@ export class CollabSession {
     this.streamOpts = {
       minBackoffMs: opts.minBackoffMs,
       maxBackoffMs: opts.maxBackoffMs,
+      stallTimeoutMs: opts.stallTimeoutMs,
     };
   }
 
-  private streamOpts: { minBackoffMs?: number; maxBackoffMs?: number };
+  private streamOpts: { minBackoffMs?: number; maxBackoffMs?: number; stallTimeoutMs?: number };
 
   /** Start a session on the current document. Uploads the seed state as
    *  update #1 and returns the share code alongside the session. */
@@ -221,6 +252,7 @@ export class CollabSession {
     catchUpMs?: number;
     minBackoffMs?: number;
     maxBackoffMs?: number;
+    stallTimeoutMs?: number;
     snapshotEvery?: number;
     updateByteLimit?: number;
   }): Promise<{ session: CollabSession; shareCode: string }> {
@@ -238,6 +270,7 @@ export class CollabSession {
     catchUpMs?: number;
     minBackoffMs?: number;
     maxBackoffMs?: number;
+    stallTimeoutMs?: number;
     snapshotEvery?: number;
     updateByteLimit?: number;
   }): Promise<{ session: CollabSession; shareCode: string; sharedDoc: SharedDocMetadata }> {
@@ -267,6 +300,7 @@ export class CollabSession {
       catchUpMs?: number;
       minBackoffMs?: number;
       maxBackoffMs?: number;
+      stallTimeoutMs?: number;
       snapshotEvery?: number;
       updateByteLimit?: number;
       durableRoom?: boolean;
@@ -316,6 +350,7 @@ export class CollabSession {
     catchUpMs?: number;
     minBackoffMs?: number;
     maxBackoffMs?: number;
+    stallTimeoutMs?: number;
     updateByteLimit?: number;
     durableRoom?: boolean;
   }): Promise<CollabSession> {
@@ -359,6 +394,7 @@ export class CollabSession {
     catchUpMs?: number;
     minBackoffMs?: number;
     maxBackoffMs?: number;
+    stallTimeoutMs?: number;
     snapshotEvery?: number;
     durableRoom?: boolean;
   }): Promise<CollabSession> {
@@ -417,10 +453,13 @@ export class CollabSession {
       baseUrl: this.client.opts.baseUrl,
       token: this.client.opts.token,
       fetchImpl: this.client.opts.fetchImpl,
+      clientId: collabClientId,
       roomId: this.roomId,
       minBackoffMs: this.streamOpts.minBackoffMs,
       maxBackoffMs: this.streamOpts.maxBackoffMs,
       retryMissingRoom: this.durableRoom,
+      retryFullRoom: this.durableRoom,
+      stallTimeoutMs: this.streamOpts.stallTimeoutMs,
       callbacks: {
         onHello: () => {
           this.connected = true;
@@ -446,6 +485,12 @@ export class CollabSession {
         onFull: () => {
           this.callbacks.onFull?.();
         },
+        onFullPersisting: () => {
+          this.callbacks.onFullPersisting?.();
+        },
+        onMissingRoomPersisting: () => {
+          this.callbacks.onMissingRoomPersisting?.();
+        },
         onAuthRejected: () => {
           this.connected = false;
           this.awaitingEcho = null;
@@ -464,7 +509,22 @@ export class CollabSession {
       this.flush();
       this.checkEcho();
     }, this.flushMs);
-    this.catchUpTimer = setInterval(() => void this.catchUp(), this.catchUpMs);
+    // Adaptive catch-up. With live push working, the periodic fetch is only a
+    // belt-and-suspenders heal (catchUpMs, minutes apart). With the stream
+    // DOWN — most importantly when the room's stream slots are exhausted and
+    // it answers 409 forever — REST still works, so poll fast and keep the
+    // document syncing both ways instead of stalling until the next slow tick
+    // (field bug 2026-07-20: a shared file sat unsynced because the only
+    // fetch was 5 minutes away).
+    const tick = Math.max(250, Math.min(this.catchUpMs, DEGRADED_POLL_MS));
+    this.catchUpTimer = setInterval(() => {
+      if (this.stream?.connected) {
+        if (Date.now() - this.lastCatchUpAt >= this.catchUpMs) void this.catchUp();
+        return;
+      }
+      void this.catchUp();
+      void this.drainQueue();
+    }, tick);
     this.auditKickoff = setTimeout(() => void this.auditRoomHistory(), this.auditDelayMs);
     this.auditTimer = setInterval(() => void this.auditRoomHistory(), 30 * 60_000);
   }
@@ -498,9 +558,46 @@ export class CollabSession {
     this.handleEnded();
   }
 
+  /** Synchronously drop the relay stream and timers for window teardown.
+   *
+   *  `stop()` awaits a flush/drain first, and an unload handler never gets to
+   *  run its continuation — so the SSE connection was left for the OS to reap
+   *  and the relay kept counting it against the room's participant cap. After
+   *  enough quits (or crashes) the room answered 409 "full" to its own owner
+   *  forever, which is what left shared files stuck on "reconnecting" (field
+   *  diagnosis 2026-07-20). Persistence has its own pagehide flush, so this
+   *  only has to free the socket. */
+  releaseForUnload(): void {
+    if (this.flushTimer) clearInterval(this.flushTimer);
+    if (this.catchUpTimer) clearInterval(this.catchUpTimer);
+    if (this.auditTimer) clearInterval(this.auditTimer);
+    if (this.auditKickoff) clearTimeout(this.auditKickoff);
+    if (this.sendRetryTimer) clearTimeout(this.sendRetryTimer);
+    this.flushTimer = this.catchUpTimer = this.auditTimer = null;
+    this.auditKickoff = null;
+    this.sendRetryTimer = null;
+    this.stream?.stop();
+    this.stream = null;
+    this.connected = false;
+  }
+
   /** Wake-from-sleep hook. */
   restart(): void {
     this.stream?.restart();
+    void this.catchUp();
+    void this.drainQueue();
+  }
+
+  /** Cheap liveness check for focus/visibility events. Unlike restart(),
+   *  a healthy connected stream is left alone (no abort, no traffic);
+   *  only a down stream reconnects — plus a catch-up and queue drain so
+   *  edits made while backgrounded flow immediately rather than on the
+   *  next timer tick. */
+  ensureLive(): void {
+    if (!this.stream || this.stream.connected) return;
+    this.stream.restart();
+    void this.catchUp();
+    void this.drainQueue();
   }
 
   get queuedUpdates(): number {
@@ -604,6 +701,7 @@ export class CollabSession {
             this.outQueue.length === 0 ? this.lastSentVersion : entry.version;
           this.postedCount++;
           this.sendRetryMs = 1000;
+          this.relayReachable = true; // a successful post proves REST works
           if (this.stream?.connected) this.awaitingEcho = { seq, at: Date.now() };
           // Deliberately NOT advancing lastSeq to our own posted seq:
           // the cursor means "I have imported everything ≤ this", and a
@@ -658,6 +756,9 @@ export class CollabSession {
             continue;
           }
           this.connected = false;
+          // A transport-level failure (status 0) means the relay itself is
+          // unreachable; an HTTP error means it answered, so REST still works.
+          if (err instanceof RoomsError && err.status === 0) this.relayReachable = false;
           this.emitStatus();
           this.scheduleSendRetry();
           return;
@@ -808,8 +909,12 @@ export class CollabSession {
       if (importedCount >= 25) this.callbacks.onBacklogMerged?.(importedCount);
       // "Connected" is the STREAM's state (live push flowing) — a
       // successful catch-up over plain HTTP must not paint the chip
-      // synced while push delivery is still down.
+      // synced while push delivery is still down. It DOES prove the relay
+      // is reachable, which the UI reports separately so a stream-less but
+      // syncing session isn't mislabelled "offline".
       this.connected = this.stream ? this.stream.connected : true;
+      this.relayReachable = true;
+      this.lastCatchUpAt = Date.now();
       this.emitStatus();
     } catch (err) {
       if (err instanceof RoomsError && (err.status === 410 || err.status === 404)) {
@@ -1016,7 +1121,11 @@ export class CollabSession {
   }
 
   private emitStatus(): void {
-    this.callbacks.onStatus?.({ connected: this.connected, queuedUpdates: this.outQueue.length });
+    this.callbacks.onStatus?.({
+      connected: this.connected,
+      queuedUpdates: this.outQueue.length,
+      relayReachable: this.relayReachable,
+    });
   }
 
   private handleEnded(): void {

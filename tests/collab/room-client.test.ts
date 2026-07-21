@@ -153,6 +153,47 @@ describe('RoomStream', () => {
     expect(stream.running).toBe(false);
   });
 
+  it('appends the stable client id as ?cid= so the relay reclaims its slot on reconnect', async () => {
+    const urls: string[] = [];
+    const stream = new RoomStream({
+      baseUrl: () => 'https://relay.example',
+      token: () => 't',
+      roomId: 'room1',
+      clientId: () => 'install-xyz',
+      minBackoffMs: 5,
+      maxBackoffMs: 10,
+      fetchImpl: async (url) => {
+        urls.push(String(url));
+        return new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      },
+      callbacks: { onHello() {}, onUpdate() {}, onPresence() {}, onEnded() {}, onFull() {} },
+    });
+    stream.start();
+    await sleep(30);
+    stream.stop();
+    expect(urls[0]).toBe('https://relay.example/rooms/room1/stream?cid=install-xyz');
+  });
+
+  it('omits ?cid= when no client id is configured (back-compat)', async () => {
+    const urls: string[] = [];
+    const stream = new RoomStream({
+      baseUrl: () => 'https://relay.example',
+      token: () => 't',
+      roomId: 'room1',
+      minBackoffMs: 5,
+      maxBackoffMs: 10,
+      fetchImpl: async (url) => {
+        urls.push(String(url));
+        return new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      },
+      callbacks: { onHello() {}, onUpdate() {}, onPresence() {}, onEnded() {}, onFull() {} },
+    });
+    stream.start();
+    await sleep(30);
+    stream.stop();
+    expect(urls[0]).toBe('https://relay.example/rooms/room1/stream');
+  });
+
   it('reconnects after a transport outage and re-hellos', async () => {
     const roomId = await client.createRoom();
     const hellos: number[] = [];
@@ -319,6 +360,76 @@ describe('RoomStream', () => {
     for (const s of holders) s.stop();
   });
 
+  it('read-stall watchdog aborts a silent stream and keeps delivery working', async () => {
+    const roomId = await client.createRoom();
+    let hellos = 0;
+    const updates: RoomUpdate[] = [];
+    const stream = new RoomStream({
+      baseUrl: () => mock.url,
+      token: () => mock.token,
+      roomId,
+      minBackoffMs: 20,
+      maxBackoffMs: 40,
+      stallTimeoutMs: 200,
+      callbacks: {
+        onHello: () => hellos++,
+        onUpdate: (u) => updates.push(u),
+        onPresence: () => {},
+        onEnded: () => {},
+        onFull: () => {},
+      },
+    });
+    stream.start();
+    // The mock never sends SSE heartbeats, so every connection goes silent
+    // immediately — the watchdog must keep cycling it rather than leaving a
+    // half-open socket that looks connected forever.
+    await sleep(1200);
+    expect(hellos).toBeGreaterThanOrEqual(2);
+    expect(stream.running).toBe(true);
+
+    // Delivery still works across watchdog reconnects (post lands during a
+    // connected window within a few tries).
+    let delivered = false;
+    for (let i = 0; i < 20 && !delivered; i++) {
+      const seq = await client.postUpdate(roomId, bytes(`stall-probe-${i}`));
+      await sleep(60);
+      delivered = updates.some((u) => u.seq === seq);
+    }
+    expect(delivered).toBe(true);
+    stream.stop();
+  });
+
+  it('signals a durable room that stays 404/410 so the owner can re-host', async () => {
+    // A retryMissingRoom stream against a room that never comes back must not
+    // loop on "reconnecting" silently forever — after the notice window it
+    // fires onMissingRoomPersisting once, and keeps retrying (non-terminal).
+    let missingNotices = 0;
+    let ended = 0;
+    const stream = new RoomStream({
+      baseUrl: () => mock.url,
+      token: () => mock.token,
+      roomId: 'deadbeefdeadbeefdeadbeefdeadbeef', // never created → 404
+      minBackoffMs: 20,
+      maxBackoffMs: 40,
+      retryMissingRoom: true,
+      missingRoomNoticeMs: 60,
+      callbacks: {
+        onHello: () => {},
+        onUpdate: () => {},
+        onPresence: () => {},
+        onEnded: () => ended++,
+        onFull: () => {},
+        onMissingRoomPersisting: () => missingNotices++,
+      },
+    });
+    stream.start();
+    await sleep(400);
+    expect(missingNotices).toBe(1); // fired exactly once
+    expect(ended).toBe(0); // retryMissingRoom → never terminal
+    expect(stream.running).toBe(true);
+    stream.stop();
+  });
+
   it('retries an initially-full room until a stale stream clears', async () => {
     const roomId = await client.createRoom();
     const holders: RoomStream[] = [];
@@ -362,6 +473,55 @@ describe('RoomStream', () => {
     expect(full).toBe(false);
     expect(hello).toBe(1);
     expect(eleventh.running).toBe(true);
+
+    eleventh.stop();
+    for (const s of holders) s.stop();
+  });
+
+  it('keeps retrying an initially-full durable room instead of giving up', async () => {
+    const roomId = await client.createRoom();
+    const holders: RoomStream[] = [];
+    const mkStream = (cb: { onFull?: () => void; onHello?: () => void } = {}) =>
+      new RoomStream({
+        baseUrl: () => mock.url,
+        token: () => mock.token,
+        roomId,
+        minBackoffMs: 20,
+        maxBackoffMs: 30,
+        initialFullRetryMs: 80,
+        retryFullRoom: true,
+        callbacks: {
+          onHello: cb.onHello ?? (() => {}),
+          onUpdate: () => {},
+          onPresence: () => {},
+          onEnded: () => {},
+          onFull: cb.onFull ?? (() => {}),
+        },
+      });
+    for (let i = 0; i < 10; i++) {
+      const s = mkStream();
+      s.start();
+      holders.push(s);
+    }
+    await sleep(80);
+    expect(mock.streamCount(roomId)).toBe(10);
+
+    let full = false;
+    let hello = 0;
+    const eleventh = mkStream({
+      onFull: () => (full = true),
+      onHello: () => hello++,
+    });
+    eleventh.start();
+    await sleep(180);
+    expect(full).toBe(false);
+    expect(hello).toBe(0);
+    expect(eleventh.running).toBe(true);
+
+    holders.pop()!.stop();
+    await sleep(160);
+    expect(full).toBe(false);
+    expect(hello).toBe(1);
 
     eleventh.stop();
     for (const s of holders) s.stop();
