@@ -116,6 +116,15 @@ export default defineConfig(({ command }) => {
     server: {
       fs: { allow: [path.resolve(__dirname), path.resolve(__dirname, '../card-cutter')] },
     },
+    // The evidence-index worker must be a CLASSIC (iife) worker in
+    // production: the Electron renderer loads over file://, where
+    // Chromium refuses to start MODULE workers (module scripts need
+    // CORS, which file:// can't grant). With the default ES-module
+    // worker output the packaged app silently lost its parse worker and
+    // fell back to main-thread indexing — the field "Search Evidence
+    // freezes/crashes" (2026-07-19). Dev still uses a module worker
+    // (unbundled TS needs it); the build rewrites the constructor.
+    worker: { format: 'iife' },
     // loro-crdt's wasm loader uses top-level await, which the dev-time
     // dependency pre-bundler (esbuild, pre-es2022 targets) rejects.
     // Excluding the pair serves them as native ESM in dev — modern dev

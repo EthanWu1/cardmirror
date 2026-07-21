@@ -5,7 +5,7 @@
   --line-soft: var(--pmd-c-border-soft, #ececec);
   --surface: var(--pmd-c-doc-paper, #ffffff);
   --workspace: var(--pmd-c-surface, #f5f6f7);
-  --header: #ececed;
+  --header: color-mix(in srgb, var(--pmd-c-ribbon, #adadb0) 34%, #fff);
   --selection: var(--pmd-c-accent-soft, #eef1f5);
   --active-ring: var(--pmd-c-focus, #60666f);
   --row-height: 26px;
@@ -84,8 +84,8 @@
   top: 0;
   z-index: 6;
   height: var(--header-height);
-  border-right: 1px solid #d6d6d6;
-  border-bottom: 1px solid #c8c8c8;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
   background: var(--header);
   text-align: center;
   font-size: var(--header-font-size);
@@ -129,7 +129,7 @@
   left: 0;
   z-index: 5;
   height: var(--row-height);
-  border-right: 1px solid #d6d6d6;
+  border-right: 1px solid var(--line);
   border-bottom: 1px solid var(--line-soft);
   background: var(--header);
   vertical-align: middle;
@@ -139,7 +139,7 @@
   position: relative;
   height: var(--row-height);
   min-height: var(--row-height);
-  border-right: 1px solid #e4e4e4;
+  border-right: 1px solid var(--line-soft);
   border-bottom: 1px solid var(--line-soft);
   padding: 0;
   vertical-align: top;
@@ -170,7 +170,7 @@
 }
 
 .flowline-sheet td:hover .cell-value {
-  background: #fbfcfe;
+  background: color-mix(in srgb, var(--pmd-c-accent, #1b5ea8) 5%, #fff);
 }
 
 .flowline-sheet td.is-active:hover .cell-value {
@@ -286,11 +286,11 @@
   right: 0;
   bottom: 0;
   z-index: 16;
-  height: 36px;
+  height: 38px;
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 4px 10px 5px;
+  gap: 8px;
+  padding: 5px 12px 6px;
   border-top: 0;
   background: transparent;
   overflow: visible;
@@ -333,58 +333,65 @@
   box-shadow: inset 0 0 0 1px #8a8886;
 }
 
+/* Segmented tab bar — one quiet floating group (Excel/Flowline sheet
+   tabs, not loose pills; field feedback 2026-07-19). The BAR carries the
+   surface + border; the tabs inside are flat segments. */
 .flow-tabs {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 2px;
   min-width: 80px;
   overflow-x: auto;
   overflow-y: visible;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   scrollbar-width: none;
   pointer-events: auto;
+  padding: 3px;
+  border: 1px solid var(--line, #dcdcde);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--surface, #fff) 92%, transparent);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .08);
 }
 
 .flow-tabs::-webkit-scrollbar {
   display: none;
 }
 
+/* Segments inside the bar: flat and quiet until selected; selection =
+   solid AFF-blue / NEG-red fill with white text. No per-tab borders or
+   drop shadows — the BAR owns the chrome. */
 .sheet-tab {
   position: relative;
-  height: 27px;
-  max-width: 150px;
+  height: 26px;
+  max-width: 156px;
   display: flex;
   align-items: center;
   gap: 3px;
-  border: 1px solid rgba(0, 0, 0, .08);
-  border-radius: 7px;
-  color: #3b3b3b;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: #444;
   background: transparent;
   white-space: nowrap;
   cursor: pointer;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, .08);
-  transition: background-color 120ms ease-out, border-color 120ms ease-out, box-shadow 120ms ease-out, opacity 120ms ease-out, transform 120ms ease-out;
+  box-shadow: none;
+  transition: background-color 120ms ease-out, border-color 120ms ease-out, opacity 120ms ease-out, transform 120ms ease-out;
 }
 
 .sheet-tab:hover {
-  background: color-mix(in srgb, currentColor 10%, transparent);
-  box-shadow: 0 3px 7px rgba(0, 0, 0, .12);
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  box-shadow: none;
 }
 
 .sheet-tab.side-aff {
   color: var(--aff);
-  background: color-mix(in srgb, var(--aff) 13%, transparent);
-  border-color: color-mix(in srgb, var(--aff) 34%, transparent);
 }
 
 .sheet-tab.side-neg {
   color: var(--neg);
-  background: color-mix(in srgb, var(--neg) 13%, transparent);
-  border-color: color-mix(in srgb, var(--neg) 34%, transparent);
 }
 
 .sheet-tab[aria-selected="true"] {
-  box-shadow: 0 4px 10px rgba(0, 0, 0, .16);
+  box-shadow: none;
 }
 
 .cm-flow-tab[aria-selected="true"] {
@@ -404,7 +411,7 @@
 }
 
 .sheet-tab-label {
-  height: 25px;
+  height: 24px;
   max-width: 116px;
   min-width: 0;
   border: 0;
@@ -414,7 +421,7 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  line-height: 25px;
+  line-height: 24px;
 }
 
 .cm-flow-tab.is-dragging {
@@ -424,7 +431,7 @@
 .cm-flow-tab.is-drop-target {
   background: rgba(255, 255, 255, .86);
   border-color: currentColor;
-  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 22%, transparent), 0 4px 10px rgba(0, 0, 0, .14);
+  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 22%, transparent);
 }
 
 .cm-flow-tab-close {

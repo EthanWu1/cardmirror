@@ -10,7 +10,7 @@
 import { TextSelection } from 'prosemirror-state';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { schema } from '../../src/schema/index.js';
-import { RoomsClient, RoomsError } from '../../src/editor/collab/room-client.js';
+import { RoomsClient, RoomsError, RoomStream } from '../../src/editor/collab/room-client.js';
 import { CollabSession } from '../../src/editor/collab/collab-session.js';
 import { decodeShareCode } from '../../src/editor/collab/collab-crypto.js';
 import { startRoomsMock, type RoomsMock } from './_rooms-mock.js';
@@ -82,6 +82,126 @@ describe('ended-room join strictness (410)', () => {
 });
 
 describe('collab session end-to-end', () => {
+  it('keeps syncing by polling when the room refuses new streams (409 full)', async () => {
+    // FIELD BUG 2026-07-20: the user's room had all 10 stream slots held by
+    // orphaned sockets, so live push could never connect. REST still worked,
+    // but the only fetch was the slow belt-and-suspenders catch-up, so the
+    // document sat unsynced and the chip claimed "offline". A stream-less
+    // session must still converge, and must report itself as reachable.
+    const { session: host, shareCode } = await CollabSession.host({
+      pmDoc: simpleDoc('polling fallback base'),
+      client,
+      ...FAST,
+    });
+    const hostView = mkView(host.plugins());
+    await settle();
+    host.start();
+    const decoded = decodeShareCode(shareCode)!;
+
+    // Saturate the room's stream slots so the joiner can never get push.
+    const hogs: RoomStream[] = [];
+    for (let i = 0; i < 10; i++) {
+      const s = new RoomStream({
+        baseUrl: () => mock.url,
+        token: () => mock.token,
+        roomId: decoded.roomId,
+        minBackoffMs: 20,
+        maxBackoffMs: 40,
+        callbacks: {
+          onHello: () => {},
+          onUpdate: () => {},
+          onPresence: () => {},
+          onEnded: () => {},
+          onFull: () => {},
+        },
+      });
+      s.start();
+      hogs.push(s);
+    }
+    for (let i = 0; i < 60 && mock.streamCount(decoded.roomId) < 10; i++) await sleep(20);
+
+    const joiner = await CollabSession.join({
+      ...decoded,
+      client,
+      flushMs: 25,
+      minBackoffMs: 20,
+      maxBackoffMs: 60,
+      catchUpMs: 60_000, // slow "belt and suspenders" tick — polling must carry it
+      durableRoom: true, // durable rooms retry a full room instead of dying
+    });
+    const joinView = mkView(joiner.plugins());
+    await settle();
+    joiner.start();
+
+    // The joiner never gets a stream…
+    await sleep(300);
+    expect(joiner.debugState().streamConnected).toBe(false);
+
+    // …yet a host edit still reaches it, via polling.
+    typeAfter(hostView, 'polling fallback', ' SYNCED');
+    let sawIt = false;
+    for (let i = 0; i < 80 && !sawIt; i++) {
+      await sleep(100);
+      await settle();
+      sawIt = docText(joinView.state.doc).includes('polling fallback SYNCED');
+    }
+    expect(sawIt).toBe(true);
+
+    // It synced without ever holding a stream — that is the whole point.
+    expect(joiner.debugState().streamConnected).toBe(false);
+
+    for (const s of hogs) s.stop();
+    await joiner.stop();
+    joinView.destroy();
+    hostView.destroy();
+    await host.end();
+  }, 30_000);
+
+  it('releaseForUnload frees the relay stream slot synchronously', async () => {
+    // REGRESSION (field diagnosis 2026-07-20): stop() awaits a flush first, so
+    // an unload handler never reached the stream teardown — every quit leaked
+    // a stream the relay counted against the room's cap, until the room
+    // answered 409 "full" to its own owner and the file stuck on
+    // "reconnecting" forever.
+    const { session, shareCode } = await CollabSession.host({
+      pmDoc: simpleDoc('slot release body'),
+      client,
+      ...FAST,
+    });
+    session.start();
+    const decoded = decodeShareCode(shareCode)!;
+    for (let i = 0; i < 50 && mock.streamCount(decoded.roomId) === 0; i++) await sleep(20);
+    expect(mock.streamCount(decoded.roomId)).toBe(1);
+
+    session.releaseForUnload(); // synchronous — no await, like a real unload
+    for (let i = 0; i < 50 && mock.streamCount(decoded.roomId) > 0; i++) await sleep(20);
+    expect(mock.streamCount(decoded.roomId)).toBe(0);
+    expect(session.debugState().streamRunning).toBe(false);
+    await session.end();
+  });
+
+  it('ensureLive leaves a healthy connected stream untouched', async () => {
+    const { session } = await CollabSession.host({
+      pmDoc: simpleDoc('liveness probe body'),
+      client,
+      ...FAST,
+    });
+    session.start();
+    for (let i = 0; i < 50 && !session.debugState().streamConnected; i++) await sleep(20);
+    expect(session.debugState().streamConnected).toBe(true);
+
+    // Repeated visibility-style liveness checks must not cycle a healthy
+    // stream: no new stream attempts, connection stays up throughout.
+    const before = mock.streamAttempts();
+    for (let i = 0; i < 5; i++) {
+      session.ensureLive();
+      await sleep(30);
+    }
+    expect(mock.streamAttempts()).toBe(before);
+    expect(session.debugState().streamConnected).toBe(true);
+    await session.end();
+  });
+
   it('uses a low-latency default flush for realtime typing', async () => {
     const { session: host, shareCode } = await CollabSession.host({
       pmDoc: simpleDoc('fast default sync'),

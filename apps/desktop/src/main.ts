@@ -1090,11 +1090,46 @@ function persistCmirIndex(): Promise<void> {
   return cmirIndexWriteTail;
 }
 
+/** Directories that can never hold debate files but can hold MILLIONS of
+ *  entries — walking them made the first scan of a big tree take minutes
+ *  (felt as "Search Everything never finishes", field bug 2026-07-19). */
+const SCAN_SKIP_DIRS = new Set([
+  'node_modules',
+  '__pycache__',
+  '$recycle.bin',
+  'system volume information',
+  '.dropbox.cache',
+]);
+
 /** Walk `root` recursively for openable editor files
  *  (`.cmir`, `.docx`, `.cmflow`),
- *  recording mtime + size. */
-async function scanCmirFiles(root: string): Promise<CmirFileEntry[]> {
+ *  recording mtime + size. `onPartial` (throttled) receives the
+ *  accumulated listing DURING the walk so a cold first scan can populate
+ *  open palettes progressively instead of going dark until the end. */
+async function scanCmirFiles(
+  root: string,
+  onPartial?: (entries: CmirFileEntry[]) => void,
+): Promise<CmirFileEntry[]> {
   const out: CmirFileEntry[] = [];
+  let lastPartialAt = Date.now();
+  let lastPartialCount = 0;
+  let partialsSent = 0;
+  // Each partial COPIES and IPC-serializes the whole accumulated listing to
+  // every window, and each one makes the renderer re-merge and re-search. A
+  // count-based trigger therefore costs O(n^2) bytes on a big tree and made
+  // cold scans crawl (field bug 2026-07-19). Time-throttle only, and stop
+  // after a handful — the final listing always ships.
+  const PARTIAL_INTERVAL_MS = 3_000;
+  const MAX_PARTIALS = 6;
+  const maybePublishPartial = (): void => {
+    if (!onPartial || partialsSent >= MAX_PARTIALS) return;
+    const now = Date.now();
+    if (now - lastPartialAt < PARTIAL_INTERVAL_MS || out.length === lastPartialCount) return;
+    lastPartialAt = now;
+    lastPartialCount = out.length;
+    partialsSent++;
+    onPartial(out.slice());
+  };
   const isOpenable = (name: string): boolean => {
     // Skip Word's `~$…docx` owner/lock files — not real documents.
     if (name.startsWith('~$')) return false;
@@ -1109,11 +1144,16 @@ async function scanCmirFiles(root: string): Promise<CmirFileEntry[]> {
     }
     for (const ent of entries) {
       const full = path.join(cur, ent.name);
-      if (ent.isDirectory()) await walk(full);
-      else if (ent.isFile() && isOpenable(ent.name)) {
+      if (ent.isDirectory()) {
+        // Dot-directories (.git, .venv, caches) and known junk trees are
+        // never evidence folders — skipping them keeps huge scans bounded.
+        if (ent.name.startsWith('.') || SCAN_SKIP_DIRS.has(ent.name.toLowerCase())) continue;
+        await walk(full);
+      } else if (ent.isFile() && isOpenable(ent.name)) {
         try {
           const st = await fs.stat(full);
           out.push({ path: full, relPath: path.relative(root, full), mtimeMs: st.mtimeMs, size: st.size });
+          maybePublishPartial();
         } catch {
           /* vanished between readdir and stat — skip */
         }
@@ -1133,9 +1173,13 @@ function cmirListingsDiffer(a: CmirFileEntry[], b: CmirFileEntry[]): boolean {
 
 /** Push a freshly-revalidated listing to every window so an open
  *  command palette can swap it in live (it filters by `root`). */
-function broadcastCmirIndexUpdated(root: string, entries: CmirFileEntry[]): void {
+function broadcastCmirIndexUpdated(
+  root: string,
+  entries: CmirFileEntry[],
+  partial = false,
+): void {
   for (const w of BrowserWindow.getAllWindows()) {
-    if (!w.isDestroyed()) w.webContents.send('host:cmir-files-updated', { root, entries });
+    if (!w.isDestroyed()) w.webContents.send('host:cmir-files-updated', { root, entries, partial });
   }
 }
 
@@ -1146,7 +1190,10 @@ function broadcastCmirIndexUpdated(root: string, entries: CmirFileEntry[]): void
 function revalidateCmirIndex(root: string): void {
   if (cmirRevalidating.has(root)) return;
   cmirRevalidating.add(root);
-  void scanCmirFiles(root)
+  // Progressive publishing matters only on a COLD scan (no cached listing
+  // yet) — a warm revalidate already answered from cache instantly.
+  const cold = !cmirIndexMem.has(root);
+  void scanCmirFiles(root, cold ? (partial) => broadcastCmirIndexUpdated(root, partial, true) : undefined)
     .then((fresh) => {
       cmirRevalidating.delete(root);
       const prev = cmirIndexMem.get(root);
@@ -1168,11 +1215,12 @@ ipcMain.handle('host:list-cmir-files', async (_event, root: string): Promise<Cmi
     revalidateCmirIndex(root);
     return cached;
   }
-  // Cold (first ever / new root): scan now, cache, persist.
-  const fresh = await scanCmirFiles(root);
-  cmirIndexMem.set(root, fresh);
-  void persistCmirIndex();
-  return fresh;
+  // Cold (first ever / new root): return immediately and let the
+  // background scan publish `host:cmir-files-updated`. Blocking here is
+  // what made Search Everything/Search Evidence feel frozen on large
+  // Dropbox trees.
+  revalidateCmirIndex(root);
+  return [];
 });
 
 ipcMain.handle('host:write-file-at-path', async (_event, filePath: string, bytes: unknown) => {

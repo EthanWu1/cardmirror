@@ -520,6 +520,13 @@ export interface Settings {
    *  (high-contrast, colorblind, dark) that sets the variable
    *  via a body class. Empty by default. */
   customColorOverrides: Record<string, string>;
+  /** Dark-mode sibling of `customColorOverrides`. Overrides are inline
+   *  styles that beat BOTH theme blocks, so a single shared blob meant a
+   *  color picked in light mode silently poisoned dark mode (white
+   *  surfaces under light text — field bug 2026-07-19). The editor and
+   *  the apply path read/write whichever blob matches the active
+   *  effective theme. */
+  customColorOverridesDark: Record<string, string>;
   /** Whether the navigation pane (outline) is visible in THIS
    *  window. Default on. Toggled via the ribbon's nav-pane
    *  button or the left-edge pull-tab that appears when the pane
@@ -1211,6 +1218,11 @@ export interface Settings {
    *  page reload to (re)build the editor shell. Comments are
    *  unavailable while this is on. See SPEC-multi-pane.md. */
   multiDocWorkspace: boolean;
+  /** Surfaces the open documents as a Chrome-style tab strip below the
+   *  ribbon (built on top of the multi-doc workspace shell). Phase 1 of the
+   *  tabbed-workspace feature; off by default while it matures. Requires
+   *  `multiDocWorkspace` — it renders that shell's slots/stacks as tabs. */
+  tabbedWorkspace: boolean;
   /** Which UI shell the web edition uses on this device. `'auto'`
    *  picks the mobile shell on coarse-pointer screens narrower than
    *  1024px (resolved once per load — rotating mid-session doesn't
@@ -1433,6 +1445,7 @@ const DEFAULTS: Settings = {
   overrideShadingSlots: ['#d2d2d2'],
   showCursorColorNames: false,
   customColorOverrides: {},
+  customColorOverridesDark: {},
   navPaneVisible: true,
   formatNavPaneByType: true,
   timerProfile: 'college',
@@ -1591,6 +1604,7 @@ const DEFAULTS: Settings = {
   googleTranslateApiKey: '',
   prependTranslationMarker: true,
   multiDocWorkspace: false,
+  tabbedWorkspace: false,
   mobileLayout: 'auto',
   multiDocLayoutMode: 'compact',
   multiDocConfirmModeSwitch: true,
@@ -1814,6 +1828,17 @@ export const SETTING_METADATA: SettingMeta[] = [
     category: 'general',
     section: 'Workspace',
     aliases: ['split view', 'split screen', 'multi pane', 'multi-doc'],
+  },
+  {
+    key: 'tabbedWorkspace',
+    label: 'Tabbed workspace (preview)',
+    description:
+      'Show your open documents as a Chrome-style tab strip below the ribbon. Requires the three-pane workspace. Preview: click a tab to switch, ✕ to close, drag to reorder.',
+    kind: 'toggle',
+    category: 'general',
+    section: 'Workspace',
+    dependsOn: 'multiDocWorkspace',
+    aliases: ['tabs', 'tab bar', 'tab strip', 'chrome tabs'],
   },
   {
     key: 'multiDocLayoutMode',
@@ -2304,7 +2329,7 @@ export const SETTING_METADATA: SettingMeta[] = [
     key: 'customColorOverrides',
     label: 'Color overrides',
     description:
-      "Override any color in the interface. Explicit overrides here always win over the defaults and over future accessibility presets (high-contrast, dark mode, colorblind-friendly, etc.) — pick a color to override it; reset a row to fall back to whichever preset is active.",
+      'Override any color in the interface. Overrides are saved separately for light and dark mode — you are editing the set for the mode the app is currently in, so a light-mode customization never bleeds into dark mode. Pick a color to override it; reset a row to fall back to the active theme default.',
     kind: 'colorOverrides',
     category: 'accessibility',
   },
@@ -3817,6 +3842,7 @@ function sanitize(s: Settings): Settings {
       '#d2d2d2',
     ),
     customColorOverrides: sanitizeCustomColorOverrides(s.customColorOverrides),
+    customColorOverridesDark: sanitizeCustomColorOverrides(s.customColorOverridesDark),
     // navPaneVisible defaults to TRUE when missing — the user
     // opens to an outline-visible window unless they've already
     // dismissed it during the session (transient — see
@@ -4137,6 +4163,7 @@ function sanitize(s: Settings): Settings {
       typeof s.googleTranslateApiKey === 'string' ? s.googleTranslateApiKey.trim() : '',
     prependTranslationMarker: s.prependTranslationMarker === false ? false : true,
     multiDocWorkspace: !!s.multiDocWorkspace,
+    tabbedWorkspace: !!s.tabbedWorkspace,
     mobileLayout:
       s.mobileLayout === 'mobile' || s.mobileLayout === 'desktop'
         ? s.mobileLayout

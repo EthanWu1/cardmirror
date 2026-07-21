@@ -2000,7 +2000,9 @@ export class NavigationPanel {
     if (!range) return;
     const slice = this.view.state.doc.slice(range.from, range.to);
 
-    const html = serializeCardMirrorClipboardHtml(slice.content, this.view.state.schema);
+    const html = serializeCardMirrorClipboardHtml(slice.content, this.view.state.schema, {
+      bodyFont: () => settings.get('bodyFont'),
+    });
     const text = slice.content.textBetween(0, slice.content.size, '\n', '\n');
 
     try {

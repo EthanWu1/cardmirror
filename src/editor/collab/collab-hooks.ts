@@ -208,15 +208,21 @@ export function collabEndOrLeaveSession(uid: string): Promise<boolean> {
  *  and stay resumable from the home-screen Sessions list — the uids are how the
  *  toggle knows which docs those are. Provided by collab-ui; resolves [] when
  *  collab isn't loaded (no sessions — always the case on web). */
-let handoffProvider: (() => Promise<{ uid: string; roomId: string }[]>) | null = null;
+export interface CollabSessionHandoff {
+  uid: string;
+  roomId: string;
+  durableRoom: boolean;
+}
+
+let handoffProvider: (() => Promise<CollabSessionHandoff[]>) | null = null;
 
 export function setCollabHandoffProvider(
-  fn: (() => Promise<{ uid: string; roomId: string }[]>) | null,
+  fn: (() => Promise<CollabSessionHandoff[]>) | null,
 ): void {
   handoffProvider = fn;
 }
 
-export function collabCaptureSessionHandoff(): Promise<{ uid: string; roomId: string }[]> {
+export function collabCaptureSessionHandoff(): Promise<CollabSessionHandoff[]> {
   return handoffProvider?.() ?? Promise.resolve([]);
 }
 

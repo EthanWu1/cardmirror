@@ -21,7 +21,11 @@ export async function ensureBakedRelay(): Promise<void> {
   try {
     bakedRelay = (await getElectronHost()?.collabRelayDefaults()) ?? { url: '', token: '' };
   } catch {
-    bakedRelay = { url: '', token: '' };
+    // Transient IPC failure (early-boot race) — do NOT cache it: caching an
+    // empty result here permanently disabled the baked relay for the whole
+    // session, so shared .cmir files silently never auto-started (field bug
+    // 2026-07-19, "sometimes opening a cmir doesn't start the session").
+    bakedRelay = null;
   }
 }
 

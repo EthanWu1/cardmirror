@@ -303,6 +303,83 @@ describe('flow workspace', () => {
     expect(cell.querySelector('textarea')).toBeNull();
   });
 
+  it('toggles cell bold with Ctrl/Cmd+B and persists it in the round', () => {
+    const { workspace } = mountWorkspace();
+    const cell = workspace.element.querySelector<HTMLTableCellElement>('td.flowline-cell')!;
+    cell.click();
+
+    const boldEvent = new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, bubbles: true, cancelable: true });
+    cell.dispatchEvent(boldEvent);
+
+    expect(boldEvent.defaultPrevented).toBe(true);
+    expect(workspace.getRound().flows[0]!.rows[0]![0]!.bold).toBe(true);
+    expect(cell.querySelector('.cell-value')!.classList.contains('is-bold')).toBe(true);
+
+    cell.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', metaKey: true, bubbles: true, cancelable: true }));
+    expect(workspace.getRound().flows[0]!.rows[0]![0]!.bold).toBeUndefined();
+    expect(cell.querySelector('.cell-value')!.classList.contains('is-bold')).toBe(false);
+  });
+
+  it('copies with Ctrl+C, cuts with Ctrl+X, and pastes TSV across cells with Ctrl+V', async () => {
+    const writeText = vi.fn(() => Promise.resolve());
+    const readText = vi.fn(() => Promise.resolve('resp one\tresp two'));
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText, readText },
+    });
+
+    let round = createRound({ format: 'ld', title: 'Round' });
+    round = setCellText(round, round.flows[0]!.id, 0, 0, 'aff case');
+    const { workspace } = mountWorkspace(round);
+    const cell = workspace.element.querySelector<HTMLTableCellElement>('td.flowline-cell')!;
+    cell.click();
+
+    cell.dispatchEvent(new KeyboardEvent('keydown', { key: 'c', ctrlKey: true, bubbles: true, cancelable: true }));
+    expect(writeText).toHaveBeenCalledWith('aff case');
+
+    cell.dispatchEvent(new KeyboardEvent('keydown', { key: 'x', ctrlKey: true, bubbles: true, cancelable: true }));
+    expect(writeText).toHaveBeenCalledTimes(2);
+    expect(workspace.getRound().flows[0]!.rows[0]![0]!.text).toBe('');
+
+    cell.dispatchEvent(new KeyboardEvent('keydown', { key: 'v', ctrlKey: true, bubbles: true, cancelable: true }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(workspace.getRound().flows[0]!.rows[0]![0]!.text).toBe('resp one');
+    expect(workspace.getRound().flows[0]!.rows[0]![1]!.text).toBe('resp two');
+    expect(workspace.element.querySelectorAll('.cell-value')[1]!.textContent).toBe('resp two');
+  });
+
+  it('opens the editor with F2 keeping existing text and exits with Escape', () => {
+    let round = createRound({ format: 'ld', title: 'Round' });
+    round = setCellText(round, round.flows[0]!.id, 0, 0, 'extend the DA');
+    const { workspace } = mountWorkspace(round);
+    const cell = workspace.element.querySelector<HTMLTableCellElement>('td.flowline-cell')!;
+    cell.click();
+
+    cell.dispatchEvent(new KeyboardEvent('keydown', { key: 'F2', bubbles: true, cancelable: true }));
+    const editor = cell.querySelector<HTMLTextAreaElement>('.cell-editor.cm-flow-cell')!;
+    expect(editor).not.toBeNull();
+    expect(editor.value).toBe('extend the DA');
+
+    editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    expect(cell.querySelector('.cell-editor')).toBeNull();
+    expect(cell.classList.contains('is-editing')).toBe(false);
+    expect(workspace.getRound().flows[0]!.rows[0]![0]!.text).toBe('extend the DA');
+  });
+
+  it('inserts a line break with Alt+Enter instead of moving the selection', () => {
+    const { workspace } = mountWorkspace();
+    const cell = workspace.element.querySelector<HTMLTableCellElement>('td.flowline-cell')!;
+    cell.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+    const editor = cell.querySelector<HTMLTextAreaElement>('.cell-editor.cm-flow-cell')!;
+    input(editor, 'line one');
+
+    editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', altKey: true, bubbles: true, cancelable: true }));
+
+    expect(cell.querySelector('.cell-editor')).not.toBeNull();
+    expect(editor.value).toBe('line one\n');
+    expect(workspace.getRound().flows[0]!.rows[0]![0]!.text).toBe('line one\n');
+  });
+
   it('swaps to a new round with setRound and re-renders tabs and cells', () => {
     const { workspace } = mountWorkspace(createRound({ format: 'ld', title: 'LD' }));
     let nextRound = createRound({ format: 'pf', title: 'PF' });
@@ -378,13 +455,22 @@ describe('flow workspace', () => {
     expect(ruleBody('.sheet-tabs')).toContain('pointer-events: none;');
     expect(ruleBody('.flow-tabs')).toContain('pointer-events: auto;');
     expect(ruleBody('.flow-tabs')).toContain('overflow-y: visible;');
+    // Segmented bar: the .flow-tabs GROUP carries the surface/border; the
+    // tabs are flat segments inside it — no per-tab borders, fills, or
+    // floating drop shadows (field feedback 2026-07-19, twice).
+    expect(ruleBody('.flow-tabs')).toContain('border: 1px solid var(--line, #dcdcde);');
+    expect(ruleBody('.flow-tabs')).toContain('border-radius: 7px;');
     expect(ruleBody('.sheet-tab')).toContain('background: transparent;');
-    expect(ruleBody('.sheet-tab')).toContain('border-radius: 7px;');
+    expect(ruleBody('.sheet-tab')).toContain('border-radius: 5px;');
+    expect(ruleBody('.sheet-tab')).toContain('box-shadow: none;');
     expect(ruleBody('.sheet-tab:hover')).not.toContain('translateY');
+    expect(ruleBody('.sheet-tab:hover')).toContain('box-shadow: none;');
   });
 
   it('uses a lighter gray for Flow column headers', () => {
-    expect(ruleBody('.cm-flow-workspace')).toContain('--header: #ececed;');
+    expect(ruleBody('.cm-flow-workspace')).toContain(
+      '--header: color-mix(in srgb, var(--pmd-c-ribbon, #adadb0) 34%, #fff);',
+    );
     expect(ruleBody('.flowline-sheet th')).toContain('background: var(--header);');
     expect(ruleBody('.flowline-row-header')).toContain('background: var(--header);');
   });

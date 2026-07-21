@@ -108,11 +108,6 @@ interface WarmEntry {
 }
 const warmCache = new Map<string, WarmEntry>();
 
-interface EvidenceWarmEntry {
-  mtimeMs: number;
-  rows: EvidenceSearchRow[];
-}
-const evidenceWarmCache = new Map<string, EvidenceWarmEntry>();
 import {
   RIBBON_COMMAND_LABELS,
   RIBBON_COMMAND_ALIASES,
@@ -121,6 +116,7 @@ import {
   type RibbonCommandId,
 } from './ribbon-commands.js';
 import { availableRibbonCommandIds } from './ribbon-availability.js';
+import { indexEvidenceFiles } from './evidence-index.js';
 
 // ── Warm-cache machinery (module-level, shared by the open palette and
 //    the proactive idle pre-warm) ────────────────────────────────────
@@ -182,81 +178,6 @@ async function parseFileDoc(
   return parseNative(bytes).doc;
 }
 
-interface EvidenceIndexRequest {
-  type: 'index-evidence-file';
-  jobId: number;
-  entry: FileEntry;
-  bytes: Uint8Array;
-  format: OpenableFileFormat;
-}
-
-interface EvidenceIndexSuccess {
-  type: 'evidence-file-indexed';
-  jobId: number;
-  rows: EvidenceSearchRow[];
-}
-
-interface EvidenceIndexFailure {
-  type: 'evidence-file-error';
-  jobId: number;
-  message: string;
-}
-
-type EvidenceIndexResponse = EvidenceIndexSuccess | EvidenceIndexFailure;
-
-let evidenceIndexJobId = 0;
-
-function cloneTransferableBytes(bytes: Uint8Array): Uint8Array {
-  const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-  return new Uint8Array(buffer);
-}
-
-function indexEvidenceFileInWorker(
-  worker: Worker,
-  entry: FileEntry,
-  bytes: Uint8Array,
-  format: OpenableFileFormat,
-): Promise<EvidenceSearchRow[]> {
-  const jobId = ++evidenceIndexJobId;
-  return new Promise((resolve, reject) => {
-    const cleanup = (): void => {
-      worker.removeEventListener('message', onMessage);
-      worker.removeEventListener('error', onError);
-      worker.removeEventListener('messageerror', onMessageError);
-    };
-    const onMessage = (event: MessageEvent<EvidenceIndexResponse>): void => {
-      const response = event.data;
-      if (!response || response.jobId !== jobId) return;
-      cleanup();
-      if (response.type === 'evidence-file-indexed') {
-        resolve(response.rows);
-      } else {
-        reject(new Error(response.message || 'Could not index evidence file.'));
-      }
-    };
-    const onError = (event: ErrorEvent): void => {
-      cleanup();
-      reject(event.error instanceof Error ? event.error : new Error(event.message));
-    };
-    const onMessageError = (): void => {
-      cleanup();
-      reject(new Error('Could not transfer evidence file to the index worker.'));
-    };
-    worker.addEventListener('message', onMessage);
-    worker.addEventListener('error', onError);
-    worker.addEventListener('messageerror', onMessageError);
-    const transferableBytes = cloneTransferableBytes(bytes);
-    const request: EvidenceIndexRequest = {
-      type: 'index-evidence-file',
-      jobId,
-      entry,
-      bytes: transferableBytes,
-      format,
-    };
-    worker.postMessage(request, [transferableBytes.buffer]);
-  });
-}
-
 /** Parse the pinned/recent files that aren't warm yet (or are stale by
  *  mtime), one at a time, yielding to idle before each parse so it never
  *  blocks a keystroke. Prunes rotated-out pins first.
@@ -299,7 +220,7 @@ async function runWarmPass(
 
 /** Map a main-process file listing to FileEntry rows. */
 function toFileEntries(
-  list: ReadonlyArray<{ path: string; relPath: string; mtimeMs: number }>,
+  list: ReadonlyArray<{ path: string; relPath: string; mtimeMs: number; size?: number }>,
 ): FileEntry[] {
   return list.map((it) => {
     const name = stripFileExt(baseName(it.relPath));
@@ -308,6 +229,7 @@ function toFileEntries(
       relPath: it.relPath,
       name,
       mtimeMs: it.mtimeMs,
+      ...(typeof it.size === 'number' ? { size: it.size } : {}),
       searchText: `${name.toLowerCase()} ${dirName(it.relPath).toLowerCase()}`,
     };
   });
@@ -833,10 +755,29 @@ const RESULT_PAGE_SIZE = 100;
 export const SOURCE_RESULT_LIMIT = 60;
 export const MERGED_RESULT_LIMIT = 180;
 export const EVIDENCE_RESULT_LIMIT = 220;
-export const EVIDENCE_SEARCH_SCAN_BUDGET = 6000;
-export const EVIDENCE_QUERY_CHUNK_SIZE = 500;
-export const EVIDENCE_INDEX_BATCH_SIZE = 12;
-export const EVIDENCE_READ_IDLE_MS = 40;
+/** Legacy short-query scan cap. No longer used to truncate coverage (see
+ *  `evidenceScanBudget`); kept exported for compatibility. */
+export const EVIDENCE_SEARCH_SCAN_BUDGET = 2000;
+/** Rows scanned per event-loop yield during an async evidence search.
+ *  Each yield is a deferred idle callback, so with the index now up to
+ *  200k rows a chunk of 100 meant ~2,000 idle hops per query — seconds of
+ *  latency (field 2026-07-20 "kind of slow"). At 10k it's ~20 hops for a
+ *  full 200k scan: a handful of matchTier passes per frame, still yielding
+ *  often enough to keep typing responsive. */
+export const EVIDENCE_QUERY_CHUNK_SIZE = 10_000;
+/** Stop indexing past this many rows (memory bound; the per-file byte cap
+ *  and the parallel pool live in evidence-index.ts). A massive library then
+ *  degrades to partial coverage instead of crashing the renderer.
+ *  200,000 rows crashed the renderer at the OLD row shape (~11 KB/row —
+ *  full text duplicated across `textLower`/`searchText`/`snippet`/an
+ *  unbounded `anchor.quote`, field bug 2026-07-19), hence the 50k cap.
+ *  The slimmer-rows change (2026-07-20) cut that to ~2-3 KB/row by
+ *  dropping the eager duplicates and bounding the quote, so this same
+ *  200k-row figure now lands at roughly the OLD cap's memory footprint —
+ *  raised back up to actually use that headroom for coverage ("doesn't go
+ *  through everything", field 2026-07-20) rather than leaving it on the
+ *  table. Keep this in sync with `EVIDENCE_DEFAULT_MAX_ROWS`. */
+export const EVIDENCE_MAX_TOTAL_ROWS = 200_000;
 
 export function capResultsForRender<T>(
   rows: readonly T[],
@@ -845,16 +786,74 @@ export function capResultsForRender<T>(
   return rows.length > limit ? rows.slice(0, limit) : [...rows];
 }
 
+/** Append `text` to `el`, wrapping case-insensitive occurrences of the query
+ *  tokens in `<mark class="pmd-qcs-match">` so the eye lands on WHY a row
+ *  matched. Tokens under 2 chars are skipped (pure noise), overlapping hits
+ *  merge into one mark, and unmatched text passes through as plain nodes. */
+export function appendHighlightedText(
+  el: HTMLElement,
+  text: string,
+  tokens: readonly string[],
+): void {
+  const lower = text.toLowerCase();
+  const spans: { from: number; to: number }[] = [];
+  for (const token of tokens) {
+    if (token.length < 2) continue;
+    let at = 0;
+    while ((at = lower.indexOf(token, at)) >= 0) {
+      spans.push({ from: at, to: at + token.length });
+      at += token.length;
+    }
+  }
+  if (spans.length === 0) {
+    el.appendChild(document.createTextNode(text));
+    return;
+  }
+  spans.sort((a, b) => a.from - b.from || b.to - a.to);
+  const merged: { from: number; to: number }[] = [];
+  for (const span of spans) {
+    const last = merged[merged.length - 1];
+    if (last && span.from <= last.to) last.to = Math.max(last.to, span.to);
+    else merged.push({ ...span });
+  }
+  let cursor = 0;
+  for (const span of merged) {
+    if (span.from > cursor) el.appendChild(document.createTextNode(text.slice(cursor, span.from)));
+    const mark = document.createElement('mark');
+    mark.className = 'pmd-qcs-match';
+    mark.textContent = text.slice(span.from, span.to);
+    el.appendChild(mark);
+    cursor = span.to;
+  }
+  if (cursor < text.length) el.appendChild(document.createTextNode(text.slice(cursor)));
+}
+
 function sourceCap(rows: PaletteResult[]): PaletteResult[] {
   return capResultsForRender(rows, SOURCE_RESULT_LIMIT);
 }
 
+/** Empty-corpus message. An empty file list usually means the FIRST
+ *  recursive scan of the search roots is still running in the main
+ *  process (cold index returns [] and publishes when done) — saying
+ *  "No evidence files found" there read as "search is broken". */
+function emptyCorpusText(fileList: readonly FileEntry[] | null): string {
+  return fileList !== null && fileList.length === 0
+    ? 'Scanning your evidence folders — results appear when the first scan finishes.'
+    : 'No evidence files found.';
+}
+
 function evidenceScanBudget(query: string): number {
-  const trimmed = query.trim();
-  if (!trimmed) return EVIDENCE_SEARCH_SCAN_BUDGET;
-  const tokens = trimmed.split(/\s+/).filter(Boolean);
-  const singleShortToken = tokens.length === 1 && tokens[0]!.length <= 5;
-  return singleShortToken ? EVIDENCE_SEARCH_SCAN_BUDGET : Number.POSITIVE_INFINITY;
+  // Always scan the whole indexed set. The OLD behaviour capped a single
+  // short token (<=5 chars) to the first EVIDENCE_SEARCH_SCAN_BUDGET rows —
+  // fine at 50k rows, but after the cap rose to 200k that was ~1% of the
+  // index, and it's the FIRST 1% by file order, so short searches ("cp",
+  // "war", "econ") found almost nothing ("rarely seems to work", field
+  // 2026-07-20). The ranked-bucket search already bounds OUTPUT via the
+  // per-tier result caps, and the async scan yields between chunks, so a
+  // full scan stays responsive without truncating coverage. An empty query
+  // never reaches here (the palette shows a prompt below 2 chars).
+  void query;
+  return Number.POSITIVE_INFINITY;
 }
 
 /** Short left-aligned badge for a result row. */
@@ -1008,10 +1007,11 @@ class QuickCardSearchUI {
   private fileIndexUnsub: (() => void) | null = null;
   private evidenceRows: EvidenceSearchRow[] | null = null;
   private evidenceLoading = false;
+  private evidenceIndexProgress: { done: number; total: number } | null = null;
+  private evidenceIndexTruncated = false;
   private evidenceAsyncToken = 0;
   private evidenceSearchToken = 0;
   private evidenceSearchAbort: AbortController | null = null;
-  private evidenceIndexWorker: Worker | null = null;
   private searchRaf = 0;
   private searchTimer = 0;
 
@@ -1036,6 +1036,8 @@ class QuickCardSearchUI {
     this.inFile = null;
     this.evidenceRows = null;
     this.evidenceLoading = false;
+    this.evidenceIndexProgress = null;
+    this.evidenceIndexTruncated = false;
     this.evidenceAsyncToken += 1;
     this.evidenceSearchToken += 1;
     this.evidenceSearchAbort?.abort();
@@ -1136,11 +1138,14 @@ class QuickCardSearchUI {
     this.inFile = null;
     this.evidenceRows = null;
     this.evidenceLoading = false;
+    this.evidenceIndexProgress = null;
     this.evidenceSearchToken += 1;
     this.evidenceSearchAbort?.abort();
     this.evidenceSearchAbort = null;
-    this.evidenceIndexWorker?.terminate();
-    this.evidenceIndexWorker = null;
+    // Bumping evidenceAsyncToken (via close's asyncToken sibling above is not
+    // enough) — the shared indexer watches isAborted() keyed on the token, so
+    // advance it so any in-flight pool run stops and drops its workers.
+    this.evidenceAsyncToken += 1;
     this.root.remove();
     this.root = null;
     this.view?.focus();
@@ -1499,7 +1504,7 @@ class QuickCardSearchUI {
     if (this.evidenceRows === null) {
       if (!this.evidenceLoading) this.loadEvidenceRows(electron);
       this.results = [];
-      this.emptyText = 'Indexing evidence...';
+      this.emptyText = this.evidenceIndexingText();
       this.finishSearch();
       return;
     }
@@ -1510,12 +1515,10 @@ class QuickCardSearchUI {
     this.evidenceSearchAbort = controller;
     this.results = [];
     this.emptyText = this.evidenceLoading
-      ? rows.length
-        ? 'Still indexing evidence...'
-        : 'Indexing evidence...'
+      ? this.evidenceIndexingText(rows.length > 0)
       : rows.length
         ? 'Searching evidence...'
-        : 'No evidence files found.';
+        : emptyCorpusText(this.fileList);
     this.finishSearch();
     void searchEvidenceRowsAsync(rows, trimmed, {
       limit: EVIDENCE_RESULT_LIMIT,
@@ -1531,12 +1534,12 @@ class QuickCardSearchUI {
         this.evidenceSearchAbort = null;
         this.results = matches.map(evidenceResult);
         this.emptyText = this.evidenceLoading
-          ? rows.length
-            ? 'Still indexing evidence...'
-            : 'Indexing evidence...'
+          ? this.evidenceIndexingText(rows.length > 0)
           : rows.length
-            ? 'No matching evidence.'
-            : 'No evidence files found.';
+            ? this.evidenceIndexTruncated
+              ? 'No matching evidence. (Very large library — only part of it is indexed.)'
+              : 'No matching evidence.'
+            : emptyCorpusText(this.fileList);
         this.finishSearch();
       })
       .catch((err: unknown) => {
@@ -1548,104 +1551,81 @@ class QuickCardSearchUI {
         this.results = [];
         this.emptyText = rows.length
           ? 'Could not search evidence.'
-          : 'No evidence files found.';
+          : emptyCorpusText(this.fileList);
         this.finishSearch();
       });
   }
 
-  private getEvidenceIndexWorker(): Worker | null {
-    if (this.evidenceIndexWorker) return this.evidenceIndexWorker;
-    if (typeof Worker === 'undefined') return null;
-    try {
-      this.evidenceIndexWorker = new Worker(new URL('./evidence-index-worker.ts', import.meta.url), {
-        type: 'module',
-      });
-      return this.evidenceIndexWorker;
-    } catch {
-      this.evidenceIndexWorker = null;
-      return null;
-    }
+  /** "Indexing evidence... 40/128 files" while progress is known; the
+   *  bare label otherwise. `still` marks the partial-results phase. */
+  private evidenceIndexingText(still = false): string {
+    const progress = this.evidenceIndexProgress;
+    const base = still ? 'Still indexing evidence' : 'Indexing evidence';
+    return progress && progress.total > 0
+      ? `${base}... ${Math.min(progress.done, progress.total)}/${progress.total} files`
+      : `${base}...`;
+  }
+
+  /** Live-update the empty-state line while indexing runs, without a full
+   *  re-render (the palette may be sitting on an empty query). */
+  private refreshEvidenceEmptyText(): void {
+    if (!this.root || !this.evidenceLoading || this.results.length > 0) return;
+    this.emptyText = this.evidenceIndexingText((this.evidenceRows?.length ?? 0) > 0);
+    const empty = this.resultsEl.querySelector('.pmd-qcs-empty');
+    if (empty) empty.textContent = this.emptyText;
   }
 
   private loadEvidenceRows(electron: NonNullable<ReturnType<typeof getElectronHost>>): void {
     if (!this.fileList) return;
     this.evidenceLoading = true;
+    this.evidenceIndexTruncated = false;
     this.evidenceRows = [];
     const token = ++this.evidenceAsyncToken;
     const files = filterFilesByFormatSetting(this.fileList).filter((f) => {
       const format = fileFormat(f.path);
       return format === 'cmir' || format === 'docx';
     });
-    void (async () => {
-      const rows: EvidenceSearchRow[] = [];
-      let publishedRows = 0;
-      const publishPartial = (): void => {
+    this.evidenceIndexProgress = { done: 0, total: files.length };
+    // Delegate to the shared PARALLEL indexer (worker pool + caches). The
+    // old serial loop — one worker, a 40 ms sleep between every file — was
+    // the "Search Evidence never finishes" bug: pure throttling dwarfed the
+    // parse cost on a real library.
+    void indexEvidenceFiles({
+      files,
+      host: electron,
+      maxTotalRows: EVIDENCE_MAX_TOTAL_ROWS,
+      // Main-thread fallback for environments without Web Workers (jsdom /
+      // tests, defensive). Production Electron uses the worker pool.
+      indexFileOnMain: async (entry, bytes, format) => {
+        const doc = await parseFileDoc(bytes, format);
+        const extracted = extractEvidenceRows(doc, entry);
+        for (const row of extracted) row.searchText ??= evidenceSearchText(row);
+        return extracted;
+      },
+      isAborted: () => token !== this.evidenceAsyncToken || !this.root,
+      onProgress: (rows, done, total) => {
         if (token !== this.evidenceAsyncToken || !this.root) return;
-        if (rows.length === publishedRows) return;
-        publishedRows = rows.length;
-        this.evidenceRows = rows.slice();
+        this.evidenceIndexProgress = { done, total };
+        this.evidenceRows = rows;
+        this.refreshEvidenceEmptyText();
         if (this.input.value.trim().length >= 2) this.scheduleSearch();
-      };
-      for (let index = 0; index < files.length; index++) {
-        const entry = files[index]!;
+      },
+    })
+      .then((result) => {
         if (token !== this.evidenceAsyncToken || !this.root) return;
-        const cached = evidenceWarmCache.get(entry.path);
-        if (cached && cached.mtimeMs === entry.mtimeMs) {
-          for (const row of cached.rows) row.searchText ??= evidenceSearchText(row);
-          rows.push(...cached.rows);
-          if ((index + 1) % EVIDENCE_INDEX_BATCH_SIZE === 0) publishPartial();
-          continue;
-        }
-        const worker = this.getEvidenceIndexWorker();
-        let extracted: EvidenceSearchRow[];
-        if (worker) {
-          try {
-            await idleYield(EVIDENCE_READ_IDLE_MS);
-            if (token !== this.evidenceAsyncToken || !this.root) return;
-            const file = await electron.readFileAtPath(entry.path);
-            if (!file) continue;
-            await idleYield(EVIDENCE_READ_IDLE_MS);
-            if (token !== this.evidenceAsyncToken || !this.root) return;
-            extracted = await indexEvidenceFileInWorker(worker, entry, file.bytes, file.format);
-          } catch {
-            continue;
-          }
-        } else {
-          const warm = warmCache.get(entry.path);
-          let doc: PMNode | null = warm && warm.mtimeMs === entry.mtimeMs ? warm.doc : null;
-          if (!doc) {
-            try {
-              await idleYield(EVIDENCE_READ_IDLE_MS);
-              if (token !== this.evidenceAsyncToken || !this.root) return;
-              const file = await electron.readFileAtPath(entry.path);
-              if (!file) continue;
-              await idleYield(EVIDENCE_READ_IDLE_MS);
-              if (token !== this.evidenceAsyncToken || !this.root) return;
-              doc = await parseFileDoc(file.bytes, file.format);
-            } catch {
-              continue;
-            }
-          }
-          extracted = extractEvidenceRows(doc, entry);
-          for (const row of extracted) row.searchText ??= evidenceSearchText(row);
-        }
-        evidenceWarmCache.set(entry.path, { mtimeMs: entry.mtimeMs, rows: extracted });
-        rows.push(...extracted);
-        if ((index + 1) % EVIDENCE_INDEX_BATCH_SIZE === 0) {
-          publishPartial();
-          await idleYield(EVIDENCE_READ_IDLE_MS);
-        }
-      }
-      if (token !== this.evidenceAsyncToken || !this.root) return;
-      this.evidenceRows = rows.slice();
-      this.evidenceLoading = false;
-      if (this.input.value.trim().length >= 2) this.runSearch();
-    })().catch(() => {
-      if (token !== this.evidenceAsyncToken || !this.root) return;
-      this.evidenceRows = [];
-      this.evidenceLoading = false;
-      if (this.input.value.trim().length >= 2) this.runSearch();
-    });
+        this.evidenceRows = result.rows;
+        this.evidenceIndexTruncated = result.truncated;
+        this.evidenceLoading = false;
+        this.evidenceIndexProgress = null;
+        if (this.input.value.trim().length >= 2) this.runSearch();
+      })
+      .catch(() => {
+        if (token !== this.evidenceAsyncToken || !this.root) return;
+        this.evidenceRows = [];
+        this.evidenceLoading = false;
+        this.evidenceIndexProgress = null;
+        if (this.input.value.trim().length >= 2) this.runSearch();
+      });
   }
 
   private manualPinPaths(): Set<string> {
@@ -1727,12 +1707,21 @@ class QuickCardSearchUI {
   private onFileIndexUpdated(payload: {
     root: string;
     entries: Array<{ path: string; relPath: string; mtimeMs: number; size: number }>;
+    /** True for throttled mid-scan snapshots during a COLD first walk. */
+    partial?: boolean;
   }): void {
     if (!this.root) return; // closed — the next open reloads from main
     if (!settings.get('fileSearchRoots').includes(payload.root)) return; // not one of our roots
     this.rootLists.set(payload.root, toFileEntries(payload.entries));
     this.fileList = mergeFileLists(this.rootLists.values());
     this.fileListLoading = false;
+    if (payload.partial) {
+      // Mid-scan snapshot: refresh the visible file results, but do NOT
+      // restart evidence indexing on every tick — the final (non-partial)
+      // broadcast does the full reset once the walk completes.
+      this.runSearch();
+      return;
+    }
     this.evidenceAsyncToken += 1;
     this.evidenceSearchToken += 1;
     this.evidenceSearchAbort?.abort();
@@ -1972,6 +1961,9 @@ class QuickCardSearchUI {
       this.resultsEl.appendChild(empty);
       return;
     }
+    // Query tokens for match highlighting (lowercased; prefix sigils like
+    // "ev " have already been stripped out of what reaches row text).
+    const highlightTokens = this.input.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
     this.results.forEach((r, i) => {
       const row = document.createElement('div');
       row.className = 'pmd-qcs-row';
@@ -2013,7 +2005,7 @@ class QuickCardSearchUI {
       top.appendChild(badge);
       const name = document.createElement('span');
       name.className = 'pmd-qcs-row-name';
-      name.textContent = r.name;
+      appendHighlightedText(name, r.name, highlightTokens);
       top.appendChild(name);
       let meta: HTMLSpanElement | null = null;
       if (r.meta) {
@@ -2057,7 +2049,7 @@ class QuickCardSearchUI {
       if (!r.matchedName && r.snippet) {
         const snip = document.createElement('div');
         snip.className = 'pmd-qcs-row-snippet';
-        snip.textContent = r.snippet;
+        appendHighlightedText(snip, r.snippet, highlightTokens);
         row.appendChild(snip);
       }
       row.addEventListener('mousemove', () => {

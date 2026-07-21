@@ -382,6 +382,69 @@ describe('searchEvidenceRows', () => {
     expect((mod.searchEvidenceRows as Function)(rows, 'healthcare spending')[0].kind).toBe('tag');
   });
 
+  it('caches textLower on the row after the first search instead of recomputing it every query', () => {
+    // REGRESSION: extractEvidenceRows deliberately leaves textLower unset
+    // (slimmer rows, 2026-07-20); if the search loop stopped memoizing it
+    // back onto the row, every keystroke would re-lowercase every scanned
+    // row's full text forever — the "kind of slow" field regression.
+    const mod = fileSearchModule as typeof fileSearchModule & {
+      extractEvidenceRows?: unknown;
+      searchEvidenceRows?: unknown;
+    };
+    const rows = (mod.extractEvidenceRows as Function)(
+      sampleEvidenceDoc(),
+      file('Single-Payer 1AC', 'Aff/Single-Payer 1AC.docx', 10),
+    ) as EvidenceSearchRow[];
+    expect(rows[0]!.textLower).toBeUndefined();
+    (mod.searchEvidenceRows as Function)(rows, 'discretionary spending');
+    expect(rows.some((r) => r.textLower !== undefined)).toBe(true);
+  });
+
+  it('spans a multi-word snippet across all matched tokens, not just the first', () => {
+    // REGRESSION: snippetFor used to center on the first QUERY token found in
+    // the row's own text and ignore the rest, so a two-word match could read
+    // as if only one word had been searched.
+    const mod = fileSearchModule as typeof fileSearchModule & {
+      extractEvidenceRows?: unknown;
+      searchEvidenceRows?: unknown;
+    };
+    const rows = (mod.extractEvidenceRows as Function)(
+      sampleEvidenceDoc(),
+      file('Single-Payer 1AC', 'Aff/Single-Payer 1AC.docx', 10),
+    ) as EvidenceSearchRow[];
+    const results = (mod.searchEvidenceRows as Function)(rows, 'national discretionary') as EvidenceSearchRow[];
+    expect(results).toHaveLength(1);
+    expect(results[0]!.snippet).toContain('National');
+    expect(results[0]!.snippet).toContain('discretionary');
+  });
+
+  it('caps body rows per file but keeps every structural row (so big files cannot starve the budget)', () => {
+    // A single huge backfile must not fill the global row budget with its
+    // hundreds of long card bodies and crowd later files out of the index
+    // ("doesn't go through everything", field 2026-07-20). Bodies are capped
+    // per file; tags/cites (the primary search targets) are always kept.
+    const cards = Array.from({ length: 120 }, (_u, i) =>
+      schema.nodes['card']!.createChecked(null, [
+        schema.nodes['tag']!.create({ id: newHeadingId() }, schema.text(`Tag number ${i}`)),
+        citePara({ text: `Author ${i} 24`, cite: true }),
+        cardBody(`Body evidence paragraph number ${i} with distinct words token${i}.`),
+      ]),
+    );
+    const doc = schema.nodes['doc']!.createChecked(null, [block('Huge Backfile'), ...cards]);
+    const mod = fileSearchModule as typeof fileSearchModule & { extractEvidenceRows?: unknown };
+    const rows = (mod.extractEvidenceRows as Function)(
+      doc,
+      file('Huge Backfile', 'Neg/Huge Backfile.cmir', 10),
+    ) as EvidenceSearchRow[];
+
+    const byKind = (k: string): number => rows.filter((r) => r.kind === k).length;
+    // All 120 tags and 120 cites survive (structural rows are never capped).
+    expect(byKind('tag')).toBe(120);
+    expect(byKind('cite')).toBe(120);
+    // Bodies are bounded to the per-file cap (80), not all 120.
+    expect(byKind('body')).toBe(80);
+  });
+
   it('uses cached lowercase evidence search text when present', () => {
     type EvidenceModule = typeof fileSearchModule & {
       extractEvidenceRows?: unknown;

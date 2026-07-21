@@ -139,6 +139,7 @@ import { highlightColorLabel, shadingColorLabel } from './color-palette.js';
 import { viewportSpellcheckPlugin } from './viewport-spellcheck.js';
 import { commentsPlugin, commentsKey, loadThreads, getCommentsState, gcOrphanThreads, newCommentId, setCommentIdSessionResolver } from './comments-plugin.js';
 import { scheduleIdle, cancelIdle, type IdleHandle } from './idle-scheduler.js';
+import { startEvidenceWarmup } from './evidence-warmup.js';
 import { CommentsColumn, addCommentToSelection, FC_PREFIX, AI_PREFIX, NOTE_PREFIX } from './comments-ui.js';
 import { runAiCreateCite } from './ai/cite-creator.js';
 import { runTranslate } from './translate.js';
@@ -890,6 +891,9 @@ let multiDocSetFilenameForUid: ((uid: string, name: string) => void) | null = nu
 /** App-quit path: the shell prompts to save every unsaved pane, returning false
  *  if the user cancels (abort the quit). null in single-doc mode. */
 let multiDocPromptSaveAllForQuit: (() => Promise<boolean>) | null = null;
+/** Whether any pane is unsaved or has a live session — drives the generic
+ *  "close this window?" confirm on an otherwise-silent window close. */
+let multiDocHasUnsavedOrLiveForQuit: (() => boolean) | null = null;
 
 /** Full focused-file plumbing for the Save / Save-As flow — reads
  *  the filename plus the on-disk handle and on-disk format. */
@@ -1017,6 +1021,11 @@ export function enableMultiDocMode(opts: {
   /** App-quit path: prompt to save every unsaved doc across all panes (without
    *  closing them). Returns false if the user cancels — the quit aborts. */
   promptSaveAllForQuit?: () => Promise<boolean>;
+  /** Whether any pane has unsaved changes or a live session — i.e. whether
+   *  `promptSaveAllForQuit` would surface a prompt. The window-close handler
+   *  uses this to add a generic "close this window?" confirm when the close
+   *  would otherwise be silent. */
+  hasUnsavedOrLiveForQuit?: () => boolean;
   /** Called from single-doc save flows RIGHT BEFORE serializing so a
    *  successful save can mark the focused DocRecord clean + drop its
    *  journal — but only if no edits landed while the write was in
@@ -1073,6 +1082,7 @@ export function enableMultiDocMode(opts: {
   multiDocCreateSessionDoc = opts.createSessionDoc ?? null;
   multiDocSetFilenameForUid = opts.setFilenameForUid ?? null;
   multiDocPromptSaveAllForQuit = opts.promptSaveAllForQuit ?? null;
+  multiDocHasUnsavedOrLiveForQuit = opts.hasUnsavedOrLiveForQuit ?? null;
   multiDocCaptureFocusedCleanToken = opts.captureFocusedCleanToken ?? null;
   multiDocOnRecoveredDoc = opts.onRecoveredDoc ?? null;
   multiDocJournalAll = opts.journalAll ?? null;
@@ -3039,8 +3049,21 @@ const systemDarkMedia = window.matchMedia('(prefers-color-scheme: dark)');
 systemDarkMedia.addEventListener('change', () => {
   if (settings.get('theme') === 'system') {
     applyTheme('system', settings.get('themeAppliesToDocument'));
+    applyCustomColorOverrides(activeCustomColorOverrides(), CUSTOM_OVERRIDE_TOKEN_NAMES);
   }
 });
+
+/** The color-override blob for the ACTIVE effective theme. Overrides are
+ *  inline styles that outrank both theme blocks, so light-mode and
+ *  dark-mode customizations must live apart — a shared blob let a color
+ *  picked in light mode wreck dark mode (field bug 2026-07-19). */
+function activeCustomColorOverrides(): Record<string, string> {
+  const pref = settings.get('theme');
+  const dark = pref === 'dark' || (pref === 'system' && systemDarkMedia.matches);
+  return dark
+    ? settings.get('customColorOverridesDark')
+    : settings.get('customColorOverrides');
+}
 
 /** Apply the `showDocNameChip` setting to `<html>`. The chip's CSS
  *  display is gated on this class — without it, the chip is
@@ -3372,7 +3395,7 @@ settings.subscribe((s) => {
     s.overrideShadingSlots,
   );
   applyCustomColorOverrides(
-    s.customColorOverrides,
+    activeCustomColorOverrides(),
     CUSTOM_OVERRIDE_TOKEN_NAMES,
   );
   applyBodyFont(s.bodyFont);
@@ -3706,13 +3729,17 @@ applyHighlightShadingOverride(
   settings.get('overrideShadingSlots'),
 );
 applyCustomColorOverrides(
-  settings.get('customColorOverrides'),
+  activeCustomColorOverrides(),
   CUSTOM_OVERRIDE_TOKEN_NAMES,
 );
 applyBodyFont(settings.get('bodyFont'));
 applyUiFont(settings.get('uiFont'));
 applyLineHeight(settings.get('lineHeight'));
 applyParagraphSpacing();
+// Warm the evidence index in the background a few seconds after boot so
+// the first Search Evidence open is already fast (desktop only; no-op on
+// the web edition and after the first call).
+startEvidenceWarmup();
 applyFormattingPanel(
   settings.get('formattingPanelMode'),
   stylePreview,
@@ -5491,6 +5518,9 @@ async function flushActiveAutosaveBackedContent(): Promise<boolean> {
 async function closeActiveCoeditingSessionWithoutPrompt(): Promise<boolean> {
   if (activeFlowWorkspace) return true;
   if (!collabCopresenceFor(currentDocUid)) return true;
+  if (activeSharedDoc() != null && activeFile().format === 'cmir') {
+    return collabCloseKeepResumable(currentDocUid);
+  }
   return collabEndOrLeaveSession(currentDocUid);
 }
 
@@ -7459,7 +7489,7 @@ async function runActiveFlowSave(): Promise<boolean> {
     const round = activeFlowRound();
     if (!round) return false;
     const bytes = activeFlowBytes(round);
-    await getHost().saveExisting(activeFlowHandle, bytes);
+    await getHost().saveExisting(activeFlowHandle, bytes, { force: true });
     commitActiveFlowSaveResult(
       activeFlowFilename ?? defaultFlowName(round.format),
       activeFlowHandle,
@@ -8081,11 +8111,7 @@ const SHARED_DOC_AUTOSAVE_DELAY_MS = 1000;
 
 function sharedDocAutosaveForced(): boolean {
   const file = activeFile();
-  return (
-    file.format === 'cmir' &&
-    activeSharedDoc() != null &&
-    collabCopresenceFor(activeDocIdentity().sessionUid)?.role === 'host'
-  );
+  return file.format === 'cmir' && activeSharedDoc() != null;
 }
 
 function activeSharedDocDiskWriter(): boolean {
@@ -8221,7 +8247,7 @@ async function runAutosaveAttempt(): Promise<void> {
       const round = activeFlowWorkspace.getRound();
       const commitClean = captureActiveFlowCleanToken();
       const bytes = activeFlowBytes(round);
-      await getHost().saveExisting(activeFlowHandle, bytes);
+      await getHost().saveExisting(activeFlowHandle, bytes, { force: true });
       commitActiveFlowSaveResult(
         activeFlowFilename ?? defaultFlowName(round.format),
         activeFlowHandle,
@@ -8523,6 +8549,18 @@ async function handleUserCloseRequest(): Promise<void> {
   }
 }
 
+/** Generic "close this window?" confirm, shown on a window close that has no
+ *  unsaved work of its own to prompt about — the user asked to be warned
+ *  before the window closes every time, not only when something is dirty. */
+function confirmCloseWindow(): Promise<boolean> {
+  return confirmDialog('Are you sure you want to close this window?', {
+    title: 'Close window',
+    okLabel: 'Close window',
+    cancelLabel: 'Keep open',
+    icon: 'question',
+  });
+}
+
 async function handleUserCloseRequestInner(
   electronHost: NonNullable<ReturnType<typeof getElectronHost>>,
 ): Promise<void> {
@@ -8533,6 +8571,16 @@ async function handleUserCloseRequestInner(
   // aborts the quit via `cancelClose` so a later ordinary close still leaves the
   // app in the dock on macOS.
   if (multiDocActive) {
+    // Always warn before the window closes. When panes are unsaved (or have a
+    // live session), promptSaveAllForQuit IS the warning; when everything is
+    // clean the close would otherwise be silent, so add a generic confirm.
+    const needsSavePrompt = multiDocHasUnsavedOrLiveForQuit
+      ? multiDocHasUnsavedOrLiveForQuit()
+      : false;
+    if (!needsSavePrompt && !(await confirmCloseWindow())) {
+      await electronHost.cancelClose?.();
+      return;
+    }
     const ok = multiDocPromptSaveAllForQuit ? await multiDocPromptSaveAllForQuit() : true;
     if (ok) {
       // Explicitly flush every live session's record before the window dies —
@@ -8577,6 +8625,12 @@ async function handleUserCloseRequestInner(
     // 'run-normal' → fall through to the dirty/save flow below.
   }
   if (!activeContentDirty()) {
+    // Nothing unsaved — still confirm the window close (the user asked to be
+    // warned every time, not only when there's unsaved work).
+    if (!(await confirmCloseWindow())) {
+      await electronHost.cancelClose?.();
+      return;
+    }
     await electronHost.closeSelf();
     return;
   }
@@ -9380,7 +9434,7 @@ async function journalForModeSwitchExcludingSessions(): Promise<ModeSwitchDoc[]>
   let sessionUids = new Set<string>();
   try {
     const flushed = await collabCaptureSessionHandoff();
-    sessionUids = new Set(flushed.map((h) => h.uid));
+    sessionUids = new Set(flushed.filter((h) => !h.durableRoom).map((h) => h.uid));
   } catch (err) {
     console.warn('Mode-switch session flush failed:', err);
   }

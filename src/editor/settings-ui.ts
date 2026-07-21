@@ -149,6 +149,18 @@ const DISPLAY_SIZE_LABELS: Record<keyof DisplaySizes, string> = {
  *  `SettingsModal.close()` and at the top of every `render()`. */
 let rowCleanups: Array<() => void> = [];
 
+/** Which color-override blob the editor reads/writes: the one matching the
+ *  ACTIVE effective theme. Overrides are inline styles that outrank both
+ *  theme blocks, so the light and dark sets must stay separate — a color
+ *  picked in light mode used to poison dark mode (field bug 2026-07-19). */
+function activeOverridesKey(): 'customColorOverrides' | 'customColorOverridesDark' {
+  const pref = settings.get('theme');
+  const dark =
+    pref === 'dark' ||
+    (pref === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  return dark ? 'customColorOverridesDark' : 'customColorOverrides';
+}
+
 function flushRowCleanups(): void {
   const list = rowCleanups;
   rowCleanups = [];
@@ -3007,9 +3019,9 @@ function buildCardNumberColorEditor(): HTMLElement {
     return `#${h(m[0]!)}${h(m[1]!)}${h(m[2]!)}`;
   };
   const isOverridden = (): boolean =>
-    Object.prototype.hasOwnProperty.call(settings.get('customColorOverrides'), TOKEN);
+    Object.prototype.hasOwnProperty.call(settings.get(activeOverridesKey()), TOKEN);
   const effective = (): string => {
-    const ov = settings.get('customColorOverrides');
+    const ov = settings.get(activeOverridesKey());
     return isOverridden()
       ? ov[TOKEN]!
       : getComputedStyle(document.documentElement).getPropertyValue('--' + TOKEN).trim();
@@ -3038,17 +3050,17 @@ function buildCardNumberColorEditor(): HTMLElement {
     reset.disabled = matching || !isOverridden();
   }
   input.addEventListener('input', () => {
-    settings.set('customColorOverrides', {
-      ...settings.get('customColorOverrides'),
+    settings.set(activeOverridesKey(), {
+      ...settings.get(activeOverridesKey()),
       [TOKEN]: input.value,
     });
   });
   reset.addEventListener('click', () => {
-    const cur = settings.get('customColorOverrides');
+    const cur = settings.get(activeOverridesKey());
     if (!Object.prototype.hasOwnProperty.call(cur, TOKEN)) return;
     const next = { ...cur };
     delete next[TOKEN];
-    settings.set('customColorOverrides', next);
+    settings.set(activeOverridesKey(), next);
   });
 
   wrap.appendChild(matchWrap);
@@ -4468,7 +4480,10 @@ function buildColorOverridesEditor(): HTMLElement {
   resetAll.textContent = '↺ Reset all overrides';
   resetAll.title = 'Drop every override and fall back to defaults';
   resetAll.addEventListener('click', () => {
+    // "Reset all" clears BOTH themes' override sets — a stale set for the
+    // other mode would silently resurface on the next theme switch.
     settings.set('customColorOverrides', {});
+    settings.set('customColorOverridesDark', {});
     // The document-text rows are backed by displayColors, not the
     // overrides blob — reset them too so "Reset all" clears every
     // row the user sees in this panel.
@@ -4485,7 +4500,7 @@ function buildColorOverridesEditor(): HTMLElement {
   }
   function refreshResetAll(): void {
     const has =
-      Object.keys(settings.get('customColorOverrides')).length > 0 ||
+      Object.keys(settings.get(activeOverridesKey())).length > 0 ||
       !displayColorsAtDefault();
     resetAll.disabled = !has;
   }
@@ -4556,20 +4571,20 @@ function buildColorOverridesEditor(): HTMLElement {
   }
 
   function isOverridden(name: string): boolean {
-    const overrides = settings.get('customColorOverrides');
+    const overrides = settings.get(activeOverridesKey());
     return Object.prototype.hasOwnProperty.call(overrides, name);
   }
 
   function setOverride(name: string, value: string): void {
-    const next = { ...settings.get('customColorOverrides'), [name]: value };
-    settings.set('customColorOverrides', next);
+    const next = { ...settings.get(activeOverridesKey()), [name]: value };
+    settings.set(activeOverridesKey(), next);
   }
   function clearOverride(name: string): void {
-    const cur = settings.get('customColorOverrides');
+    const cur = settings.get(activeOverridesKey());
     if (!Object.prototype.hasOwnProperty.call(cur, name)) return;
     const next = { ...cur };
     delete next[name];
-    settings.set('customColorOverrides', next);
+    settings.set(activeOverridesKey(), next);
   }
 
   function renderRow(tok: typeof CUSTOMIZABLE_COLOR_TOKENS[number]): HTMLElement {

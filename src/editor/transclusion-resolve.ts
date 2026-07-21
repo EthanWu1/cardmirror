@@ -30,6 +30,7 @@ export type ResolveReason =
   /** The source heading still exists but has been emptied since the last sync —
    *  refuse rather than blank the zone; keep the last cached content. */
   | 'source-empty'
+  | 'source-too-large'
   | 'cancelled'
   /** The zone couldn't be uniquely re-located after the async read (it moved and
    *  there are duplicate-identity zones) — refuse rather than risk the wrong one. */
@@ -64,6 +65,8 @@ export function refreshFailMessage(reason: ResolveReason | undefined): string {
       return 'That heading is gone from the source — showing cached content.';
     case 'source-empty':
       return 'That heading is now empty in the source — keeping the last cached content.';
+    case 'source-too-large':
+      return 'That linked copy is too large to refresh safely - keeping the last cached content.';
     case 'ambiguous':
       return 'The document changed while refreshing — try again.';
     case 'cancelled':

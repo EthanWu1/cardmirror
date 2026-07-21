@@ -6,6 +6,8 @@
  * backdrop click. Headless (no `document`) resolves `false`.
  */
 
+import { dialogIconEl, type DialogIconKind } from './text-prompt.js';
+
 export interface ConfirmOptions {
   /** Optional bold title line above the message. */
   title?: string;
@@ -15,6 +17,10 @@ export interface ConfirmOptions {
   cancelLabel?: string;
   /** Style the confirm button as a destructive action. */
   danger?: boolean;
+  /** Icon kind, or false for no icon. Defaults to 'danger' for destructive
+   *  confirms and 'question' otherwise — the same family as alertDialog /
+   *  confirmDialog so every modal reads as one system. */
+  icon?: DialogIconKind | false;
 }
 
 export function showConfirm(opts: ConfirmOptions): Promise<boolean> {
@@ -36,11 +42,18 @@ export function showConfirm(opts: ConfirmOptions): Promise<boolean> {
       dialog.appendChild(title);
     }
 
+    const row = document.createElement('div');
+    row.className = 'pmd-confirm-row';
+    const iconKind = opts.icon ?? (opts.danger ? 'danger' : 'question');
+    if (iconKind !== false) row.appendChild(dialogIconEl(iconKind));
+    else row.classList.add('pmd-confirm-row-no-icon');
+
     const message = document.createElement('div');
     message.className = 'pmd-confirm-message';
     // Preserve author-intended line breaks without allowing HTML injection.
     message.textContent = opts.message;
-    dialog.appendChild(message);
+    row.appendChild(message);
+    dialog.appendChild(row);
 
     const actions = document.createElement('div');
     actions.className = 'pmd-confirm-actions';

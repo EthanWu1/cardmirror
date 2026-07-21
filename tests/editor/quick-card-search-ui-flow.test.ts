@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { serializeNative } from '../../src/native/index.js';
 import { schema, newHeadingId } from '../../src/schema/index.js';
 import {
+  appendHighlightedText,
   capResultsForRender,
   clampPaletteToViewport,
 } from '../../src/editor/quick-card-search-ui.js';
@@ -82,6 +83,47 @@ describe('capResultsForRender', () => {
     expect(capResultsForRender(rows).at(-1)).toBe(179);
     expect(capResultsForRender(rows, 80)).toEqual(rows.slice(0, 80));
     expect(rows).toHaveLength(500);
+  });
+});
+
+describe('appendHighlightedText', () => {
+  function render(text: string, tokens: string[]): string {
+    const el = document.createElement('div');
+    appendHighlightedText(el, text, tokens);
+    return el.innerHTML;
+  }
+
+  it('marks case-insensitive token hits and passes the rest through', () => {
+    expect(render('Solvency deficit takes out the aff', ['solvency', 'aff'])).toBe(
+      '<mark class="pmd-qcs-match">Solvency</mark> deficit takes out the ' +
+        '<mark class="pmd-qcs-match">aff</mark>',
+    );
+  });
+
+  it('merges overlapping token hits into one mark', () => {
+    expect(render('hegemony', ['hegemon', 'gemony'])).toBe(
+      '<mark class="pmd-qcs-match">hegemony</mark>',
+    );
+  });
+
+  it('skips sub-2-char tokens (prefix letters, stray initials)', () => {
+    expect(render('a plan text', ['a', 'plan'])).toBe(
+      'a <mark class="pmd-qcs-match">plan</mark> text',
+    );
+  });
+
+  it('renders plain text when nothing matches', () => {
+    const el = document.createElement('div');
+    appendHighlightedText(el, 'no hits here', ['warming']);
+    expect(el.innerHTML).toBe('no hits here');
+    expect(el.querySelector('mark')).toBeNull();
+  });
+
+  it('escapes markup-looking source text rather than injecting it', () => {
+    const el = document.createElement('div');
+    appendHighlightedText(el, '<img src=x onerror=alert(1)> climate', ['climate']);
+    expect(el.querySelector('img')).toBeNull();
+    expect(el.textContent).toBe('<img src=x onerror=alert(1)> climate');
   });
 });
 

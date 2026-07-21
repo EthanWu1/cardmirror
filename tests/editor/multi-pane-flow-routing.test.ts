@@ -84,7 +84,10 @@ describe('multi-pane flow routing', () => {
     expect(multiPaneShellSource).toContain('function scheduleFlowAutosave');
     expect(multiPaneShellSource).toContain('function runFlowAutosave');
     expect(multiPaneShellSource).toContain("record.format !== 'cmflow'");
-    expect(multiPaneShellSource).toContain('await host.saveExisting(record.handle, bytes)');
+    const start = multiPaneShellSource.indexOf('async function runFlowAutosave(): Promise<void>');
+    const end = multiPaneShellSource.indexOf('async function save(): Promise<boolean>', start);
+    const runFlowAutosave = start >= 0 && end > start ? multiPaneShellSource.slice(start, end) : '';
+    expect(runFlowAutosave).toContain('await host.saveExisting(record.handle, bytes, { force: true })');
   });
 
   it('marks flow panes so document-only footer chrome is hidden while the pane header remains', () => {

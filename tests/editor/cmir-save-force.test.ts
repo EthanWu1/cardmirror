@@ -20,9 +20,15 @@ describe('.cmir save conflict handling', () => {
     expect(multiPaneSource).toContain("await getHost().saveExisting(rec.handle, bytes, { force: true })");
   });
 
-  it('only lets the host force-autosave a live shared .cmir to the sync folder', () => {
-    expect(editorIndexSource).toContain("collabCopresenceFor(activeDocIdentity().sessionUid)?.role === 'host'");
-    expect(multiPaneSource).toContain("collabCopresenceFor(record.uid)?.role === 'host'");
+  it('treats every live shared .cmir as autosave-backed so guests never get save prompts', () => {
+    expect(editorIndexSource).toContain("return file.format === 'cmir' && activeSharedDoc() != null");
+    expect(multiPaneSource).toContain("return record.format === 'cmir' && record.sharedDoc != null");
+    expect(editorIndexSource).not.toContain(
+      "activeSharedDoc() != null &&\n    collabCopresenceFor(activeDocIdentity().sessionUid)?.role === 'host'",
+    );
+    expect(multiPaneSource).not.toContain(
+      "record.sharedDoc != null &&\n    collabCopresenceFor(record.uid)?.role === 'host'",
+    );
   });
 
   it('prevents non-host live shared .cmir autosave/manual saves from writing the Dropbox file', () => {
@@ -32,5 +38,11 @@ describe('.cmir save conflict handling', () => {
     expect(multiPaneSource).toContain('sharedDocDiskWriter(record)');
     expect(multiPaneSource).toContain('if (!sharedDocDiskWriter(record)) return');
     expect(multiPaneSource).toContain('if (!sharedDocDiskWriter(rec)) {');
+  });
+
+  it('closes autosave-backed co-edited .cmir files by keeping the durable session resumable', () => {
+    expect(editorIndexSource).toContain('return collabCloseKeepResumable(currentDocUid)');
+    expect(multiPaneSource).toContain('await collabCloseKeepResumable(closing.uid)');
+    expect(multiPaneSource).toContain('await collabCloseKeepResumable(rec.uid)');
   });
 });

@@ -71,23 +71,23 @@ describe('Mac Word-like chrome theme tokens', () => {
     const tokens = rootTokens();
 
     expect(tokens.get('--pmd-c-bg')).toBe('#fff');
-    expect(tokens.get('--pmd-c-bg-soft')).toBe('#f2f2f2');
-    expect(tokens.get('--pmd-c-surface')).toBe('#e4e4e4');
-    expect(tokens.get('--pmd-c-surface-alt')).toBe('#d9d9d9');
-    expect(tokens.get('--pmd-c-ribbon')).toBe('#b8b8b8');
-    expect(tokens.get('--pmd-c-ribbon-border')).toBe('#7f7f7f');
+    expect(tokens.get('--pmd-c-bg-soft')).toBe('#f1f2f4');
+    expect(tokens.get('--pmd-c-surface')).toBe('#dfe1e4');
+    expect(tokens.get('--pmd-c-surface-alt')).toBe('#d5d7da');
+    expect(tokens.get('--pmd-c-ribbon')).toBe('#adadb0');
+    expect(tokens.get('--pmd-c-ribbon-border')).toBe('#76787c');
     expect(tokens.get('--pmd-c-ribbon-text')).toBe('#1f1f1f');
     expect(tokens.get('--pmd-c-ribbon-text-secondary')).toBe('#454545');
-    expect(tokens.get('--pmd-c-ribbon-hover')).toBe('rgba(0, 0, 0, 0.14)');
-    expect(tokens.get('--pmd-c-status')).toBe('#b8b8b8');
-    expect(tokens.get('--pmd-c-status-border')).toBe('#7f7f7f');
+    expect(tokens.get('--pmd-c-ribbon-hover')).toBe('rgba(0, 0, 0, 0.12)');
+    expect(tokens.get('--pmd-c-status')).toBe('#adadb0');
+    expect(tokens.get('--pmd-c-status-border')).toBe('#76787c');
     expect(tokens.get('--pmd-c-nav-bg')).toBe('#464646');
     expect(tokens.get('--pmd-c-nav-header-bg')).toBe('#4d4d4d');
     expect(tokens.get('--pmd-c-nav-selected')).toBe('#0a64ad');
     expect(tokens.get('--pmd-c-chrome-text')).toBe('#f2f2f2');
     expect(tokens.get('--pmd-c-chrome-text-secondary')).toBe('#c9c9c9');
-    expect(tokens.get('--pmd-c-hover')).toBe('#dedede');
-    expect(tokens.get('--pmd-c-accent')).toBe('#1557b0');
+    expect(tokens.get('--pmd-c-hover')).toBe('#d7d9dc');
+    expect(tokens.get('--pmd-c-accent')).toBe('#1b5ea8');
     expect(tokens.get('--pmd-c-doc-paper')).toBe('#fff');
   });
 
@@ -98,25 +98,43 @@ describe('Mac Word-like chrome theme tokens', () => {
     expect(styleCss).toContain('color: var(--pmd-c-chrome-text);');
   });
 
-  it('keeps the Word-style chrome even when the app follows system dark mode', () => {
+  it('uses genuinely dark Word-style chrome in dark mode (field feedback 2026-07-19)', () => {
     const tokens = darkThemeTokens();
 
-    expect(tokens.get('--pmd-c-ribbon')).toBe('#b8b8b8');
-    expect(tokens.get('--pmd-c-ribbon-border')).toBe('#7f7f7f');
-    expect(tokens.get('--pmd-c-ribbon-text')).toBe('#1f1f1f');
-    expect(tokens.get('--pmd-c-ribbon-text-secondary')).toBe('#454545');
-    expect(tokens.get('--pmd-c-ribbon-hover')).toBe('rgba(0, 0, 0, 0.14)');
-    expect(tokens.get('--pmd-c-nav-bg')).toBe('#464646');
-    expect(tokens.get('--pmd-c-nav-header-bg')).toBe('#4d4d4d');
+    expect(tokens.get('--pmd-c-ribbon')).toBe('#2b2d30');
+    expect(tokens.get('--pmd-c-ribbon-border')).toBe('#1c1e20');
+    expect(tokens.get('--pmd-c-ribbon-text')).toBe('#e8e8e8');
+    expect(tokens.get('--pmd-c-ribbon-text-secondary')).toBe('#b0b0b0');
+    expect(tokens.get('--pmd-c-ribbon-hover')).toBe('rgba(255, 255, 255, 0.1)');
+    expect(tokens.get('--pmd-c-status')).toBe('#2b2d30');
+    expect(tokens.get('--pmd-c-status-border')).toBe('#1c1e20');
+    expect(tokens.get('--pmd-c-nav-bg')).toBe('#2f2f2f');
+    expect(tokens.get('--pmd-c-nav-header-bg')).toBe('#383838');
     expect(tokens.get('--pmd-c-scrollbar-chrome-hover')).toBe('rgba(255, 255, 255, 0.38)');
     expect(tokens.get('--pmd-c-scrollbar-doc-hover')).toBe('rgba(0, 0, 0, 0.28)');
+  });
+
+  it('gives dark-dialog buttons their own visible surface tokens', () => {
+    // Cancel / Don't Save / route buttons live on DARK dialog bodies. They
+    // must not borrow the ribbon tokens (a near-black ribbon made them
+    // invisible, field bug 2026-07-19) and must not hardcode dark text.
+    for (const selector of [
+      '.pmd-route-btn',
+      '.pmd-route-cancel',
+      '.pmd-text-prompt-secondary',
+      '.pmd-confirm-btn',
+    ]) {
+      expect(ruleBody(selector)).toContain('color: var(--pmd-c-dialog-button-text);');
+      expect(ruleBody(selector)).not.toContain('color: #242424;');
+      expect(ruleBody(selector)).not.toContain('var(--pmd-c-ribbon)');
+    }
   });
 
   it('uses the same light ribbon chrome for the bottom status bar', () => {
     const tokens = rootTokens();
 
-    expect(tokens.get('--pmd-c-status')).toBe('#b8b8b8');
-    expect(tokens.get('--pmd-c-status-border')).toBe('#7f7f7f');
+    expect(tokens.get('--pmd-c-status')).toBe('#adadb0');
+    expect(tokens.get('--pmd-c-status-border')).toBe('#76787c');
     expect(ruleBody('#status-bar')).toContain('background: var(--pmd-c-ribbon);');
     expect(ruleBody('#status-bar')).toContain('border-top: 1px solid var(--pmd-c-ribbon-border);');
     expect(ruleBody('#status-bar')).toContain('color: var(--pmd-c-ribbon-text-secondary);');
@@ -163,18 +181,30 @@ describe('Mac Word-like chrome theme tokens', () => {
     const row = declarationsForSelector('.pmd-settings-row');
 
     expect(dialog.get('display')).toBe('grid');
-    expect(dialog.get('grid-template-columns')).toBe('13rem minmax(0, 1fr)');
+    expect(dialog.get('grid-template-columns')).toBe('12.25rem minmax(0, 1fr)');
     expect(header.get('background')).toBe('var(--pmd-c-ribbon)');
     expect(tabsBar.get('grid-column')).toBe('1');
     expect(tabsBar.get('border-right')).toBe('1px solid var(--pmd-c-ribbon-border)');
-    expect(tabsBar.get('background')).toBe('var(--pmd-c-bg)');
+    expect(tabsBar.get('background')).toBe('var(--pmd-c-surface-soft)');
     expect(tabs.get('flex-direction')).toBe('column');
-    expect(activeTab.get('background')).toBe('var(--pmd-c-ribbon)');
+    expect(activeTab.get('background')).toBe('var(--pmd-c-bg)');
     expect(activeTab.get('border-color')).not.toBe('var(--pmd-c-ribbon-border)');
     expect(list.get('grid-column')).toBe('2');
     expect(list.get('background')).toBe('var(--pmd-c-bg)');
-    expect(row.get('padding')).toBe('0.9rem 0');
+    expect(row.get('padding')).toBe('0.78rem 0');
     expect(row.get('border-bottom')).toBe('1px solid var(--pmd-c-divider-faint)');
+  });
+
+  it('puts the Save As dialog on the unified dark dialog system', () => {
+    const overrides = styleCss.slice(styleCss.indexOf('Save As on the unified dark dialog system'));
+    expect(overrides).toContain('background: var(--pmd-c-dialog-bg);');
+    expect(overrides).toContain('color: var(--pmd-c-dialog-text);');
+    expect(overrides).toContain('background: var(--pmd-c-dialog-bg-strong);');
+    // Secondary buttons share the ribbon-gray cancel treatment; primaries stay accent blue.
+    expect(overrides).toContain('.pmd-save-as-dialog .pmd-save-as-btn {');
+    expect(overrides).toContain('background: var(--pmd-c-dialog-button);');
+    expect(overrides).toContain('.pmd-save-as-dialog .pmd-save-as-btn-primary {');
+    expect(overrides).toContain('background: var(--pmd-c-accent);');
   });
 
   it('aligns the home search and result sections on one Word-like surface', () => {
@@ -224,21 +254,21 @@ describe('Mac Word-like chrome theme tokens', () => {
   });
 
   it('keeps route choice popups in the cleaner Word-style modal family', () => {
-    expect(ruleBody('.pmd-route-dialog')).toContain('background: #3f3f3f;');
-    expect(ruleBody('.pmd-route-dialog')).toContain('border: 1px solid #565656;');
-    expect(ruleBody('.pmd-route-dialog')).toContain('color: #f4f4f4;');
-    expect(ruleBody('.pmd-route-header')).toContain('color: #fff;');
-    expect(ruleBody('.pmd-route-btn')).toContain('background: var(--pmd-c-ribbon);');
-    expect(ruleBody('.pmd-route-btn')).toContain('color: #242424;');
-    expect(ruleBody('.pmd-route-btn:hover')).toContain('color: #242424;');
+    expect(ruleBody('.pmd-route-dialog')).toContain('background: var(--pmd-c-dialog-bg);');
+    expect(ruleBody('.pmd-route-dialog')).toContain('border: 1px solid var(--pmd-c-dialog-border);');
+    expect(ruleBody('.pmd-route-dialog')).toContain('color: var(--pmd-c-dialog-text);');
+    expect(ruleBody('.pmd-route-header')).toContain('color: var(--pmd-c-dialog-text);');
+    expect(ruleBody('.pmd-route-btn')).toContain('background: var(--pmd-c-dialog-button);');
+    expect(ruleBody('.pmd-route-btn')).toContain('color: var(--pmd-c-dialog-button-text);');
+    expect(ruleBody('.pmd-route-btn:hover')).toContain('color: var(--pmd-c-dialog-button-text);');
     expect(ruleBody('.pmd-route-btn:hover')).toContain('border-color: var(--pmd-c-accent);');
     expect(ruleBody('.pmd-route-btn-primary')).toContain('background: var(--pmd-c-accent);');
-    expect(ruleBody('.pmd-route-btn-danger')).toContain('background: #7a2f2f;');
-    expect(ruleBody('.pmd-route-cancel')).toContain('background: var(--pmd-c-ribbon);');
-    expect(ruleBody('.pmd-route-cancel:hover')).toContain('color: #242424;');
-    expect(ruleBody('.pmd-text-prompt-secondary')).toContain('background: var(--pmd-c-ribbon);');
+    expect(ruleBody('.pmd-route-btn-danger')).toContain('background: color-mix(in srgb, var(--pmd-c-error) 68%, #202020);');
+    expect(ruleBody('.pmd-route-cancel')).toContain('background: var(--pmd-c-dialog-button);');
+    expect(ruleBody('.pmd-route-cancel:hover')).toContain('color: var(--pmd-c-dialog-button-text);');
+    expect(ruleBody('.pmd-text-prompt-secondary')).toContain('background: var(--pmd-c-dialog-button);');
     expect(styleCss).toContain('.pmd-text-prompt-danger,');
-    expect(styleCss).toContain('background: #7a2f2f;');
+    expect(styleCss).toContain('background: color-mix(in srgb, var(--pmd-c-error) 68%, #202020);');
   });
 
   it('uses compact buttons for the co-edited document close/end session screen', () => {
@@ -264,7 +294,7 @@ describe('Mac Word-like chrome theme tokens', () => {
       'repeat(3, minmax(0, 1fr))',
     );
     expect(declarationsForSelector('.pmd-pane-route-slots').get('gap')).toBe('0');
-    expect(declarationsForSelector('.pmd-pane-route-slot').get('background')).toBe('#f2f2f2');
+    expect(declarationsForSelector('.pmd-pane-route-slot').get('background')).toBe('var(--pmd-c-dialog-control)');
     expect(declarationsForSelector('.pmd-pane-route-slot').get('min-height')).toBe('112px');
     expect(declarationsForSelector('.pmd-pane-route-number').get('font-size')).toBe('2.25rem');
     expect(declarationsForSelector('.pmd-pane-route-number').get('border')).toBe('0');

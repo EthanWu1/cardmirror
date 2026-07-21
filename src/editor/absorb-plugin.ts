@@ -222,13 +222,27 @@ function absorptionScanWindow(
   }
 
   // Include following loose siblings so a paste / split that creates several
-  // orphan bodies after a card is fixed in one transaction. Include the first
-  // breaker too so the local scan can flush a pending region.
+  // orphan bodies after a card is fixed in one transaction. Also include one
+  // following absorbing container (card / analytic_unit) plus its loose bodies:
+  // commands like F7 can create a new card immediately before an existing
+  // analytic_unit that already has an orphan to claim. Stop before a second
+  // extra absorbing container so ordinary typing in a large card run stays local.
+  let followingAbsorbers = 0;
   while (end < size) {
     const next = doc.childAfter(end);
     if (!next.node) break;
+    const nextType = next.node.type.name;
+    const isAbsorbing = ABSORBING_TYPES.has(nextType);
+    const isAbsorbable = ABSORBABLE_TYPES.has(nextType);
+    if (!isAbsorbing && !isAbsorbable) {
+      end = next.offset + next.node.nodeSize;
+      break;
+    }
+    if (isAbsorbing) {
+      if (followingAbsorbers >= 1) break;
+      followingAbsorbers++;
+    }
     end = next.offset + next.node.nodeSize;
-    if (!ABSORBABLE_TYPES.has(next.node.type.name)) break;
   }
 
   if (end <= start) return null;

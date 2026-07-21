@@ -118,17 +118,21 @@ describe('unsaved close dialog', () => {
   });
 
   it('uses a dark Word-style save prompt color scheme', () => {
-    expect(ruleBody('.pmd-unsaved-close-dialog')).toContain('background: #3d3d3d;');
+    expect(ruleBody('.pmd-unsaved-close-dialog')).toContain('background: var(--pmd-c-dialog-bg);');
     expect(ruleBody('.pmd-unsaved-close-title')).toContain(
       'color: color-mix(in srgb, var(--pmd-c-accent) 78%, #fff);',
     );
-    expect(ruleBody('.pmd-unsaved-location-label')).toContain('color: #fff;');
-    expect(ruleBody('.pmd-unsaved-location-button')).toContain('background: #f1f1f1;');
+    expect(ruleBody('.pmd-unsaved-location-label')).toContain('color: var(--pmd-c-dialog-text);');
+    expect(ruleBody('.pmd-unsaved-location-button')).toContain('background: var(--pmd-c-dialog-control);');
     expect(ruleBody('.pmd-unsaved-location-button:hover')).toContain('color: #242424;');
     expect(ruleBody('.pmd-unsaved-location-chevron')).toContain('color: #242424;');
-    expect(ruleBody('.pmd-unsaved-close-actions')).toContain('background: #363636;');
-    expect(ruleBody('.pmd-unsaved-close-btn')).toContain('background: var(--pmd-c-ribbon);');
-    expect(ruleBody('.pmd-unsaved-close-btn:hover')).toContain('color: #1f1f1f;');
+    expect(ruleBody('.pmd-unsaved-close-actions')).toContain('background: var(--pmd-c-dialog-bg-strong);');
+    // Don't Save / Cancel must use the LIGHT dialog-button tokens — the old
+    // ribbon background went near-black in dark mode and the buttons vanished
+    // (field bug 2026-07-19, reported twice).
+    expect(ruleBody('.pmd-unsaved-close-btn')).toContain('background: var(--pmd-c-dialog-button);');
+    expect(ruleBody('.pmd-unsaved-close-btn')).toContain('color: var(--pmd-c-dialog-button-text);');
+    expect(ruleBody('.pmd-unsaved-close-btn')).not.toContain('var(--pmd-c-ribbon)');
     expect(ruleBody('.pmd-unsaved-close-primary')).toContain('background: var(--pmd-c-accent);');
     expect(ruleBody('.pmd-unsaved-close-primary')).toContain('color: var(--pmd-c-text-on-accent);');
     expect(ruleBody('.pmd-unsaved-close-primary')).toContain('border-color: var(--pmd-c-accent);');

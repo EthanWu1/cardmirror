@@ -27,6 +27,12 @@ function card(tag: string, body: string, id = newHeadingId()): PMNode {
     schema.nodes['card_body']!.create(null, schema.text(body)),
   ]);
 }
+function renderedSelfRef(sourceId: string, children: PMNode[]): PMNode {
+  return schema.nodes['self_ref']!.create(
+    { source_heading_id: sourceId, source_label: 'rendered' },
+    children,
+  );
+}
 function inDocCopyNode(doc: PMNode, headingId: string): PMNode {
   const o = buildInDocCopyAttrs(doc, headingId);
   if (!o.ok || !o.attrs) throw new Error('build failed: ' + o.reason);
@@ -95,6 +101,22 @@ describe('buildInDocCopyAttrs', () => {
     // kept — so the copy never carries a second transclusion rail.
     expect(selfRefs).toBe(0);
     expect(o.content!.textBetween(0, o.content!.size, ' ')).toContain('other-ev');
+  });
+
+  it('snapshots rendered live-view children instead of recursively re-resolving them', () => {
+    const d = schema.nodes['doc']!.create(null, [
+      block('Other', 'other'),
+      card('O', 'source-ev'),
+      block('Src', 'src'),
+      card('A', 'alpha'),
+      renderedSelfRef('other', [card('Rendered', 'rendered-ev')]),
+      block('End', 'end'),
+    ]);
+    const o = buildInDocCopyAttrs(d, 'src');
+    expect(o.ok).toBe(true);
+    const text = o.content!.textBetween(0, o.content!.size, ' ');
+    expect(text).toContain('rendered-ev');
+    expect(text).not.toContain('source-ev');
   });
 
   it('refuses an empty or missing section', () => {

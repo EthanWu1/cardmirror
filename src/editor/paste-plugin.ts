@@ -543,14 +543,22 @@ const WORD_BLOCK_STYLE_CLASSES: Record<string, { tag: string; className: string 
   heading1char: { tag: 'h1', className: 'pmd-pocket' },
   pocket: { tag: 'h1', className: 'pmd-pocket' },
   pocketchar: { tag: 'h1', className: 'pmd-pocket' },
+  // Verbatim's aliased built-ins ("Heading 1,Pocket") as ONE concatenated
+  // token — belt and braces for any path that normalizes the whole name.
+  heading1pocket: { tag: 'h1', className: 'pmd-pocket' },
+  heading1pocketchar: { tag: 'h1', className: 'pmd-pocket' },
   heading2: { tag: 'h2', className: 'pmd-hat' },
   heading2char: { tag: 'h2', className: 'pmd-hat' },
   hat: { tag: 'h2', className: 'pmd-hat' },
   hatchar: { tag: 'h2', className: 'pmd-hat' },
+  heading2hat: { tag: 'h2', className: 'pmd-hat' },
+  heading2hatchar: { tag: 'h2', className: 'pmd-hat' },
   heading3: { tag: 'h3', className: 'pmd-block' },
   heading3char: { tag: 'h3', className: 'pmd-block' },
   block: { tag: 'h3', className: 'pmd-block' },
   blockchar: { tag: 'h3', className: 'pmd-block' },
+  heading3block: { tag: 'h3', className: 'pmd-block' },
+  heading3blockchar: { tag: 'h3', className: 'pmd-block' },
   blockheading: { tag: 'h3', className: 'pmd-block' },
   blockheadingchar: { tag: 'h3', className: 'pmd-block' },
   blockheadings: { tag: 'h3', className: 'pmd-block' },
@@ -561,6 +569,8 @@ const WORD_BLOCK_STYLE_CLASSES: Record<string, { tag: string; className: string 
   hiddenblockheaderchar: { tag: 'h3', className: 'pmd-block' },
   heading4: { tag: 'h4', className: 'pmd-tag' },
   heading4char: { tag: 'h4', className: 'pmd-tag' },
+  heading4tag: { tag: 'h4', className: 'pmd-tag' },
+  heading4tagchar: { tag: 'h4', className: 'pmd-tag' },
   tag: { tag: 'h4', className: 'pmd-tag' },
   tagchar: { tag: 'h4', className: 'pmd-tag' },
   styletag: { tag: 'h4', className: 'pmd-tag' },
@@ -646,6 +656,25 @@ function normalizeWordStyleToken(value: string): string {
     .replace(/[^a-z0-9]+/g, '');
 }
 
+/** Tokens for one raw `mso-style-name` value. Word styles carry
+ *  comma-separated ALIASES — Verbatim renames the built-in headings to
+ *  "Heading 1,Pocket" / "Heading 2,Hat" / "Heading 3,Block" — and the
+ *  copied HTML surfaces the full aliased name (comma escaped as `\,`).
+ *  Normalizing the whole thing to one token ("heading1pocket") matched
+ *  nothing, so aliased Verbatim headings pasted as plain text (field bug
+ *  2026-07-19). Emit a token per alias plus the concatenation. */
+function wordStyleNameTokens(value: string): string[] {
+  const unquoted = value.trim().replace(/^["']|["']$/g, '');
+  const tokens = new Set<string>();
+  const whole = normalizeWordStyleToken(unquoted);
+  if (whole) tokens.add(whole);
+  for (const alias of unquoted.split(/(?<!\\),/)) {
+    const token = normalizeWordStyleToken(alias.replace(/\\,/g, ','));
+    if (token) tokens.add(token);
+  }
+  return [...tokens];
+}
+
 function blankWordCssInfo(): WordCssInfo {
   return {
     tokens: [],
@@ -679,8 +708,7 @@ function parseWordCssDeclarations(declarations: string): WordCssInfo {
   const info = blankWordCssInfo();
   const styleNamePattern = /(?:^|;)\s*mso-style-(?:name|link|id)\s*:\s*("[^"]+"|'[^']+'|[^;]+)/gi;
   for (const match of declarations.matchAll(styleNamePattern)) {
-    const token = normalizeWordStyleToken(match[1] ?? '');
-    if (token) info.tokens.push(token);
+    for (const token of wordStyleNameTokens(match[1] ?? '')) info.tokens.push(token);
   }
 
   const outlineMatch = /(?:^|;)\s*mso-outline-level\s*:\s*(\d+)/i.exec(declarations);
@@ -714,11 +742,27 @@ function parseWordCssClassInfo(root: ParentNode): Map<string, WordCssInfo> {
       continue;
     }
     for (const selector of selectors.split(',')) {
+      let sawClass = false;
       for (const classMatch of selector.matchAll(/\.([_a-zA-Z][-_a-zA-Z0-9]*)/g)) {
         const className = classMatch[1];
         if (!className) continue;
+        sawClass = true;
         const existing = map.get(className) ?? blankWordCssInfo();
         map.set(className, mergeWordCssInfo(existing, info));
+      }
+      // TAG-keyed rules (`h2 { mso-style-name:"Heading 2\,Hat"; ... }`) are
+      // how REAL Word CF_HTML carries heading metadata — the elements
+      // themselves are bare `<h2>`s. Skipping these left every heading
+      // unmapped, and ProseMirror's doc-level textblock synthesis then
+      // swallowed them all as pockets (field bug 2026-07-19). Keyed with a
+      // `tag:` prefix so class names can never collide.
+      if (!sawClass) {
+        const tagMatch = /^\s*(h[1-6])\s*$/i.exec(selector);
+        if (tagMatch?.[1]) {
+          const key = `tag:${tagMatch[1].toLowerCase()}`;
+          const existing = map.get(key) ?? blankWordCssInfo();
+          map.set(key, mergeWordCssInfo(existing, info));
+        }
       }
     }
   }
@@ -727,6 +771,10 @@ function parseWordCssClassInfo(root: ParentNode): Map<string, WordCssInfo> {
 
 function wordCssInfoForElement(el: Element, classInfo: Map<string, WordCssInfo>): WordCssInfo {
   const info = blankWordCssInfo();
+  // Tag-keyed sheet rule first (lowest precedence) — element classes and
+  // inline styles merge after it and win where they disagree.
+  const tagRule = classInfo.get(`tag:${el.tagName.toLowerCase()}`);
+  if (tagRule) mergeWordCssInfo(info, tagRule);
   const classAttr = el.getAttribute('class') ?? '';
   for (const className of classAttr.split(/\s+/)) {
     if (!className) continue;
@@ -887,6 +935,25 @@ function replaceElementTag(el: HTMLElement, tagName: string): HTMLElement {
   while (el.firstChild) replacement.appendChild(el.firstChild);
   el.replaceWith(replacement);
   return replacement;
+}
+
+/** Last-resort mapping for a heading ELEMENT that carried no usable style
+ *  metadata at all: map by its own tag level. Without this, an unmapped
+ *  heading dissolves to loose text and ProseMirror's doc-level textblock
+ *  synthesis wraps EVERYTHING as a pocket (field bug 2026-07-19 — "all
+ *  pasted headings turn into pocket"). h5/h6 have no CardMirror level of
+ *  their own; they land as tags, the finest heading. */
+const BARE_HEADING_FALLBACK: Record<string, { tag: string; className: string }> = {
+  h1: { tag: 'h1', className: 'pmd-pocket' },
+  h2: { tag: 'h2', className: 'pmd-hat' },
+  h3: { tag: 'h3', className: 'pmd-block' },
+  h4: { tag: 'h4', className: 'pmd-tag' },
+  h5: { tag: 'h4', className: 'pmd-tag' },
+  h6: { tag: 'h4', className: 'pmd-tag' },
+};
+
+function bareHeadingFallbackStyle(el: Element): { tag: string; className: string } | null {
+  return BARE_HEADING_FALLBACK[el.tagName.toLowerCase()] ?? null;
 }
 
 function firstWordBlockStyle(
@@ -1257,7 +1324,11 @@ function normalizeWordNamedStyles(html: string): string {
     /(?:mso-style-(?:name|link|id)|mso-outline-level|mso-bidi-font-weight|Mso|Heading[1-4]|Style13ptBold|StyleUnderline|StyleBoldUnderline|StyleStyleBold12pt|UndertagChar|AnalyticChar|TagChar|\bTag\b|\bTags\b|\bCard\b|\bCards\b|Emphasis)/i.test(html);
   const hasVisualStyleSignal =
     /(?:font-weight\s*:|font-style\s*:|text-decoration\s*:|font-size\s*:|<(?:b|strong|i|em|u)\b)/i.test(html);
-  if (!hasNamedStyleSignal && !hasVisualStyleSignal) {
+  // Bare heading elements are a signal on their own: without normalization
+  // they dissolve to loose text in the schema parse and re-wrap as pockets
+  // (the bare-heading fallback in the walk below maps them by level).
+  const hasHeadingSignal = /<h[1-6][\s>]/i.test(html);
+  if (!hasNamedStyleSignal && !hasVisualStyleSignal && !hasHeadingSignal) {
     return html;
   }
   const allowVisualBlockInference = hasWordSignal;
@@ -1267,8 +1338,10 @@ function normalizeWordNamedStyles(html: string): string {
   wrap.innerHTML = html;
   const classInfo = parseWordCssClassInfo(wrap);
 
-  for (const original of Array.from(wrap.querySelectorAll<HTMLElement>('p,h1,h2,h3,h4,div'))) {
-    const block = firstWordBlockStyle(original, classInfo, allowVisualBlockInference);
+  for (const original of Array.from(wrap.querySelectorAll<HTMLElement>('p,h1,h2,h3,h4,h5,h6,div'))) {
+    const block =
+      firstWordBlockStyle(original, classInfo, allowVisualBlockInference) ??
+      bareHeadingFallbackStyle(original);
     if (!block) continue;
     const el = replaceElementTag(original, block.tag);
     addClass(el, block.className);

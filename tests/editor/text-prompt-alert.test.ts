@@ -32,6 +32,7 @@ describe('alert and confirm route dialogs', () => {
 
     expect(document.querySelector('.pmd-alert-title')?.textContent).toBe('CardMirror');
     expect(document.querySelector('.pmd-alert-icon')?.textContent).toBe('!');
+    expect(document.querySelector('.pmd-alert-icon-warning')).not.toBeNull();
     expect(document.querySelector('.pmd-alert-message')?.textContent).toContain('maximum length');
     expect(document.querySelector('.pmd-choice-prompt-detail')).toBeNull();
     expect([...document.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['OK']);
@@ -40,7 +41,7 @@ describe('alert and confirm route dialogs', () => {
     await expect(done).resolves.toBeUndefined();
   });
 
-  it('renders confirms as a compact message without a warning icon', async () => {
+  it('renders confirms with a question icon in the shared dialog icon family', async () => {
     const done = confirmDialog('Connect this document to the live shared room?', {
       title: 'CardMirror',
       okLabel: 'Connect',
@@ -48,8 +49,8 @@ describe('alert and confirm route dialogs', () => {
     });
 
     expect(document.querySelector('.pmd-alert-title')?.textContent).toBe('CardMirror');
-    expect(document.querySelector('.pmd-alert-icon')).toBeNull();
-    expect(document.querySelector('.pmd-alert-row-no-icon')).not.toBeNull();
+    expect(document.querySelector('.pmd-alert-icon-question')?.textContent).toBe('?');
+    expect(document.querySelector('.pmd-alert-row-no-icon')).toBeNull();
     expect(document.querySelector('.pmd-alert-message')?.textContent).toContain('Connect this document');
     expect(document.querySelector('.pmd-choice-prompt-detail')).toBeNull();
     expect([...document.querySelectorAll('button')].map((b) => b.textContent)).toEqual([
@@ -71,10 +72,13 @@ describe('alert and confirm route dialogs', () => {
     const ok = document.querySelector<HTMLButtonElement>('.pmd-text-prompt-ok')!;
     expect(ok.textContent).toBe('End Session');
     expect(ok.classList.contains('pmd-text-prompt-danger')).toBe(true);
+    expect(document.querySelector('.pmd-alert-icon-danger')?.textContent).toBe('!');
     expect(ruleBody('.pmd-alert-dialog .pmd-text-prompt-ok')).toContain(
-      'background: var(--pmd-c-ribbon);',
+      'background: var(--pmd-c-dialog-button);',
     );
-    expect(ruleBody('.pmd-alert-dialog .pmd-text-prompt-danger')).toContain('background: #7a2f2f;');
+    expect(ruleBody('.pmd-alert-dialog .pmd-text-prompt-danger')).toContain(
+      'background: color-mix(in srgb, var(--pmd-c-error) 68%, #202020);',
+    );
 
     ok.click();
     await expect(done).resolves.toBe(true);
@@ -107,21 +111,21 @@ describe('alert and confirm route dialogs', () => {
     expect(ruleBody('.pmd-alert-dialog')).toContain('width: min(520px, calc(100vw - 32px));');
     expect(ruleBody('.pmd-alert-dialog')).toContain('min-width: min(340px, calc(100vw - 32px));');
     expect(ruleBody('.pmd-alert-dialog')).toContain('padding: 1rem 1.15rem 0.85rem;');
-    expect(ruleBody('.pmd-alert-title')).toContain('color: #fff;');
+    expect(ruleBody('.pmd-alert-title')).toContain('color: var(--pmd-c-dialog-text);');
     expect(ruleBody('.pmd-alert-title')).toContain('font-size: 1.08rem;');
     expect(ruleBody('.pmd-alert-row')).toContain('display: grid;');
     expect(ruleBody('.pmd-alert-row')).toContain('grid-template-columns: 3rem minmax(0, 1fr);');
     expect(ruleBody('.pmd-alert-row-no-icon')).toContain('grid-template-columns: minmax(0, 1fr);');
     expect(ruleBody('.pmd-alert-icon')).toContain('width: 2.4rem;');
-    expect(ruleBody('.pmd-alert-message')).toContain('color: #fff;');
+    expect(ruleBody('.pmd-alert-message')).toContain('color: var(--pmd-c-dialog-text);');
     expect(ruleBody('.pmd-alert-message')).toContain('font-size: 0.88rem;');
     expect(ruleBody('.pmd-alert-message')).toContain('white-space: pre-line;');
     expect(ruleBody('.pmd-alert-dialog .pmd-text-prompt-ok')).toContain(
-      'background: var(--pmd-c-ribbon);',
+      'background: var(--pmd-c-dialog-button);',
     );
-    expect(ruleBody('.pmd-text-prompt-buttons .pmd-route-cancel')).toContain('background: var(--pmd-c-ribbon);');
+    expect(ruleBody('.pmd-text-prompt-buttons .pmd-route-cancel')).toContain('background: var(--pmd-c-dialog-button);');
     expect(ruleBody('.pmd-text-prompt-buttons .pmd-route-cancel:hover')).toContain(
-      'background: color-mix(in srgb, var(--pmd-c-ribbon) 82%, #fff);',
+      'background: color-mix(in srgb, var(--pmd-c-dialog-button) 82%, #fff);',
     );
   });
 });

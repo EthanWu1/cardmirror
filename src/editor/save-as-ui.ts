@@ -9,15 +9,12 @@
  *     teammates still on Verbatim, or for any tournament-day round
  *     where the receiving party needs Word.
  *
- * Layout: a Name section, a Format section, then a Save section
- * with one-click presets — As-Is (everything), Send Doc (no
- * analytics / undertags / comments), Read Doc (read-mode export),
- * Marked Doc (marked cards only), each with its description as a
- * caption below the button — followed by a Custom Save block
- * (comments / analytics / undertags checkboxes + a Save Custom
- * button), then Cancel. The format radio drives the default
- * filename extension and which filter the OS dialog defaults to;
- * all content options apply equally to both formats.
+ * Layout (minimal — field feedback 2026-07-19): a Name field, a Type
+ * dropdown (Original = everything, Send = no analytics/undertags/comments,
+ * Read = read-mode export, Marked = marked cards only), a compact Format
+ * toggle (.cmir / .docx), and a Cancel / Save footer. Save applies the
+ * selected Type. The Format toggle drives the default filename extension
+ * and which filter the OS dialog defaults to.
  */
 
 import { settings } from './settings.js';
@@ -79,19 +76,92 @@ const FORMAT_BLURBS: Record<SaveAsFormat, string> = {
   docx: 'For sharing with Verbatim users or any Word-based workflow.',
 };
 
+/** Content options a Save As "type" carries, minus the filename/format
+ *  the user sets separately. */
+type SaveContentOptions = Omit<SaveAsResult, 'filename' | 'format'>;
+
+type SaveTypeId = 'original' | 'send' | 'read' | 'marked';
+
+interface SaveTypeDef {
+  id: SaveTypeId;
+  label: string;
+  blurb: string;
+  /** Filename prefix setting key, when this type prepends one. */
+  prefixKey?: 'sendDocPrefix' | 'readDocPrefix' | 'markedDocPrefix';
+  opts: SaveContentOptions;
+}
+
+/** The four save "types" the dropdown offers. Order = dropdown order;
+ *  `original` (everything) is the default. */
+const SAVE_TYPES: SaveTypeDef[] = [
+  {
+    id: 'original',
+    label: 'Original',
+    blurb: 'Everything in the document.',
+    opts: {
+      includeComments: true,
+      includeAnalytics: true,
+      includeUndertags: true,
+      readMode: false,
+      includeNotes: false,
+      includeAiThreads: false,
+      markedCardsOnly: false,
+    },
+  },
+  {
+    id: 'send',
+    label: 'Send',
+    blurb: 'Excludes analytics, undertags, and comments.',
+    prefixKey: 'sendDocPrefix',
+    opts: {
+      includeComments: false,
+      includeAnalytics: false,
+      includeUndertags: false,
+      readMode: false,
+      includeNotes: false,
+      includeAiThreads: false,
+      markedCardsOnly: false,
+    },
+  },
+  {
+    id: 'read',
+    label: 'Read',
+    blurb: 'The read-mode view of the document.',
+    prefixKey: 'readDocPrefix',
+    opts: {
+      includeComments: false,
+      includeAnalytics: false,
+      includeUndertags: false,
+      readMode: true,
+      includeNotes: false,
+      includeAiThreads: false,
+      markedCardsOnly: false,
+    },
+  },
+  {
+    id: 'marked',
+    label: 'Marked',
+    blurb: 'Only the cards you marked.',
+    prefixKey: 'markedDocPrefix',
+    opts: {
+      includeComments: false,
+      includeAnalytics: false,
+      includeUndertags: true,
+      readMode: false,
+      includeNotes: false,
+      includeAiThreads: false,
+      markedCardsOnly: true,
+    },
+  },
+];
+
 class SaveAsModal {
   private readonly overlay: HTMLDivElement;
   private readonly dialog: HTMLDivElement;
   private filenameInput!: HTMLInputElement;
-  private commentsBox!: HTMLInputElement;
-  private analyticsBox!: HTMLInputElement;
-  private undertagsBox!: HTMLInputElement;
-  private notesBox!: HTMLInputElement;
-  private aiThreadsBox!: HTMLInputElement;
-  /** Radio inputs keyed by format id. */
-  private formatRadios!: Record<SaveAsFormat, HTMLInputElement>;
   private settled = false;
   private currentFormat: SaveAsFormat;
+  private currentType: SaveTypeDef = SAVE_TYPES[0]!;
 
   constructor(
     private readonly opts: OpenSaveAsOptions,
@@ -152,130 +222,19 @@ class SaveAsModal {
 
     const form = document.createElement('form');
     form.className = 'pmd-save-as-body';
-    // Enter / the Save Custom submit button save with the current
-    // Include checkbox state.
+    // Enter / the footer Save button save using the selected Type. (Field
+    // feedback 2026-07-19: Type is a dropdown, not a row of buttons; Format
+    // is a compact toggle, not a dropdown.)
     form.addEventListener('submit', (e) => {
       e.preventDefault();
-      this.confirmWith({
-        includeComments: this.commentsBox.checked,
-        includeAnalytics: this.analyticsBox.checked,
-        includeUndertags: this.undertagsBox.checked,
-        readMode: false,
-        includeNotes: this.notesBox.checked,
-        includeAiThreads: this.aiThreadsBox.checked,
-        markedCardsOnly: false,
-      });
+      this.confirmSelectedType();
     });
 
-    // FILE NAME and FORMAT — the what/where, each under its heading.
     form.appendChild(this.buildFileNameSection());
+    form.appendChild(this.buildTypeSection());
     form.appendChild(this.buildFormatSection());
 
-    // SAVE section heading — covers the presets and the custom-save
-    // block below.
-    const saveHeading = document.createElement('div');
-    saveHeading.className = 'pmd-save-as-options-heading';
-    saveHeading.textContent = 'Save';
-    form.appendChild(saveHeading);
-
-    // One-click presets — common content configurations. Each saves
-    // immediately with the filename + format above; the description
-    // shows as a caption below the button.
-    const presets = document.createElement('div');
-    presets.className = 'pmd-save-as-presets';
-    presets.appendChild(
-      this.buildPreset(
-        'As-Is',
-        'Includes everything in the document.',
-        {
-          includeComments: true,
-          includeAnalytics: true,
-          includeUndertags: true,
-          readMode: false,
-          includeNotes: false,
-          includeAiThreads: false,
-          markedCardsOnly: false,
-        },
-      ),
-    );
-    presets.appendChild(
-      this.buildPreset(
-        'Send Doc',
-        'Excludes analytics, undertags, and comments.',
-        {
-          includeComments: false,
-          includeAnalytics: false,
-          includeUndertags: false,
-          readMode: false,
-          includeNotes: false,
-          includeAiThreads: false,
-          markedCardsOnly: false,
-        },
-        settings.get('sendDocPrefix'),
-      ),
-    );
-    presets.appendChild(
-      this.buildPreset(
-        'Read Doc',
-        'Exports the read-mode view of the document.',
-        {
-          includeComments: false,
-          includeAnalytics: false,
-          includeUndertags: false,
-          readMode: true,
-          includeNotes: false,
-          includeAiThreads: false,
-          markedCardsOnly: false,
-        },
-        settings.get('readDocPrefix'),
-      ),
-    );
-    presets.appendChild(
-      this.buildPreset(
-        'Marked Doc',
-        'Saves only the cards you marked.',
-        {
-          includeComments: false,
-          includeAnalytics: false,
-          includeUndertags: true,
-          readMode: false,
-          includeNotes: false,
-          includeAiThreads: false,
-          markedCardsOnly: true,
-        },
-        settings.get('markedDocPrefix'),
-      ),
-    );
-    form.appendChild(presets);
-
-    // Custom Save: the Include checkboxes + a Save Custom button.
-    const options = document.createElement('div');
-    options.className = 'pmd-save-as-options';
-    options.appendChild(this.buildOptionsHeading());
-
-    this.commentsBox = this.buildCheckbox('Include comments', true);
-    this.analyticsBox = this.buildCheckbox('Include analytics', true);
-    this.undertagsBox = this.buildCheckbox('Include undertags', true);
-    // Private annotation layers — off by default (they normally never
-    // leave CardMirror). Checking them bakes the notes / AI threads into
-    // the saved file as real Word-style comments.
-    this.notesBox = this.buildCheckbox('Include private notes (as comments)', false);
-    this.aiThreadsBox = this.buildCheckbox('Include AI comments (as comments)', false);
-    options.appendChild(this.commentsBox.parentElement!);
-    options.appendChild(this.analyticsBox.parentElement!);
-    options.appendChild(this.undertagsBox.parentElement!);
-    options.appendChild(this.notesBox.parentElement!);
-    options.appendChild(this.aiThreadsBox.parentElement!);
-
-    const customSave = document.createElement('button');
-    customSave.type = 'submit';
-    customSave.className = 'pmd-save-as-btn pmd-save-as-btn-primary pmd-save-as-custom-save';
-    customSave.textContent = 'Save Custom';
-    options.appendChild(customSave);
-
-    form.appendChild(options);
-
-    // Cancel sits alone at the very bottom.
+    // Footer: Cancel + Save (saves with the selected Type + Format).
     const footer = document.createElement('footer');
     footer.className = 'pmd-save-as-footer';
     const cancel = document.createElement('button');
@@ -284,43 +243,53 @@ class SaveAsModal {
     cancel.textContent = 'Cancel';
     cancel.addEventListener('click', () => this.cancel());
     footer.appendChild(cancel);
+    const save = document.createElement('button');
+    save.type = 'submit';
+    save.className = 'pmd-save-as-btn pmd-save-as-btn-primary';
+    save.textContent = 'Save';
+    footer.appendChild(save);
     form.appendChild(footer);
 
     this.dialog.appendChild(form);
   }
 
-  /** Build a preset cell: a primary (blue) button with its
-   *  description as a caption below. Clicking the button saves
-   *  immediately with the given content options (filename + format
-   *  read live from the inputs). `prefix` is prepended to the file
-   *  name (subject to the `prefixPresetSaveFilenames` setting). */
-  private buildPreset(
-    title: string,
-    sub: string,
-    opts: {
-      includeComments: boolean;
-      includeAnalytics: boolean;
-      includeUndertags: boolean;
-      readMode: boolean;
-      includeNotes: boolean;
-      includeAiThreads: boolean;
-      markedCardsOnly: boolean;
-    },
-    prefix = '',
-  ): HTMLElement {
-    const cell = document.createElement('div');
-    cell.className = 'pmd-save-as-preset';
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'pmd-save-as-btn pmd-save-as-btn-primary pmd-save-as-preset-btn';
-    btn.textContent = title;
-    btn.addEventListener('click', () => this.confirmWith(opts, prefix));
-    cell.appendChild(btn);
-    const caption = document.createElement('span');
-    caption.className = 'pmd-save-as-preset-sub';
-    caption.textContent = sub;
-    cell.appendChild(caption);
-    return cell;
+  /** TYPE section: a heading + a dropdown of the four save types
+   *  (Original / Send / Read / Marked) with a one-line blurb below. */
+  private buildTypeSection(): HTMLElement {
+    const wrap = document.createElement('div');
+    wrap.className = 'pmd-save-as-field';
+    const heading = document.createElement('div');
+    heading.className = 'pmd-save-as-options-heading';
+    heading.textContent = 'Type';
+    wrap.appendChild(heading);
+
+    const select = document.createElement('select');
+    select.className = 'pmd-save-as-input pmd-save-as-type-select';
+    select.setAttribute('aria-label', 'Save type');
+    for (const type of SAVE_TYPES) {
+      const option = document.createElement('option');
+      option.value = type.id;
+      option.textContent = type.label;
+      option.selected = type.id === this.currentType.id;
+      select.appendChild(option);
+    }
+    const blurb = document.createElement('div');
+    blurb.className = 'pmd-save-as-format-row-blurb';
+    blurb.textContent = this.currentType.blurb;
+    select.addEventListener('change', () => {
+      this.currentType = SAVE_TYPES.find((t) => t.id === select.value) ?? SAVE_TYPES[0]!;
+      blurb.textContent = this.currentType.blurb;
+    });
+    wrap.appendChild(select);
+    wrap.appendChild(blurb);
+    return wrap;
+  }
+
+  /** Save with the selected Type's content options + the live filename
+   *  and format, applying the type's filename prefix when enabled. */
+  private confirmSelectedType(): void {
+    const prefix = this.currentType.prefixKey ? settings.get(this.currentType.prefixKey) : '';
+    this.confirmWith(this.currentType.opts, prefix);
   }
 
   /** FILE NAME section: a heading + the file-name input. */
@@ -341,7 +310,9 @@ class SaveAsModal {
     return wrap;
   }
 
-  /** FORMAT section: a heading + the cmir / docx radio rows. */
+  /** FORMAT section: a heading + a compact two-segment toggle (.cmir /
+   *  .docx) with a one-line blurb (field feedback 2026-07-19: format is a
+   *  toggle, not a dropdown). */
   private buildFormatSection(): HTMLElement {
     const wrap = document.createElement('div');
     wrap.className = 'pmd-save-as-format';
@@ -350,34 +321,39 @@ class SaveAsModal {
     heading.textContent = 'Format';
     wrap.appendChild(heading);
 
-    const groupName = `pmd-save-as-format-${Math.random().toString(36).slice(2, 8)}`;
-    this.formatRadios = { cmir: null!, docx: null! };
+    const toggle = document.createElement('div');
+    toggle.className = 'pmd-save-as-format-toggle';
+    toggle.setAttribute('role', 'radiogroup');
+    toggle.setAttribute('aria-label', 'File format');
+    const blurb = document.createElement('div');
+    blurb.className = 'pmd-save-as-format-row-blurb';
+    blurb.textContent = FORMAT_BLURBS[this.currentFormat];
+    const segments: Record<SaveAsFormat, HTMLButtonElement> = { cmir: null!, docx: null! };
+    const syncSegments = (): void => {
+      for (const id of ['cmir', 'docx'] as const) {
+        const on = id === this.currentFormat;
+        segments[id].classList.toggle('is-active', on);
+        segments[id].setAttribute('aria-checked', String(on));
+      }
+      blurb.textContent = FORMAT_BLURBS[this.currentFormat];
+    };
     for (const id of ['cmir', 'docx'] as const) {
-      const row = document.createElement('label');
-      row.className = 'pmd-save-as-format-row';
-      const input = document.createElement('input');
-      input.type = 'radio';
-      input.name = groupName;
-      input.value = id;
-      input.checked = id === this.currentFormat;
-      input.addEventListener('change', () => {
-        if (input.checked) this.setFormat(id);
+      const seg = document.createElement('button');
+      seg.type = 'button';
+      seg.className = 'pmd-save-as-format-seg';
+      seg.setAttribute('role', 'radio');
+      seg.textContent = id === 'cmir' ? '.cmir' : '.docx';
+      seg.title = FORMAT_LABELS[id];
+      seg.addEventListener('click', () => {
+        this.setFormat(id);
+        syncSegments();
       });
-      this.formatRadios[id] = input;
-      row.appendChild(input);
-      const text = document.createElement('span');
-      text.className = 'pmd-save-as-format-row-text';
-      const label = document.createElement('span');
-      label.className = 'pmd-save-as-format-row-label';
-      label.textContent = FORMAT_LABELS[id];
-      text.appendChild(label);
-      const blurb = document.createElement('span');
-      blurb.className = 'pmd-save-as-format-row-blurb';
-      blurb.textContent = FORMAT_BLURBS[id];
-      text.appendChild(blurb);
-      row.appendChild(text);
-      wrap.appendChild(row);
+      segments[id] = seg;
+      toggle.appendChild(seg);
     }
+    syncSegments();
+    wrap.appendChild(toggle);
+    wrap.appendChild(blurb);
     return wrap;
   }
 
@@ -385,26 +361,6 @@ class SaveAsModal {
   private setFormat(format: SaveAsFormat): void {
     this.currentFormat = format;
     this.filenameInput.value = withExtension(this.filenameInput.value, format);
-  }
-
-  private buildOptionsHeading(): HTMLElement {
-    const h = document.createElement('div');
-    h.className = 'pmd-save-as-options-heading';
-    h.textContent = 'Custom Save';
-    return h;
-  }
-
-  private buildCheckbox(labelText: string, defaultChecked: boolean): HTMLInputElement {
-    const label = document.createElement('label');
-    label.className = 'pmd-save-as-option';
-    const box = document.createElement('input');
-    box.type = 'checkbox';
-    box.checked = defaultChecked;
-    label.appendChild(box);
-    const text = document.createElement('span');
-    text.textContent = labelText;
-    label.appendChild(text);
-    return box;
   }
 
   /** Save with the given content options + the live filename /

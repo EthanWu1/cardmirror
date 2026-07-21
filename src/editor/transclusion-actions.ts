@@ -5,7 +5,7 @@
  */
 import { NodeSelection } from 'prosemirror-state';
 import type { EditorView } from 'prosemirror-view';
-import type { Node as PMNode, Schema, Fragment } from 'prosemirror-model';
+import { Fragment, type Node as PMNode, type Schema } from 'prosemirror-model';
 import { newHeadingId } from '../schema/index.js';
 import {
   isTransclusionNode,
@@ -22,7 +22,7 @@ import {
   type SourceRefBase,
 } from './transclusion.js';
 import { getViewDocPath } from './transclusion-doc-path.js';
-import { flattenSelfRefsInFragment } from './self-transclusion.js';
+import { isSelfRef, makeProjectionResolver } from './self-transclusion.js';
 import { resolveTransclusion, type ResolveOutcome } from './transclusion-resolve.js';
 import { ZONE_REFRESHED_META } from './transclusion-divergence-plugin.js';
 import { showConfirm } from './confirm-dialog.js';
@@ -54,6 +54,7 @@ export type BuildZoneReason =
   | 'no-section'
   /** The source heading exists but has no content — nothing to transclude. */
   | 'empty-section'
+  | 'too-large-section'
   | 'no-doc-path'
   | 'no-portable-ref';
 
@@ -64,6 +65,66 @@ export interface BuildZoneOutcome {
   /** The zone's child content (id-rewritten), ready to insert. */
   content?: Fragment;
   headingLabel?: string;
+}
+
+/**
+ * Materialize live views while preparing a linked-copy snapshot.
+ *
+ * If a live view already has rendered children, use those children: this copies
+ * what the user sees and avoids recursively expanding the source graph again
+ * when a section contains views/copies of other sections. Childless refs still
+ * resolve from the source doc, which covers native-loaded docs before the
+ * content plugin has mounted.
+ */
+function flattenSelfRefsForZone(frag: Fragment, sourceDoc: PMNode): Fragment {
+  const resolve = makeProjectionResolver(sourceDoc);
+  const walk = (content: Fragment): Fragment => {
+    const out: PMNode[] = [];
+    content.forEach((node) => {
+      if (isSelfRef(node)) {
+        const rendered = node.content.size
+          ? node.content
+          : resolve(String(node.attrs['source_heading_id'] ?? '')).content;
+        walk(rendered).forEach((child) => out.push(child));
+        return;
+      }
+      if (node.content.size) {
+        out.push(node.type.create(node.attrs, walk(node.content), node.marks));
+        return;
+      }
+      out.push(node);
+    });
+    return Fragment.fromArray(out);
+  };
+  return walk(frag);
+}
+
+const MAX_ZONE_EXPANDED_SIZE = 20_000;
+const MAX_ZONE_EXPANSION_RATIO = 4;
+
+function zoneExpansionTooLarge(originalSize: number, expandedSize: number): boolean {
+  return (
+    expandedSize > MAX_ZONE_EXPANDED_SIZE ||
+    expandedSize > originalSize * MAX_ZONE_EXPANSION_RATIO
+  );
+}
+
+function flattenBoundedSelfRefsForZone(
+  frag: Fragment,
+  sourceDoc: PMNode,
+): { ok: true; content: Fragment } | { ok: false; reason: 'too-large-section' } {
+  const content = flattenSelfRefsForZone(frag, sourceDoc);
+  if (zoneExpansionTooLarge(frag.size, content.size)) return { ok: false, reason: 'too-large-section' };
+  return { ok: true, content };
+}
+
+function prepareBoundedZoneContent(
+  raw: Fragment,
+): { ok: true; content: Fragment; hash: string; shapeHash: string } | { ok: false; reason: 'too-large-section' } {
+  const prepared = prepareZoneContent(raw, newHeadingId);
+  const expanded = prepared.content.size;
+  if (zoneExpansionTooLarge(raw.size, expanded)) return { ok: false, reason: 'too-large-section' };
+  return { ok: true, ...prepared };
 }
 
 /**
@@ -95,8 +156,12 @@ export function buildLiveZoneAttrs(
   // self_ref-free is what stops a copy from carrying a live view whose rail would
   // stack inside the copy's rail (a second transclusion updating from a different
   // source). Nested linked copies are flattened next by prepareZoneContent.
-  const flat = flattenSelfRefsInFragment(section.content, sourceDoc, newHeadingId);
-  const { content, hash, shapeHash } = prepareZoneContent(flat, newHeadingId);
+  const flattened = flattenBoundedSelfRefsForZone(section.content, sourceDoc);
+  if (!flattened.ok) return { ok: false, reason: flattened.reason };
+  const flat = flattened.content;
+  const prepared = prepareBoundedZoneContent(flat);
+  if (!prepared.ok) return { ok: false, reason: prepared.reason };
+  const { content, hash, shapeHash } = prepared;
   const attrs: TransclusionAttrs = {
     source_ref: chosen.ref,
     source_ref_base: chosen.base,
@@ -125,8 +190,12 @@ export function buildInDocCopyAttrs(doc: PMNode, headingId: string): BuildZoneOu
   const section = extractSection(doc, headingId);
   if (!section) return { ok: false, reason: 'no-section' };
   if (section.content.size === 0) return { ok: false, reason: 'empty-section' };
-  const flat = flattenSelfRefsInFragment(section.content, doc, newHeadingId);
-  const { content, hash, shapeHash } = prepareZoneContent(flat, newHeadingId);
+  const flattened = flattenBoundedSelfRefsForZone(section.content, doc);
+  if (!flattened.ok) return { ok: false, reason: flattened.reason };
+  const flat = flattened.content;
+  const prepared = prepareBoundedZoneContent(flat);
+  if (!prepared.ok) return { ok: false, reason: prepared.reason };
+  const { content, hash, shapeHash } = prepared;
   const attrs: TransclusionAttrs = {
     source_ref: SELF_SOURCE_REF,
     source_ref_base: 'doc',
@@ -149,6 +218,8 @@ export function buildZoneErrorMessage(reason: BuildZoneReason | undefined): stri
       return 'Could not read that section from the source.';
     case 'empty-section':
       return 'That heading has no content to transclude.';
+    case 'too-large-section':
+      return 'That linked copy is too large because it contains nested live copies.';
     case 'no-doc-path':
       return 'Save this document first, then insert a linked copy.';
     case 'no-portable-ref':
@@ -196,7 +267,9 @@ export interface RefreshOptions {
 function resolveInDocSource(doc: PMNode, headingId: string): ResolveOutcome {
   const section = extractSection(doc, headingId);
   if (!section) return { ok: false, reason: 'heading-missing' };
-  const content = flattenSelfRefsInFragment(section.content, doc, newHeadingId);
+  const flattened = flattenBoundedSelfRefsForZone(section.content, doc);
+  if (!flattened.ok) return { ok: false, reason: 'source-too-large' };
+  const content = flattened.content;
   return { ok: true, result: { ...section, content }, sourceName: '' };
 }
 
@@ -255,7 +328,11 @@ export async function refreshZoneAtPos(
 
   // Replace the whole zone node with a fresh one: new children (nested zones
   // flattened, source ids rewritten), reset content hash + timestamp + label.
-  const { content, hash, shapeHash } = prepareZoneContent(outcome.result.content, newHeadingId);
+  const prepared = prepareBoundedZoneContent(outcome.result.content);
+  if (!prepared.ok) {
+    return { ok: false, reason: 'source-too-large', sourceName: outcome.sourceName };
+  }
+  const { content, hash, shapeHash } = prepared;
   const newNode = createTransclusionNode(
     view.state.schema,
     {

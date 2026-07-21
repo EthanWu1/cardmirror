@@ -129,11 +129,19 @@ import { coordinatorBlocks, flashLockedLeases } from './ai/edit-coordinator.js';
 import {
   tagCollabTransaction,
   collabCopresenceFor,
+  collabCloseKeepResumable,
   collabEndOrLeaveSession,
   onCollabCopresenceChange,
 } from './collab/collab-hooks.js';
 import { icon, setIcon } from './icons';
 import { isAutosaveBackedRoute, shouldPromptBeforeRoute } from './autosave-route-policy.js';
+import {
+  WorkspaceTabStrip,
+  computeSplitLayout,
+  type TabModel,
+  type PaneLayout,
+  type DropSide,
+} from './workspace-tabs.js';
 
 type SlotId = 'slot1' | 'slot2' | 'slot3';
 const SLOT_IDS: SlotId[] = ['slot1', 'slot2', 'slot3'];
@@ -141,6 +149,20 @@ const SLOT_IDS: SlotId[] = ['slot1', 'slot2', 'slot3'];
 let nextDocUid = 1;
 function newDocUid(): string {
   return `doc-${nextDocUid++}`;
+}
+
+/** Two pane arrangements are identical (same panes, order, tabs, visible tab)?
+ *  Used to skip a no-op drag-to-split reflow. */
+function paneLayoutsEqual(a: readonly PaneLayout[], b: readonly PaneLayout[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const pa = a[i]!;
+    const pb = b[i]!;
+    if (pa.visibleUid !== pb.visibleUid) return false;
+    if (pa.uids.length !== pb.uids.length) return false;
+    for (let j = 0; j < pa.uids.length; j++) if (pa.uids[j] !== pb.uids[j]) return false;
+  }
+  return true;
 }
 
 /** Sync the cross-window open-path claim when a record's handle
@@ -265,11 +287,7 @@ const AUTOSAVE_DELAY_MS = 5000;
 const SHARED_DOC_AUTOSAVE_DELAY_MS = 1000;
 
 function sharedDocAutosaveForced(record: DocRecord): boolean {
-  return (
-    record.format === 'cmir' &&
-    record.sharedDoc != null &&
-    collabCopresenceFor(record.uid)?.role === 'host'
-  );
+  return record.format === 'cmir' && record.sharedDoc != null;
 }
 
 function sharedDocDiskWriter(record: DocRecord): boolean {
@@ -1034,6 +1052,38 @@ class Slot {
     return record;
   }
 
+  /** Detach EVERY record from this slot without destroying any view, and
+   *  return them in stack order. Used by the tab drag-to-split reflow, which
+   *  releases all slots and re-pushes records into their target slots. The
+   *  visible record's DOM is unmounted (its view stays live); background
+   *  records were never mounted. The slot ends empty + hidden. Deliberately
+   *  does NOT fire the notify/reconcile/layout hooks — the caller drives one
+   *  reconcile after the whole reflow so intermediate empty states don't
+   *  thrash focus + layout. */
+  releaseAll(): PaneRecord[] {
+    if (this.visibleIndex >= 0) this.detachVisible();
+    const records = this.stack;
+    this.stack = [];
+    this.visibleIndex = -1;
+    this.paneEl.hidden = true;
+    this.navHidden = false;
+    return records;
+  }
+
+  /** Detach ONE record from this slot without destroying its view. If it's
+   *  the visible record, defers to `releaseVisible` (which re-mounts the next
+   *  or empties the slot, firing the usual hooks). A background record is
+   *  never mounted, so it's just spliced out. Returns the record, or null if
+   *  it isn't in this slot. Used by the cross-pane tab move. */
+  releaseRecord(record: PaneRecord): PaneRecord | null {
+    const idx = this.stack.indexOf(record);
+    if (idx < 0) return null;
+    if (idx === this.visibleIndex) return this.releaseVisible();
+    this.stack.splice(idx, 1);
+    if (this.visibleIndex > idx) this.visibleIndex -= 1;
+    return record;
+  }
+
   /** Close the currently-visible doc. Reveals the next stack member
    *  (or empties the slot). Prompts for save / discard / cancel if
    *  the doc has unsaved changes; clean docs close immediately. */
@@ -1088,7 +1138,14 @@ class Slot {
         showToast('Autosave could not finish. The document stays open.');
         return false;
       }
-      if (coedited && !(await collabEndOrLeaveSession(closing.uid))) return false;
+      if (coedited) {
+        const keepDurable =
+          isDocRecord(closing) && closing.format === 'cmir' && closing.sharedDoc != null;
+        const closed = keepDurable
+          ? await collabCloseKeepResumable(closing.uid)
+          : await collabEndOrLeaveSession(closing.uid);
+        if (!closed) return false;
+      }
     } else if (coedited) {
       // Session-aware close: keep it resumable, or end/leave. Naming the doc.
       const co = await resolveCoEditedClose(closing.uid, closing.filename);
@@ -1185,8 +1242,12 @@ class Slot {
           showToast('Autosave could not finish. The window stays open.');
           return false;
         }
-        if (coedited && isDocRecord(rec) && !(await collabEndOrLeaveSession(rec.uid))) {
-          return false;
+        if (coedited && isDocRecord(rec)) {
+          const keepDurable = rec.format === 'cmir' && rec.sharedDoc != null;
+          const closed = keepDurable
+            ? await collabCloseKeepResumable(rec.uid)
+            : await collabEndOrLeaveSession(rec.uid);
+          if (!closed) return false;
         }
         continue;
       }
@@ -1339,6 +1400,10 @@ class Slot {
       parts.push(`${r.name}: ${formatReadTime(words, r.wpm)}`);
     }
     this.wcEl.textContent = parts.join(' | ');
+    // This is the debounced per-pane chrome refresh (heavy-update tick,
+    // mount, focus, settings) — the natural point to keep the tab strip's
+    // dirty dots + active state current without a per-keystroke rebuild.
+    this.shell.scheduleTabsRefresh();
   }
 
   /** Open a small dropdown over the chip listing every doc in this
@@ -1497,6 +1562,18 @@ class MultiPaneShell {
    *  when the user presses Ctrl+Tab while the focused slot has
    *  2+ docs. Created in the constructor. */
   private docSwitcher!: DocSwitcherOverlay;
+  /** Chrome-style tab strip below the ribbon (the `tabbedWorkspace`
+   *  setting). Null when the setting is off. Surfaces the slots' stacks
+   *  as tabs; see workspace-tabs.ts. */
+  private tabStrip: WorkspaceTabStrip | null = null;
+  /** Coalesces tab-strip refresh requests into one per frame. */
+  private tabsRafId = 0;
+  /** Drop-zone highlight shown while a tab is dragged into the canvas
+   *  (Phase 3 drag-to-split). Created lazily. */
+  private tabDropOverlay: HTMLElement | null = null;
+  /** The resolved, non-no-op pane arrangement the current drag would apply,
+   *  or null when the pointer isn't over a valid drop target. */
+  private pendingTabDrop: { desired: PaneLayout[]; focusUid: string } | null = null;
 
   constructor() {
     this.layoutMode = settings.get('multiDocLayoutMode');
@@ -1734,6 +1811,432 @@ class MultiPaneShell {
     });
 
     // First active slot gets focus by default once a doc lands.
+
+    // Mount the Chrome-style tab strip if the setting is on, and live-toggle
+    // it as the setting changes (no reload needed — it's a pure overlay on
+    // the slot/record model).
+    this.applyTabbedMode();
+    settings.subscribe((s) => this.syncTabbedModeFromSettings(s.tabbedWorkspace));
+  }
+
+  /** Last `tabbedWorkspace` value applied, so the settings subscription only
+   *  reacts to an actual flip (settings.subscribe fires on every change). */
+  private lastTabbedSetting = settings.get('tabbedWorkspace');
+
+  private syncTabbedModeFromSettings(next: boolean): void {
+    if (next === this.lastTabbedSetting) return;
+    this.lastTabbedSetting = next;
+    this.applyTabbedMode();
+  }
+
+  /** Create or tear down the tab strip to match the `tabbedWorkspace`
+   *  setting. Idempotent. */
+  private applyTabbedMode(): void {
+    const want = settings.get('tabbedWorkspace');
+    if (want && !this.tabStrip) {
+      const strip = new WorkspaceTabStrip({
+        onSelect: (slotId, uid) => this.selectTab(slotId, uid),
+        onClose: (slotId, uid) => void this.closeTab(slotId, uid),
+        onReorderSegment: (slotId, order) => this.reorderSegment(slotId, order),
+        onDragOutOfStrip: (uid, _src, x, y) => this.updateTabDropZone(uid, x, y),
+        onDragBackIntoStrip: () => this.hideTabDropZone(),
+        onDropOutsideStrip: (uid, _src, x, y) => this.dropTabOutsideStrip(uid, x, y),
+        onMoveTabToSegment: (uid, from, to, order) => this.moveTabToSegment(uid, from, to, order),
+        onTabContextMenu: (slotId, uid, x, y) => this.openTabContextMenu(slotId, uid, x, y),
+      });
+      this.tabStrip = strip;
+      // Full-width band pinned below the ribbon (position:fixed in CSS).
+      // Placing it right after the ribbon keeps DOM + tab order sensible.
+      const ribbon = document.getElementById('ribbon');
+      if (ribbon && ribbon.parentElement) {
+        ribbon.parentElement.insertBefore(strip.el, ribbon.nextSibling);
+      } else {
+        document.body.appendChild(strip.el);
+      }
+      document.body.classList.add('pmd-tabbed');
+      this.refreshTabsNow();
+    } else if (!want && this.tabStrip) {
+      this.tabStrip.destroy();
+      this.tabStrip = null;
+      document.body.classList.remove('pmd-tabbed');
+    }
+  }
+
+  /** True when the tab strip is mounted (the `tabbedWorkspace` setting is on).
+   *  In tabbed mode, opening / creating a document adds a TAB to a default
+   *  pane rather than prompting "which pane?" — the Chrome behaviour. */
+  private tabbedActive(): boolean {
+    return this.tabStrip !== null;
+  }
+
+  /** The pane a new tab lands in when the user didn't pick one (tabbed mode).
+   *  Mirrors Chrome: the focused pane if it already holds a doc, else the
+   *  first pane with docs, else pane 1. */
+  private defaultTabSlot(): SlotId {
+    if (this.focusedSlot && this.focusedSlot.stack.length > 0) return this.focusedSlot.id;
+    return SLOT_IDS.find((id) => this.slots[id].stack.length > 0) ?? 'slot1';
+  }
+
+  /** Build the tab model from live slot state. One segment per non-empty
+   *  slot (a pane), in slot order; each segment's tabs are its stack. */
+  private buildTabModel(): TabModel {
+    const segments = SLOT_IDS.filter((id) => this.slots[id].stack.length > 0).map((id) => {
+      const slot = this.slots[id];
+      return {
+        slotId: id,
+        focused: this.focusedSlot === slot,
+        tabs: slot.stack.map((rec, i) => ({
+          uid: rec.uid,
+          filename: rec.filename || '(untitled)',
+          dirty: rec.dirty,
+          active: i === slot.visibleIndex,
+          kind: rec.kind,
+        })),
+      };
+    });
+    return { segments };
+  }
+
+  /** Re-render the tab strip now (no coalescing). */
+  private refreshTabsNow(): void {
+    if (!this.tabStrip) return;
+    this.tabStrip.render(this.buildTabModel());
+  }
+
+  /** Request a tab-strip refresh, coalesced to once per tick so a burst of
+   *  shell mutations rebuilds the strip a single time. Uses a timer, not
+   *  requestAnimationFrame — rAF is throttled indefinitely in a minimized /
+   *  backgrounded window, which would leave the strip stale after a
+   *  background open or co-edit update. */
+  scheduleTabsRefresh(): void {
+    if (!this.tabStrip || this.tabsRafId) return;
+    this.tabsRafId = setTimeout(() => {
+      this.tabsRafId = 0;
+      this.refreshTabsNow();
+    }, 0) as unknown as number;
+  }
+
+  /** Tab clicked: show that record in its slot and focus the slot. */
+  private selectTab(slotId: string, uid: string): void {
+    const slot = this.slots[slotId as SlotId];
+    if (!slot) return;
+    const rec = slot.stack.find((r) => r.uid === uid);
+    if (!rec) return;
+    slot.showRecord(rec);
+    this.focusSlot(slot);
+    focusPaneRecord(rec);
+  }
+
+  /** Tab ✕ clicked: close that record (prompts if dirty / co-edited). */
+  private async closeTab(slotId: string, uid: string): Promise<void> {
+    const slot = this.slots[slotId as SlotId];
+    if (!slot) return;
+    const rec = slot.stack.find((r) => r.uid === uid);
+    if (!rec) return;
+    await slot.closeRecord(rec);
+    this.refreshTabsNow();
+  }
+
+  /** A within-segment tab drag settled: reorder that slot's stack to match
+   *  the dragged order, keeping the same record visible. */
+  private reorderSegment(slotId: string, orderedUids: string[]): void {
+    const slot = this.slots[slotId as SlotId];
+    if (!slot) return;
+    const visibleRec = slot.visible;
+    const byUid = new Map(slot.stack.map((r) => [r.uid, r]));
+    const next = orderedUids.map((u) => byUid.get(u)).filter((r): r is PaneRecord => !!r);
+    // Guard: only apply a true permutation of the existing stack.
+    if (next.length !== slot.stack.length) {
+      this.refreshTabsNow();
+      return;
+    }
+    slot.stack = next;
+    slot.visibleIndex = visibleRec ? next.indexOf(visibleRec) : slot.visibleIndex;
+    this.refreshTabsNow();
+  }
+
+  /** A tab was dragged across to another pane's segment within the strip:
+   *  move the record from `fromSlotId` to `toSlotId`, order the destination
+   *  segment as `orderedUids`, and keep the moved doc visible + focused. */
+  private moveTabToSegment(uid: string, fromSlotId: string, toSlotId: string, orderedUids: string[]): void {
+    const from = this.slots[fromSlotId as SlotId];
+    const to = this.slots[toSlotId as SlotId];
+    if (!from || !to || from === to) {
+      this.refreshTabsNow();
+      return;
+    }
+    const rec = from.stack.find((r) => r.uid === uid);
+    if (!rec) {
+      this.refreshTabsNow();
+      return;
+    }
+    from.releaseRecord(rec); // may empty + hide the source pane (hooks fire)
+    to.push(rec); // appends, makes visible, focuses `to`
+    // Apply the drag's intended order within the destination segment.
+    const byUid = new Map(to.stack.map((r) => [r.uid, r]));
+    const ordered = orderedUids.map((u) => byUid.get(u)).filter((r): r is PaneRecord => !!r);
+    if (ordered.length === to.stack.length) {
+      to.stack = ordered;
+      to.visibleIndex = ordered.indexOf(rec);
+    }
+    this.reconcileNavRail();
+    this.refreshLayout();
+    this.refreshTabsNow();
+    focusPaneRecord(rec);
+  }
+
+  /** Right-click a tab → a small context menu (Close, Close others, Close to
+   *  the right, Split to a new pane). Positioned at the pointer; dismissed on
+   *  the next outside pointerdown / Escape. */
+  private openTabContextMenu(slotId: string, uid: string, x: number, y: number): void {
+    const slot = this.slots[slotId as SlotId];
+    if (!slot) return;
+    const idx = slot.stack.findIndex((r) => r.uid === uid);
+    if (idx < 0) return;
+
+    const menu = document.createElement('div');
+    menu.className = 'pmd-tab-menu';
+    const close = (): void => {
+      document.removeEventListener('pointerdown', onDoc, true);
+      document.removeEventListener('keydown', onKey, true);
+      menu.remove();
+    };
+    const onDoc = (e: Event): void => {
+      if (!menu.contains(e.target as Node)) close();
+    };
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') close();
+    };
+    const item = (label: string, enabled: boolean, run: () => void): void => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'pmd-tab-menu-item';
+      btn.textContent = label;
+      btn.disabled = !enabled;
+      btn.addEventListener('click', () => {
+        close();
+        run();
+      });
+      menu.appendChild(btn);
+    };
+    const others = slot.stack.filter((r) => r.uid !== uid);
+    const toRight = slot.stack.slice(idx + 1);
+    item('Close', true, () => void this.closeTab(slotId, uid));
+    item('Close others', others.length > 0, () => void this.closeRecords(slotId, others.slice()));
+    item('Close to the right', toRight.length > 0, () => void this.closeRecords(slotId, toRight.slice()));
+    item('Split to new pane', SLOT_IDS.some((id) => this.slots[id].stack.length === 0), () => {
+      this.splitTabToSide(uid, slotId as SlotId, 'right');
+    });
+
+    menu.style.left = `${Math.round(x)}px`;
+    menu.style.top = `${Math.round(y)}px`;
+    document.body.appendChild(menu);
+    // Nudge back on-screen if it overflows the right / bottom edge.
+    const r = menu.getBoundingClientRect();
+    if (r.right > window.innerWidth) menu.style.left = `${Math.round(window.innerWidth - r.width - 8)}px`;
+    if (r.bottom > window.innerHeight) menu.style.top = `${Math.round(window.innerHeight - r.height - 8)}px`;
+    setTimeout(() => {
+      document.addEventListener('pointerdown', onDoc, true);
+      document.addEventListener('keydown', onKey, true);
+    }, 0);
+  }
+
+  /** Close a set of records in one slot, in order, prompting per dirty doc.
+   *  Stops if the user cancels a save prompt. */
+  private async closeRecords(slotId: string, records: PaneRecord[]): Promise<void> {
+    const slot = this.slots[slotId as SlotId];
+    if (!slot) return;
+    for (const rec of records) {
+      if (!slot.stack.includes(rec)) continue; // already gone
+      await slot.closeRecord(rec);
+    }
+    this.refreshTabsNow();
+  }
+
+  // ── Drag-a-tab-into-the-canvas to split (Phase 3) ──────────────────
+
+  /** Non-empty slots left→right, as the pure `PaneLayout` shape. */
+  private currentPaneLayout(): { ids: SlotId[]; panes: PaneLayout[] } {
+    const ids = SLOT_IDS.filter((id) => this.slots[id].stack.length > 0);
+    const panes = ids.map((id) => {
+      const slot = this.slots[id];
+      return { uids: slot.stack.map((r) => r.uid), visibleUid: slot.visible?.uid ?? '' };
+    });
+    return { ids, panes };
+  }
+
+  /** The visible panes' rects (non-empty slots, left→right). */
+  private activePaneRects(): { ids: SlotId[]; rects: DOMRect[] } {
+    const ids = SLOT_IDS.filter((id) => this.slots[id].stack.length > 0 && !this.slots[id].paneEl.hidden);
+    return { ids, rects: ids.map((id) => this.slots[id].paneEl.getBoundingClientRect()) };
+  }
+
+  /** Resolve the pointer to a drop target: the CENTER of a pane means "merge
+   *  into that pane"; the outer edges mean "open a new pane at that boundary".
+   *  Boundaries are shared between neighbouring panes (the gap between pane 1
+   *  and pane 2 is ONE target, not "right of 1" + "left of 2"), so N panes
+   *  offer N merge targets + N+1 boundaries rather than 3 overlapping zones
+   *  each. Returns geometry for the preview, or null when off the pane row. */
+  private resolvePaneDropTarget(
+    x: number,
+    y: number,
+  ):
+    | { kind: 'into'; paneIndex: number; rect: DOMRect }
+    | { kind: 'split'; boundary: number; edgeX: number; top: number; height: number }
+    | null {
+    const { ids, rects } = this.activePaneRects();
+    if (ids.length === 0) return null;
+    const top = Math.min(...rects.map((r) => r.top));
+    const bottom = Math.max(...rects.map((r) => r.bottom));
+    if (y < top || y > bottom) return null;
+    const height = bottom - top;
+
+    let p = -1;
+    for (let i = 0; i < rects.length; i++) {
+      if (x >= rects[i]!.left && x <= rects[i]!.right) {
+        p = i;
+        break;
+      }
+    }
+    if (p === -1) {
+      // Between/beyond panes → nearest end boundary.
+      const boundary = x < rects[0]!.left ? 0 : ids.length;
+      const edgeX = boundary === 0 ? rects[0]!.left : rects[rects.length - 1]!.right;
+      return { kind: 'split', boundary, edgeX, top, height };
+    }
+    const r = rects[p]!;
+    const frac = (x - r.left) / Math.max(1, r.width);
+    if (frac < 0.28) return { kind: 'split', boundary: p, edgeX: r.left, top, height };
+    if (frac > 0.72) return { kind: 'split', boundary: p + 1, edgeX: r.right, top, height };
+    return { kind: 'into', paneIndex: p, rect: r };
+  }
+
+  /** The pane arrangement a target would produce, or null if it changes
+   *  nothing (dropping a tab where it already is) or exceeds the pane cap.
+   *  This single check is what makes no-op targets un-droppable — you can't
+   *  "add a tab onto the pane it's already in". */
+  private resolveTabDropLayout(
+    uid: string,
+    target: NonNullable<ReturnType<MultiPaneShell['resolvePaneDropTarget']>>,
+  ): PaneLayout[] | null {
+    const { panes } = this.currentPaneLayout();
+    let desired: PaneLayout[] | null;
+    if (target.kind === 'into') {
+      // Dropping a tab into the pane it already lives in does nothing the user
+      // asked for (it's already there) — reject it so its own pane never lights
+      // up as a merge target.
+      if (panes[target.paneIndex]?.uids.includes(uid)) return null;
+      desired = computeSplitLayout(panes, uid, target.paneIndex, 'into', SLOT_IDS.length);
+    } else if (target.boundary < panes.length) {
+      desired = computeSplitLayout(panes, uid, target.boundary, 'left', SLOT_IDS.length);
+    } else {
+      desired = computeSplitLayout(panes, uid, panes.length - 1, 'right', SLOT_IDS.length);
+    }
+    if (!desired || paneLayoutsEqual(panes, desired)) return null;
+    return desired;
+  }
+
+  private ensureTabDropOverlay(): HTMLElement {
+    if (this.tabDropOverlay) return this.tabDropOverlay;
+    const el = document.createElement('div');
+    el.className = 'pmd-tab-drop-zone';
+    el.hidden = true;
+    document.body.appendChild(el);
+    this.tabDropOverlay = el;
+    return el;
+  }
+
+  /** Live drop preview as a dragged tab moves over the canvas. Highlights the
+   *  whole pane for a merge, or a thin bar at the boundary for a new pane —
+   *  and shows NOTHING (drop cancels) over a no-op target. */
+  updateTabDropZone(uid: string, x: number, y: number): void {
+    const target = this.resolvePaneDropTarget(x, y);
+    if (!target) {
+      this.hideTabDropZone();
+      return;
+    }
+    const desired = this.resolveTabDropLayout(uid, target);
+    if (!desired) {
+      this.hideTabDropZone();
+      return;
+    }
+    this.pendingTabDrop = { desired, focusUid: uid };
+    const overlay = this.ensureTabDropOverlay();
+    if (target.kind === 'into') {
+      const r = target.rect;
+      overlay.dataset['mode'] = 'into';
+      overlay.style.left = `${Math.round(r.left)}px`;
+      overlay.style.top = `${Math.round(r.top)}px`;
+      overlay.style.width = `${Math.round(r.width)}px`;
+      overlay.style.height = `${Math.round(r.height)}px`;
+    } else {
+      overlay.dataset['mode'] = 'split';
+      overlay.style.left = `${Math.round(target.edgeX - 3)}px`;
+      overlay.style.top = `${Math.round(target.top)}px`;
+      overlay.style.width = '6px';
+      overlay.style.height = `${Math.round(target.height)}px`;
+    }
+    overlay.hidden = false;
+  }
+
+  hideTabDropZone(): void {
+    this.pendingTabDrop = null;
+    if (this.tabDropOverlay) this.tabDropOverlay.hidden = true;
+  }
+
+  /** A tab was dropped in the canvas: apply the resolved arrangement under the
+   *  pointer (recomputed fresh), or cancel if it's off-row or a no-op. */
+  private dropTabOutsideStrip(uid: string, x: number, y: number): void {
+    const target = this.resolvePaneDropTarget(x, y);
+    this.hideTabDropZone();
+    if (!target) return;
+    const desired = this.resolveTabDropLayout(uid, target);
+    if (!desired) return; // no-op / over cap → cancel.
+    this.applyPaneLayout(desired, uid);
+  }
+
+  /** Reflow panes so `draggedUid` lands on `side` of `refSlotId`. */
+  private splitTabToSide(draggedUid: string, refSlotId: SlotId, side: DropSide): void {
+    const { ids, panes } = this.currentPaneLayout();
+    const refIndex = ids.indexOf(refSlotId);
+    if (refIndex < 0) return;
+    const desired = computeSplitLayout(panes, draggedUid, refIndex, side, SLOT_IDS.length);
+    if (!desired) {
+      showToast('Up to 3 panes.');
+      return;
+    }
+    if (paneLayoutsEqual(panes, desired)) return; // no-op drop — don't churn.
+    this.applyPaneLayout(desired, draggedUid);
+  }
+
+  /** Re-assign every record to slots slot1..slotN so the panes match
+   *  `desired` (left→right). Views are preserved (released, re-pushed), never
+   *  rebuilt. Focuses the pane holding `focusUid` at the end. */
+  private applyPaneLayout(desired: PaneLayout[], focusUid: string): void {
+    const byUid = new Map<string, PaneRecord>();
+    for (const id of SLOT_IDS) for (const r of this.slots[id].stack) byUid.set(r.uid, r);
+    // Release all slots first (no hooks fire) so records can move freely.
+    for (const id of SLOT_IDS) this.slots[id].releaseAll();
+    desired.slice(0, SLOT_IDS.length).forEach((pane, i) => {
+      const slot = this.slots[SLOT_IDS[i]!];
+      for (const u of pane.uids) {
+        const rec = byUid.get(u);
+        if (rec) slot.push(rec);
+      }
+      const vis = byUid.get(pane.visibleUid);
+      if (vis && slot.stack.includes(vis)) slot.showRecord(vis);
+    });
+    const focusRec = byUid.get(focusUid);
+    const focusSlot = focusRec
+      ? SLOT_IDS.map((id) => this.slots[id]).find((s) => s.stack.includes(focusRec))
+      : null;
+    if (focusSlot) {
+      this.focusSlot(focusSlot);
+      focusPaneRecord(focusSlot.visible);
+    }
+    this.reconcileNavRail();
+    this.refreshLayout();
+    this.refreshTabsNow();
   }
 
   private findSlotByView(view: EditorView): Slot | null {
@@ -1773,6 +2276,9 @@ class MultiPaneShell {
       : SLOT_IDS.filter((id) => this.slots[id].stack.length > 0).length;
     this.rowEl.dataset['active'] = String(active);
     this.navRailEl.dataset['active'] = String(active);
+    // Structural change (open / close / move / expand) → the tab strip's
+    // segments changed.
+    this.scheduleTabsRefresh();
     // Active-count change → pane widths change → re-sync.
     this.scheduleSyncAllCardIntrinsicWidths();
   }
@@ -2128,6 +2634,20 @@ class MultiPaneShell {
     return true;
   }
 
+  /** Does any open pane have unsaved changes OR a live co-editing session?
+   *  These are the docs `promptSaveAllForQuit` would surface a prompt for; the
+   *  close handler uses this to decide whether the window close is otherwise
+   *  "silent" (and so needs its own generic confirm). */
+  anyUnsavedOrLiveForQuit(): boolean {
+    for (const id of SLOT_IDS) {
+      for (const rec of this.slots[id].stack) {
+        if (rec.dirty) return true;
+        if (isDocRecord(rec) && collabCopresenceFor(rec.uid) != null) return true;
+      }
+    }
+    return false;
+  }
+
   /** Mark `slot` as focused. The shared ribbon / chrome will route
    *  through its visible doc's EditorView. In wide-scroll layout
    *  with three active panes, also scroll the focused pane into
@@ -2197,6 +2717,9 @@ class MultiPaneShell {
         });
       }
     }
+    // Focused pane changed → the tab strip's focused-segment highlight and
+    // active-tab per segment may have moved.
+    this.scheduleTabsRefresh();
   }
 
   /** Re-point the focused-pane scroll listener at `slot`. The
@@ -2583,6 +3106,13 @@ class MultiPaneShell {
    *  before loading, since the user didn't pre-choose a destination. */
   async onFileOpen(opened: OpenedFile): Promise<void> {
     if (await this.surfaceDuplicateIfOpen(opened)) return;
+    // Tabbed workspace: opening a file adds a tab to the current pane, no
+    // "which pane?" prompt (Chrome behaviour). Splitting into a second pane
+    // is a deliberate drag gesture, not a per-open question.
+    if (this.tabbedActive()) {
+      await this.loadOpenedIntoSlot(opened, this.defaultTabSlot());
+      return;
+    }
     const choice = await this.promptForOpenRoute(opened.name);
     if (!choice) return;
     if (choice === 'separate') {
@@ -2809,7 +3339,8 @@ class MultiPaneShell {
   /** Create an empty doc; prompt for slot. Used by the ribbon's
    *  "New doc" button. */
   async createNewDoc(): Promise<void> {
-    const target = await this.promptForSlot('Untitled');
+    // Tabbed workspace: New adds a tab to the current pane (no slot prompt).
+    const target = this.tabbedActive() ? this.defaultTabSlot() : await this.promptForSlot('Untitled');
     if (!target) return;
     const doc = makeBlankDoc();
     const slot = this.slots[target];
@@ -3489,7 +4020,7 @@ function buildFlowRecord(
         round: workspace.getRound(),
         createdAt: record.createdAt ?? undefined,
       });
-      await host.saveExisting(record.handle, bytes);
+      await host.saveExisting(record.handle, bytes, { force: true });
       const clean = markClean(beforeGen);
       recordRecent({
         handle: typeof record.handle === 'string' ? record.handle : null,
@@ -3515,7 +4046,7 @@ function buildFlowRecord(
           round: workspace.getRound(),
           createdAt: record.createdAt ?? undefined,
         });
-        await host.saveExisting(record.handle, bytes);
+        await host.saveExisting(record.handle, bytes, { force: true });
         const clean = markClean(beforeGen);
         recordRecent({
           handle: typeof record.handle === 'string' ? record.handle : null,
@@ -3955,6 +4486,7 @@ export function mountMultiPaneShell(): void {
     persistSharedDocForUid: (uid, sharedDoc) => shell!.persistSharedDocForUid(uid, sharedDoc),
     markDirtyForUid: (uid) => shell!.markDirtyForUid(uid),
     promptSaveAllForQuit: () => shell!.promptSaveAllForQuit(),
+    hasUnsavedOrLiveForQuit: () => shell!.anyUnsavedOrLiveForQuit(),
     onRecoveredDoc: (entry) => shell!.onRecoveredDoc(entry),
     journalAll: () => shell!.journalAll(),
     reduceToFocusedForModeSwitch: () => shell!.reduceToFocusedForModeSwitch(),

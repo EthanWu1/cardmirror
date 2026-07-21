@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   DOMParser as PMDOMParser,
   type Node as PMNode,
@@ -10,8 +11,10 @@ import {
   clipboardHasTextPayload,
   normalizeWordClipboardHtml,
   reparseClipboardStructuralSlice,
+  tryPasteSplitContainer,
 } from '../../src/editor/paste-plugin.js';
 import { serializeCardMirrorClipboardHtml } from '../../src/editor/clipboard-export.js';
+import { EditorState, TextSelection } from 'prosemirror-state';
 
 function parseHtml(html: string): PMNode {
   const wrap = document.createElement('div');
@@ -489,6 +492,12 @@ describe('Word HTML paste formatting', () => {
     expect(markNames(textRunInSlice(slice, 'normal body'))).not.toContain('font_family');
   });
 
+  it('uses the configured body font for outline-row copy exports too', () => {
+    const navPanelSource = readFileSync('src/editor/nav-panel.ts', 'utf8');
+
+    expect(navPanelSource).toContain("bodyFont: () => settings.get('bodyFont')");
+  });
+
   it('uses Mac Word heading metadata even when every heading element is h1', () => {
     const slice = parseSliceHtml(normalizeWordClipboardHtml(`
       <h1 style='mso-style-name:"Heading 1"; mso-outline-level:1'>Pocket title</h1>
@@ -673,6 +682,237 @@ describe('Word HTML paste formatting', () => {
       'card_body',
     ]);
     expect(slice!.content.firstChild?.textContent).toBe('analytic cite');
+  });
+
+  it('keeps a LONE copied CardMirror heading as that heading (no card below it)', () => {
+    // Field bug 2026-07-19: users select just a heading line and copy it —
+    // the clipboard carries only that node, with no card following.
+    const cases: Array<[string, PMNode]> = [
+      ['pocket', schema.nodes['pocket']!.create({ id: 'p1' }, schema.text('Lone pocket'))],
+      ['hat', schema.nodes['hat']!.create({ id: 'h1' }, schema.text('Lone hat'))],
+      ['block', schema.nodes['block']!.create({ id: 'b1' }, schema.text('Lone block'))],
+    ];
+    for (const [name, node] of cases) {
+      const html = serializeCardMirrorClipboardHtml(
+        schema.nodes['doc']!.create(null, [node]).content,
+        schema,
+      );
+      const slice = reparseClipboardStructuralSlice(clipboardEventWithHtml(html));
+      expect(slice, `${name} reparse`).not.toBeNull();
+      expect(sliceTopNodeNames(slice!), `${name} shape`).toEqual([name]);
+      expect(slice!.content.firstChild!.textContent, `${name} text`).toBe(node.textContent);
+    }
+  });
+
+  it('maps REAL Word CF_HTML — tag-keyed aliased sheet rules, bare heading elements', () => {
+    // The truest shape of a Word copy: heading metadata lives in TAG-keyed
+    // style-sheet rules; the elements are bare <h1>..<h4>. Before the
+    // tag-rule registration + bare-heading fallback, every one of these
+    // dissolved to text and re-wrapped as a pocket (field bug 2026-07-19).
+    const cfhtml = `
+      <html xmlns:w="urn:schemas-microsoft-com:office:word">
+      <head><style>
+      p.MsoNormal, li.MsoNormal, div.MsoNormal
+        {margin:0in; font-size:11.0pt; font-family:"Calibri",sans-serif;}
+      h1
+        {mso-style-link:"Heading 1 Char\\,Pocket Char";
+        mso-outline-level:1; text-align:center; font-size:26.0pt; font-weight:bold;}
+      h2
+        {mso-style-link:"Heading 2 Char\\,Hat Char";
+        mso-outline-level:2; text-align:center; font-size:22.0pt; font-weight:bold;}
+      h3
+        {mso-style-link:"Heading 3 Char\\,Block Char";
+        mso-outline-level:3; text-align:center; font-size:16.0pt; font-weight:bold;}
+      h4
+        {mso-style-link:"Heading 4 Char\\,Tag Char";
+        mso-outline-level:4; font-size:13.0pt; font-weight:bold;}
+      </style></head>
+      <body>
+      <h1>Pocket Line</h1>
+      <h2>Hat Line</h2>
+      <h3>Block Line</h3>
+      <h4>Tag Line</h4>
+      <p class=MsoNormal>plain body paragraph</p>
+      </body></html>`;
+    const slice = parseSliceHtml(normalizeWordClipboardHtml(cfhtml));
+    const shapes: string[] = [];
+    slice.content.forEach((n) => shapes.push(`${n.type.name}:${n.textContent}`));
+    expect(shapes[0]).toBe('pocket:Pocket Line');
+    expect(shapes[1]).toBe('hat:Hat Line');
+    expect(shapes[2]).toBe('block:Block Line');
+    // The tag line leads a card shape or stands as its own tag; either way it
+    // must be a TAG, and the body paragraph must not turn structural.
+    expect(shapes.join('|')).toContain('Tag Line');
+    expect(shapes.filter((s) => s.startsWith('pocket:'))).toHaveLength(1);
+  });
+
+  it('maps bare headings with NO style metadata by their own level, never all-pocket', () => {
+    const slice = parseSliceHtml(
+      normalizeWordClipboardHtml('<h1>one</h1><h2>two</h2><h3>three</h3><h4>four</h4>'),
+    );
+    const shapes: string[] = [];
+    slice.content.forEach((n) => shapes.push(n.type.name));
+    expect(shapes[0]).toBe('pocket');
+    expect(shapes[1]).toBe('hat');
+    expect(shapes[2]).toBe('block');
+    expect(shapes.filter((s) => s === 'pocket')).toHaveLength(1);
+  });
+
+  it('maps Verbatim ALIASED heading styles ("Heading 1,Pocket" etc.) to their headings', () => {
+    // Field bug 2026-07-19: Word styles carry comma-separated aliases and the
+    // copied HTML surfaces the whole name; normalizing it to one token
+    // ("heading1pocket") matched nothing and the headings pasted as text.
+    const cases: Array<[string, string]> = [
+      ['pocket', `<h1 style='mso-style-name:"Heading 1\\,Pocket"'>Aliased pocket</h1>`],
+      ['hat', `<h2 style='mso-style-name:"Heading 2\\,Hat"'>Aliased hat</h2>`],
+      ['block', `<h3 style='mso-style-name:"Heading 3\\,Block"'>Aliased block</h3>`],
+      ['tag', `<h4 style='mso-style-name:"Heading 4\\,Tag"'>Aliased tag</h4>`],
+      // Unescaped-comma variant (some export paths do not escape).
+      ['block', `<h3 style='mso-style-name:"Heading 3,Block"'>Aliased block 2</h3>`],
+    ];
+    for (const [expected, html] of cases) {
+      const slice = parseSliceHtml(normalizeWordClipboardHtml(html));
+      const names: string[] = [];
+      slice.content.forEach((n) => names.push(n.type.name));
+      expect(names, html).toEqual([expected]);
+    }
+  });
+
+  it('maps aliased heading styles declared only in the CF_HTML style block', () => {
+    // Word usually puts the aliased mso-style-name in the <style> sheet and
+    // references it by class — the element itself carries no style name.
+    const html = `
+      <html><head><style>
+      h1.PocketAlias { mso-style-name:"Heading 1\\,Pocket"; }
+      p.BlockAlias { mso-style-name:"Heading 3\\,Block"; }
+      </style></head><body>
+      <h1 class=PocketAlias>Sheet pocket</h1>
+      <p class=BlockAlias>Sheet block</p>
+      </body></html>`;
+    const slice = parseSliceHtml(normalizeWordClipboardHtml(html));
+    const names: string[] = [];
+    slice.content.forEach((n) => names.push(n.type.name));
+    expect(names).toEqual(['pocket', 'block']);
+  });
+
+  it('keeps a lone Word heading as the mapped CardMirror heading', () => {
+    const cases: Array<[string, string]> = [
+      ['pocket', `<h1 style='mso-outline-level:1'>Lone Word pocket</h1>`],
+      ['hat', `<h2 style='mso-outline-level:2'>Lone Word hat</h2>`],
+      ['block', `<h3 style='mso-outline-level:3'>Lone Word block</h3>`],
+    ];
+    for (const [name, html] of cases) {
+      const slice = parseSliceHtml(normalizeWordClipboardHtml(html));
+      const names: string[] = [];
+      slice.content.forEach((n) => names.push(n.type.name));
+      expect(names, `${name} shape`).toEqual([name]);
+    }
+  });
+
+  it('pastes a lone heading into a card body by splitting the card', () => {
+    const source = schema.nodes['doc']!.create(null, [
+      schema.nodes['block']!.create({ id: 'b-lone' }, schema.text('Impact Turns')),
+    ]);
+    const html = serializeCardMirrorClipboardHtml(source.content, schema);
+    const slice = reparseClipboardStructuralSlice(clipboardEventWithHtml(html));
+    expect(slice).not.toBeNull();
+
+    const target = schema.nodes['doc']!.create(null, [
+      schema.nodes['card']!.create(null, [
+        schema.nodes['tag']!.create({ id: 't-x' }, schema.text('Existing')),
+        schema.nodes['card_body']!.create(null, schema.text('before after')),
+      ]),
+    ]);
+    let cursor = -1;
+    target.descendants((node, pos) => {
+      if (cursor < 0 && node.isText && node.text === 'before after') cursor = pos + 1 + 'before '.length;
+      return cursor < 0;
+    });
+    const state = EditorState.create({
+      doc: target,
+      selection: TextSelection.create(target, cursor),
+    });
+    const tr = tryPasteSplitContainer(state, slice!);
+    expect(tr).not.toBeNull();
+    const next = state.apply(tr!);
+    const topTypes: string[] = [];
+    next.doc.forEach((node) => topTypes.push(node.type.name));
+    expect(topTypes).toContain('block');
+    expect(next.doc.textContent).toContain('Impact Turns');
+  });
+
+  it('keeps native CardMirror block headings as blocks when pasted from inside a card', () => {
+    const source = schema.nodes['doc']!.create(null, [
+      schema.nodes['block']!.create({ id: 'b-source' }, schema.text('Framework')),
+      schema.nodes['card']!.create(null, [
+        schema.nodes['tag']!.create({ id: 't-source' }, schema.text('Solvency')),
+        schema.nodes['cite_paragraph']!.create(null, [
+          schema.text('Author 24', [schema.marks['cite_mark']!.create()]),
+        ]),
+      ]),
+    ]);
+    const html = serializeCardMirrorClipboardHtml(source.content, schema);
+    const slice = reparseClipboardStructuralSlice(clipboardEventWithHtml(html));
+    expect(slice).not.toBeNull();
+    expect(sliceTopNodeNames(slice!)).toEqual(['block', 'card']);
+
+    const target = schema.nodes['doc']!.create(null, [
+      schema.nodes['card']!.create(null, [
+        schema.nodes['tag']!.create({ id: 't-target' }, schema.text('Existing')),
+        schema.nodes['card_body']!.create(null, schema.text('before after')),
+      ]),
+    ]);
+    let cursor = -1;
+    target.descendants((node, pos) => {
+      if (cursor < 0 && node.isText && node.text === 'before after') cursor = pos + 1 + 'before '.length;
+      return cursor < 0;
+    });
+    const state = EditorState.create({
+      doc: target,
+      selection: TextSelection.create(target, cursor),
+    });
+    const tr = tryPasteSplitContainer(state, slice!);
+    expect(tr).not.toBeNull();
+    const next = state.apply(tr!);
+
+    const topTypes: string[] = [];
+    next.doc.forEach((node) => topTypes.push(node.type.name));
+    expect(topTypes).toContain('block');
+    expect(next.doc.textContent).toContain('Framework');
+  });
+
+  it('keeps native CardMirror headings and analytics exact on CardMirror-to-CardMirror paste', () => {
+    const source = schema.nodes['doc']!.create(null, [
+      schema.nodes['pocket']!.create({ id: 'p-source' }, schema.text('Pocket title')),
+      schema.nodes['hat']!.create({ id: 'h-source' }, schema.text('Hat title')),
+      schema.nodes['block']!.create({ id: 'b-source' }, schema.text('Block title')),
+      schema.nodes['card']!.create(null, [
+        schema.nodes['tag']!.create({ id: 't-source' }, schema.text('Tag title')),
+        schema.nodes['cite_paragraph']!.create(null, [
+          schema.text('Author 24.', [schema.marks['cite_mark']!.create()]),
+          schema.text(' cite tail'),
+        ]),
+      ]),
+      schema.nodes['analytic_unit']!.create(null, [
+        schema.nodes['analytic']!.create({ id: 'a-source' }, schema.text('Analytic title')),
+        schema.nodes['card_body']!.create(null, [schema.text('analytic body')]),
+      ]),
+    ]);
+    const html = serializeCardMirrorClipboardHtml(source.content, schema);
+    const slice = reparseClipboardStructuralSlice(clipboardEventWithHtml(html));
+
+    expect(slice).not.toBeNull();
+    expect(sliceTopNodeNames(slice!)).toEqual([
+      'pocket',
+      'hat',
+      'block',
+      'card',
+      'analytic_unit',
+    ]);
+    expect(slice!.content.child(3).firstChild?.type.name).toBe('tag');
+    expect(slice!.content.child(4).firstChild?.type.name).toBe('analytic');
+    expect(markNames(textRunInSlice(slice!, 'Author 24.'))).toEqual(['cite_mark']);
+    expect(markNames(textRunInSlice(slice!, ' cite tail'))).toEqual([]);
   });
 
   it('treats a short Heading 3 line above a cite as a tag even with Word spacing noise', () => {

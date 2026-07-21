@@ -1,9 +1,12 @@
 import {
   addFlow as addFlowToRound,
+  copyRangeAsTsv,
   deleteFlow as deleteFlowFromRound,
   normalizeRound,
+  pasteTsv,
   reorderFlow as reorderFlowInRound,
   setCellText,
+  toggleBoldRange,
   type FlowFormat,
   type FlowRound,
   type FlowSide,
@@ -468,13 +471,89 @@ export function createFlowWorkspace(opts: FlowWorkspaceOptions): FlowWorkspace {
       tbody.appendChild(tr);
     });
 
+    function cellRange(target: EditorTarget): {
+      flowId: string;
+      startRow: number;
+      startCol: number;
+      endRow: number;
+      endCol: number;
+    } {
+      return {
+        flowId: target.flowId,
+        startRow: target.row,
+        startCol: target.col,
+        endRow: target.row,
+        endCol: target.col,
+      };
+    }
+
+    function toggleBoldAt(target: EditorTarget): void {
+      const next = toggleBoldRange(round, cellRange(target));
+      emit(touchRound(next));
+      const nowBold =
+        next.flows.find((f) => f.id === target.flowId)?.rows[target.row]?.[target.col]?.bold ===
+        true;
+      target.value.classList.toggle('is-bold', nowBold);
+    }
+
+    function copyActiveCell(target: EditorTarget): void {
+      const tsv = copyRangeAsTsv(round, cellRange(target));
+      void navigator.clipboard?.writeText(tsv).catch(() => {});
+    }
+
+    function pasteIntoCell(target: EditorTarget): void {
+      void navigator.clipboard
+        ?.readText()
+        .then((text) => {
+          if (destroyed || !text) return;
+          emit(
+            touchRound(
+              pasteTsv(round, { flowId: target.flowId, row: target.row, col: target.col }, text),
+            ),
+          );
+          render();
+          queueMicrotask(() => {
+            if (destroyed) return;
+            activeTarget()?.td.focus({ preventScroll: true });
+          });
+        })
+        .catch(() => {});
+    }
+
     table.addEventListener('keydown', (event) => {
       if (destroyed || event.target === editor) return;
       const target = activeTarget();
       if (!target) return;
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+      const mod = event.ctrlKey || event.metaKey;
+      if (mod && event.key.toLowerCase() === 's') {
         event.preventDefault();
         opts.onRequestSave?.();
+        return;
+      }
+      if (mod && event.key.toLowerCase() === 'b') {
+        event.preventDefault();
+        toggleBoldAt(target);
+        return;
+      }
+      if (mod && event.key.toLowerCase() === 'c') {
+        event.preventDefault();
+        copyActiveCell(target);
+        return;
+      }
+      if (mod && event.key.toLowerCase() === 'x') {
+        event.preventDefault();
+        copyActiveCell(target);
+        commitText(target, '');
+        return;
+      }
+      if (mod && event.key.toLowerCase() === 'v') {
+        event.preventDefault();
+        pasteIntoCell(target);
+        return;
+      }
+      if (event.key === 'F2') {
+        event.preventDefault();
+        startEditing(target);
         return;
       }
       if (handleNavigationKey(event)) return;
@@ -493,10 +572,36 @@ export function createFlowWorkspace(opts: FlowWorkspaceOptions): FlowWorkspace {
       commitText(editorTarget, editor.value);
     });
     editor.addEventListener('keydown', (event) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
-        if (destroyed) return;
+      if (destroyed) return;
+      const mod = event.ctrlKey || event.metaKey;
+      if (mod && event.key.toLowerCase() === 's') {
         event.preventDefault();
         opts.onRequestSave?.();
+        return;
+      }
+      if (mod && event.key.toLowerCase() === 'b') {
+        event.preventDefault();
+        if (editorTarget) toggleBoldAt(editorTarget);
+        return;
+      }
+      if (event.key === 'Escape') {
+        // Exit edit mode back to cell selection (the live commits already
+        // saved the text — Escape is "done typing", not "revert").
+        event.preventDefault();
+        const target = editorTarget;
+        stopEditing();
+        if (target) selectTarget(target);
+        return;
+      }
+      if (event.key === 'Enter' && event.altKey) {
+        // Alt+Enter inserts a line break inside the cell (Excel muscle
+        // memory) instead of moving the selection down.
+        event.preventDefault();
+        const start = editor.selectionStart ?? editor.value.length;
+        const end = editor.selectionEnd ?? start;
+        editor.value = `${editor.value.slice(0, start)}\n${editor.value.slice(end)}`;
+        editor.setSelectionRange(start + 1, start + 1);
+        if (editorTarget) commitText(editorTarget, editor.value);
         return;
       }
       handleNavigationKey(event);

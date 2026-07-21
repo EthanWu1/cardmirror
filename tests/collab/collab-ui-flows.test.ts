@@ -24,7 +24,7 @@ import {
   collabEndOrLeaveSession,
   collabCaptureSessionHandoff,
 } from '../../src/editor/collab/collab-hooks.js';
-import { loadSessionRecord } from '../../src/editor/collab/collab-store.js';
+import { deleteSessionRecord, loadSessionRecord } from '../../src/editor/collab/collab-store.js';
 import { getHost, type JournalEntry } from '../../src/editor/host/index.js';
 import { serializeNative } from '../../src/index.js';
 
@@ -165,7 +165,113 @@ describe('collab UI flows through the editor seams', () => {
     view.destroy();
   }, 20_000);
 
-  it('keeps an offline shared .cmir local and still exposes its share code', async () => {
+  it('connects a shared .cmir even when a stale cross-window room claim exists', async () => {
+    const electron = (window as unknown as { electronAPI?: Record<string, unknown> }).electronAPI!;
+    electron.openPathCheck = vi.fn(async () => ({ takenByOther: true }));
+    electron.openPathRegister = vi.fn(async () => {});
+    electron.openPathRelease = vi.fn(async () => {});
+
+    const client = new RoomsClient({ baseUrl: () => mock.url, token: () => mock.token });
+    const { session: host, sharedDoc } = await CollabSession.hostPersistent({
+      pmDoc: simpleDoc('room beats stale claim'),
+      client,
+      flushMs: 25,
+      minBackoffMs: 20,
+      maxBackoffMs: 60,
+    });
+
+    const owner = 'shared-stale-room-claim';
+    const view = mkIndexStyleView(owner, simpleDoc('local stale body'));
+    let storedSharedDoc: unknown = null;
+    const deps = {
+      getView: () => view,
+      getOwnerUid: () => owner,
+      refreshPlugins: () => {
+        view.updateState(view.state.reconfigure({ plugins: buildMiniPlugins(owner) }));
+      },
+      setSharedDocForUid: (_uid: string, value: unknown) => {
+        storedSharedDoc = value;
+      },
+      newSessionDoc: () => {
+        throw new Error('shared .cmir must connect in the existing doc');
+      },
+    };
+
+    expect(await collabUi.connectSharedDocFlow(deps, sharedDoc)).toBe(true);
+    await settle();
+    await sleep(120);
+    expect(collabUi.activeSession()).not.toBeNull();
+    expect(collabUi.activeSession()!.roomId).toBe(sharedDoc.roomId);
+    expect(storedSharedDoc).toEqual(sharedDoc);
+    expect(docText(view.state.doc)).toContain('room beats stale claim');
+    expect(docText(view.state.doc)).not.toContain('local stale body');
+
+    await collabUi.activeSession()!.stop();
+    const endP = collabUi.endSessionFlow(deps);
+    await settle();
+    clickPromptButton('Leave Session');
+    await endP;
+    await host.end();
+    view.destroy();
+    delete electron.openPathCheck;
+    delete electron.openPathRegister;
+    delete electron.openPathRelease;
+  }, 20_000);
+
+  it('re-hosts a shared .cmir whose durable room is gone instead of looping forever', async () => {
+    const client = new RoomsClient({ baseUrl: () => mock.url, token: () => mock.token });
+    const { session: host, sharedDoc } = await CollabSession.hostPersistent({
+      pmDoc: simpleDoc('room that will vanish'),
+      client,
+      flushMs: 25,
+      minBackoffMs: 20,
+      maxBackoffMs: 60,
+    });
+    await host.stop();
+    // Relay redeploy / wiped storage: the durable room is simply gone while
+    // the .cmir keeps carrying its pointer.
+    await client.deletePersistentDoc(sharedDoc.docId);
+
+    const owner = 'shared-room-vanished';
+    const view = mkIndexStyleView(owner, simpleDoc('local copy is the source now'));
+    let storedSharedDoc: unknown = 'untouched';
+    const deps = {
+      getView: () => view,
+      getOwnerUid: () => owner,
+      refreshPlugins: () => {
+        view.updateState(view.state.reconfigure({ plugins: buildMiniPlugins(owner) }));
+      },
+      setSharedDocForUid: (_uid: string, value: unknown) => {
+        storedSharedDoc = value;
+      },
+      persistSharedDocForUid: () => {},
+      markDirtyForUid: () => {},
+      newSessionDoc: () => {
+        throw new Error('re-host must bind to the existing doc');
+      },
+    };
+
+    expect(await collabUi.connectSharedDocFlow(deps, sharedDoc)).toBe(true);
+    await settle();
+    const sess = collabUi.activeSession();
+    expect(sess).not.toBeNull();
+    expect(sess!.roomId).not.toBe(sharedDoc.roomId);
+    expect(sess!.durableRoom).toBe(true);
+    // The stale pointer was replaced by the fresh room's metadata...
+    expect(storedSharedDoc).toMatchObject({ roomId: sess!.roomId });
+    // ...and the session carries the LOCAL file's content (nothing to merge
+    // from the dead room).
+    expect(docText(view.state.doc)).toContain('local copy is the source now');
+
+    await collabUi.activeSession()!.stop();
+    const endP = collabUi.endSessionFlow(deps);
+    await settle();
+    clickPromptButton('End Session');
+    await endP;
+    view.destroy();
+  }, 20_000);
+
+  it('keeps retrying an offline shared .cmir and auto-connects when the relay returns', async () => {
     const client = new RoomsClient({ baseUrl: () => mock.url, token: () => mock.token });
     const { session: host, sharedDoc } = await CollabSession.hostPersistent({
       pmDoc: simpleDoc('room body while offline'),
@@ -210,12 +316,12 @@ describe('collab UI flows through the editor seams', () => {
     expect(copied).toBe(sharedDoc.shareCode);
 
     mock.resume();
-    const connected = collabUi.connectSharedDocFlow(deps, sharedDoc);
+    await sleep(1500);
     await settle();
-    await sleep(100);
-    expect(await connected).toBe(true);
-    await settle();
-    await sleep(100);
+    expect(collabUi.activeSession()).not.toBeNull();
+    expect(collabUi.activeSession()!.durableRoom).toBe(true);
+    expect(docText(view.state.doc)).toContain('room body while offline');
+    expect(docText(view.state.doc)).not.toContain('local offline copy');
 
     await collabUi.activeSession()!.stop();
     const endP = collabUi.endSessionFlow(deps);
@@ -680,7 +786,7 @@ describe('collab UI flows through the editor seams', () => {
     viewB.destroy();
   }, 20_000);
 
-  it('closing a co-edited doc keeps the session resumable; end/leave clears it', async () => {
+  it('closing a durable shared .cmir keeps the hidden resume record; end/leave clears it', async () => {
     const viewK = mkIndexStyleView('close-keep');
     const viewE = mkIndexStyleView('close-end');
     const viewForUid = (u: string): EditorView | null =>
@@ -698,15 +804,18 @@ describe('collab UI flows through the editor seams', () => {
       value: { writeText: () => Promise.resolve() },
     });
 
-    // Close-but-keep: the live session tears down, but its persisted record
-    // stays so the Sessions list can resume it (unsynced edits sync on rejoin).
+    // Durable shared .cmir close: the live session tears down, but its hidden
+    // CRDT resume record stays so offline edits survive reopening and sync.
+    // The home screen filters durable records out of the visible Sessions list.
     await startSession(depsFor('close-keep', viewK));
     const keepRoom = collabUi.activeSession()!.roomId;
+    expect(collabUi.activeSession()!.durableRoom).toBe(true);
     await collabCloseKeepResumable('close-keep');
     await settle();
     expect(collabPluginSourceFor('close-keep')).toBeNull();
     expect(collabCopresenceFor('close-keep')).toBeNull();
-    expect(await loadSessionRecord(keepRoom)).not.toBeNull();
+    expect(await loadSessionRecord(keepRoom)).toMatchObject({ durableRoom: true });
+    await deleteSessionRecord(keepRoom);
 
     // End/leave: the session AND its resumable record are gone.
     await startSession(depsFor('close-end', viewE));
@@ -731,7 +840,115 @@ describe('collab UI flows through the editor seams', () => {
     viewE.destroy();
   }, 20_000);
 
-  it('session flush + keep-resumable close + resume-in-place (existingDoc)', async () => {
+  it('keeps a hidden durable record across offline close so unsent shared .cmir edits resume', async () => {
+    const owner = 'durable-offline-close';
+    const view = mkIndexStyleView(owner, simpleDoc('durable shared base'));
+    let sharedDoc: unknown = null;
+    const deps = {
+      getView: () => view,
+      getOwnerUid: () => owner,
+      refreshPlugins: () =>
+        view.updateState(view.state.reconfigure({ plugins: buildMiniPlugins(owner) })),
+      setSharedDocForUid: (_uid: string, value: unknown) => {
+        sharedDoc = value;
+      },
+      persistSharedDocForUid: () => {},
+      markDirtyForUid: () => {},
+      newSessionDoc: () => {
+        throw new Error('durable .cmir sessions should bind to the existing document');
+      },
+    };
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: () => Promise.resolve() },
+    });
+
+    expect(await collabUi.autoStartSharedDocFlow(deps)).toBe(true);
+    await settle();
+    const room = collabUi.activeSession()!.roomId;
+    expect(collabUi.activeSession()!.durableRoom).toBe(true);
+    expect(sharedDoc).toMatchObject({ roomId: room });
+
+    mock.pause();
+    collabUi.activeSession()!.restart();
+    await sleep(80);
+    typeAfter(view, 'durable shared', ' OFFLINE');
+    await sleep(180);
+    expect(collabUi.activeSession()!.queuedUpdates).toBeGreaterThan(0);
+
+    await collabCloseKeepResumable(owner);
+    await settle();
+    expect(collabUi.activeSession()).toBeNull();
+    const hiddenRecord = await loadSessionRecord(room);
+    expect(hiddenRecord).not.toBeNull();
+    expect(hiddenRecord?.durableRoom).toBe(true);
+
+    expect(await collabUi.connectSharedDocFlow(deps, sharedDoc as Parameters<typeof collabUi.connectSharedDocFlow>[1])).toBe(true);
+    await settle();
+    expect(collabUi.activeSession()).not.toBeNull();
+    expect(docText(view.state.doc)).toContain('durable shared OFFLINE base');
+
+    mock.resume();
+    await sleep(900);
+    const fresh = await CollabSession.join({
+      ...decodeShareCode((sharedDoc as { shareCode: string }).shareCode)!,
+      client: new RoomsClient({ baseUrl: () => mock.url, token: () => mock.token }),
+      flushMs: 25,
+      minBackoffMs: 20,
+      maxBackoffMs: 60,
+    });
+    const freshView = mkView(fresh.plugins());
+    await settle();
+    expect(docText(freshView.state.doc)).toContain('durable shared OFFLINE base');
+
+    await fresh.stop();
+    freshView.destroy();
+    await collabUi.activeSession()!.stop();
+    const endP = collabUi.endSessionFlow(deps);
+    await settle();
+    clickPromptButton('End Session');
+    await endP;
+    view.destroy();
+  }, 25_000);
+
+  it('closing a temporary invite session keeps the resumable row', async () => {
+    const legacy = await startRoomsMock({ docs: false });
+    const previousUrl = settings.get('pairingRelayUrl');
+    const previousToken = settings.get('pairingRelayToken');
+    settings.set('pairingRelayUrl', legacy.url);
+    settings.set('pairingRelayToken', legacy.token);
+
+    const view = mkIndexStyleView('close-temporary', simpleDoc('temporary room body'));
+    const deps = {
+      getView: () => view,
+      getOwnerUid: () => 'close-temporary',
+      refreshPlugins: () =>
+        view.updateState(view.state.reconfigure({ plugins: buildMiniPlugins('close-temporary') })),
+      newSessionDoc: () => true,
+    };
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: () => Promise.resolve() },
+    });
+
+    try {
+      await startSession(deps);
+      const room = collabUi.activeSession()!.roomId;
+      expect(collabUi.activeSession()!.durableRoom).toBe(false);
+      await collabCloseKeepResumable('close-temporary');
+      await settle();
+      expect(collabPluginSourceFor('close-temporary')).toBeNull();
+      expect(await loadSessionRecord(room)).not.toBeNull();
+      await deleteSessionRecord(room);
+    } finally {
+      view.destroy();
+      settings.set('pairingRelayUrl', previousUrl);
+      settings.set('pairingRelayToken', previousToken);
+      await legacy.close();
+    }
+  }, 20_000);
+
+  it('temporary session flush + keep-resumable close + resume-in-place (existingDoc)', async () => {
     const view = mkIndexStyleView('ho-doc');
     const depsFor = (uid: string, v: EditorView, onNewDoc?: () => void) => ({
       getView: () => v,
@@ -748,13 +965,20 @@ describe('collab UI flows through the editor seams', () => {
       value: { writeText: () => Promise.resolve() },
     });
 
+    const legacy = await startRoomsMock({ docs: false });
+    const previousUrl = settings.get('pairingRelayUrl');
+    const previousToken = settings.get('pairingRelayToken');
+    settings.set('pairingRelayUrl', legacy.url);
+    settings.set('pairingRelayToken', legacy.token);
+
+    try {
     await startSession(depsFor('ho-doc', view));
     const room = collabUi.activeSession()!.roomId;
 
     // Capture reports the live session and flushes its record (so unsynced
     // edits survive the toggle's reload).
     const handoff = await collabCaptureSessionHandoff();
-    expect(handoff).toContainEqual({ uid: 'ho-doc', roomId: room });
+    expect(handoff).toContainEqual({ uid: 'ho-doc', roomId: room, durableRoom: false });
     expect(await loadSessionRecord(room)).not.toBeNull();
 
     // Simulate the pre-reload teardown that keeps the record resumable.
@@ -781,6 +1005,11 @@ describe('collab UI flows through the editor seams', () => {
     // Resumed from a host record → host role → "End Session".
     clickPromptButton('End Session');
     await end;
-    view.destroy();
+    } finally {
+      view.destroy();
+      settings.set('pairingRelayUrl', previousUrl);
+      settings.set('pairingRelayToken', previousToken);
+      await legacy.close();
+    }
   }, 20_000);
 });

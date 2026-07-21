@@ -51,7 +51,12 @@ import { UndoManager } from 'loro-crdt';
 import { attachSessionPersistence, type PersistHandle } from './collab-persist.js';
 import { installCursorPresence, type CursorsHandle } from './collab-cursors.js';
 import { collabRepairPlugin, lowestPeerIsLeader } from './collab-repair.js';
-import { loadSessionRecord, loadPrefetch, deletePrefetch } from './collab-store.js';
+import {
+  deleteSessionRecord,
+  loadSessionRecord,
+  loadPrefetch,
+  deletePrefetch,
+} from './collab-store.js';
 import { importRoomKey, decryptBlob } from './collab-crypto.js';
 import { resetSessionCommentIds } from '../comments-plugin.js';
 import { collabEnabled } from './collab-gate.js';
@@ -127,7 +132,13 @@ interface ActiveSession {
 
 const sessions = new Map<string, ActiveSession>();
 
-type CollabUiStatus = { connected: boolean; queuedUpdates: number };
+type CollabUiStatus = {
+  connected: boolean;
+  queuedUpdates: number;
+  /** Relay answers REST even though live push is unavailable — the doc is
+   *  still syncing (by polling), so don't report it as offline. */
+  relayReachable?: boolean;
+};
 
 interface SharedDocOpenState {
   sharedDoc: SharedDocMetadata;
@@ -136,6 +147,18 @@ interface SharedDocOpenState {
 }
 
 const sharedDocOpenStates = new Map<string, SharedDocOpenState>();
+
+interface SharedDocReconnect {
+  timer: ReturnType<typeof setTimeout> | null;
+  attempt: number;
+  /** Last failure toast shown for this doc — repeated retry failures with
+   *  the same cause stay silent instead of re-toasting every cycle. */
+  lastToast?: string;
+}
+
+const sharedDocReconnects = new Map<string, SharedDocReconnect>();
+const SHARED_DOC_RECONNECT_MIN_MS = 500;
+const SHARED_DOC_RECONNECT_MAX_MS = 8_000;
 
 /** Commit origin for session meta-map writes (title publishing) — excluded
  *  from the session UndoManager alongside comment writes, so Ctrl+Z never
@@ -161,6 +184,25 @@ export function setCollabDocTitleResolver(fn: ((uid: string) => string | null) |
 /** The session owned by `uid`, or null. */
 function sessionFor(uid: string | null | undefined): ActiveSession | null {
   return uid != null ? sessions.get(uid) ?? null : null;
+}
+
+function depsForOwner(deps: CollabUiDeps, ownerUid: string): CollabUiDeps {
+  return {
+    ...deps,
+    getView: () => deps.getViewForUid?.(ownerUid) ?? deps.getView(),
+    getOwnerUid: () => ownerUid,
+    refreshPlugins: () => {
+      if (deps.refreshPluginsForUid) deps.refreshPluginsForUid(ownerUid);
+      else deps.refreshPlugins();
+    },
+  };
+}
+
+function clearSharedDocReconnect(ownerUid: string): void {
+  const retry = sharedDocReconnects.get(ownerUid);
+  if (!retry) return;
+  if (retry.timer !== null) clearTimeout(retry.timer);
+  sharedDocReconnects.delete(ownerUid);
 }
 
 // Feed the multi-pane shell's per-slot footers: each slot paints the copresence
@@ -191,7 +233,11 @@ setCollabCloseActions({
 // survive the toggle's reload) and report {uid, roomId} so the post-reload flow
 // can auto-resume each into the doc that reopens under its uid.
 setCollabHandoffProvider(async () => {
-  const list = [...sessions.values()].map((s) => ({ uid: s.ownerUid, roomId: s.session.roomId }));
+  const list = [...sessions.values()].map((s) => ({
+    uid: s.ownerUid,
+    roomId: s.session.roomId,
+    durableRoom: s.session.durableRoom,
+  }));
   await Promise.all([...sessions.values()].map((s) => s.persist.flush()));
   return list;
 });
@@ -277,8 +323,191 @@ function actionSharedDocState(): SharedDocOpenState | null {
 
 function setSharedDocOpenState(ownerUid: string, state: SharedDocOpenState | null): void {
   if (state) sharedDocOpenStates.set(ownerUid, state);
-  else sharedDocOpenStates.delete(ownerUid);
+  else {
+    sharedDocOpenStates.delete(ownerUid);
+    clearSharedDocReconnect(ownerUid);
+  }
   if (!sessionFor(ownerUid)) refreshChipForFocus();
+}
+
+function sameSharedDocState(
+  state: SharedDocOpenState | null | undefined,
+  sharedDoc: SharedDocMetadata,
+): boolean {
+  return state?.sharedDoc.roomId === sharedDoc.roomId && state.sharedDoc.shareCode === sharedDoc.shareCode;
+}
+
+function scheduleSharedDocReconnect(
+  deps: CollabUiDeps,
+  sharedDoc: SharedDocMetadata,
+  ownerUid: string,
+): void {
+  if (!ownerUid) return;
+  const existing = sharedDocReconnects.get(ownerUid);
+  if (existing?.timer) return;
+  const lastToast = existing?.lastToast;
+  const attempt = (existing?.attempt ?? 0) + 1;
+  const base = Math.min(
+    SHARED_DOC_RECONNECT_MIN_MS * 2 ** Math.min(attempt - 1, 4),
+    SHARED_DOC_RECONNECT_MAX_MS,
+  );
+  const jitter = 0.8 + Math.random() * 0.4;
+  const timer = setTimeout(() => {
+    const state = sharedDocReconnects.get(ownerUid);
+    if (state) state.timer = null;
+    if (sessionFor(ownerUid)) {
+      clearSharedDocReconnect(ownerUid);
+      return;
+    }
+    if (!sameSharedDocState(sharedDocOpenStates.get(ownerUid), sharedDoc)) {
+      clearSharedDocReconnect(ownerUid);
+      return;
+    }
+    void connectSharedDocFlow(depsForOwner(deps, ownerUid), sharedDoc);
+  }, base * jitter);
+  sharedDocReconnects.set(ownerUid, { attempt, timer, ...(lastToast ? { lastToast } : {}) });
+}
+
+function keepSharedDocConnecting(
+  deps: CollabUiDeps,
+  sharedDoc: SharedDocMetadata,
+  ownerUid: string,
+  detail?: string,
+  toast?: string,
+): false {
+  if (toast) {
+    // One toast per distinct failure cause — the retry loop re-enters this
+    // path every few seconds, and re-toasting the same message each cycle
+    // buries the editor under an endless "session has ended" stream.
+    const entry = sharedDocReconnects.get(ownerUid);
+    if (entry?.lastToast !== toast) showToast(toast);
+    if (entry) entry.lastToast = toast;
+    else sharedDocReconnects.set(ownerUid, { timer: null, attempt: 0, lastToast: toast });
+  }
+  setSharedDocOpenState(ownerUid, {
+    sharedDoc,
+    status: 'connecting',
+    ...(detail ? { detail } : {}),
+  });
+  scheduleSharedDocReconnect(deps, sharedDoc, ownerUid);
+  return false;
+}
+
+/** True when the relay is reachable and answers that this durable room no
+ *  longer exists (redeployed relay, wiped storage, an ended/archived doc).
+ *  Network-level failures and auth problems return false — those are
+ *  retryable outages, not proof the room is gone. */
+async function durableRoomGone(
+  client: NonNullable<ReturnType<typeof relayClient>>,
+  sharedDoc: SharedDocMetadata,
+): Promise<boolean> {
+  try {
+    // Cheap metadata probe — the designed endpoint for exactly this
+    // question. (An updates-tail probe was fragile: a relay that validates
+    // its `after` cursor rejects a beyond-tail value, and probing from 0
+    // downloaded the whole backlog twice.)
+    const info = await client.getPersistentDoc(sharedDoc.docId);
+    return info.archived || info.ended;
+  } catch (err) {
+    return err instanceof RoomsError && (err.status === 404 || err.status === 410);
+  }
+}
+
+/** A live durable session whose room has been 404/410 for a stretch: confirm
+ *  it is truly gone (not a transient blip), then tear it down and re-host a
+ *  fresh room from the local view. The view holds the current content
+ *  (including any offline edits — the Loro binding keeps it in sync), and the
+ *  dead room has no surviving peers to merge with, so seeding the new room
+ *  from the view is correct. Converts "stuck reconnecting forever" into a
+ *  live session on a fresh room. */
+const rehostingOwners = new Set<string>();
+async function rehostGoneDurableRoom(deps: CollabUiDeps, sess: ActiveSession): Promise<void> {
+  const ownerUid = sess.ownerUid;
+  if (rehostingOwners.has(ownerUid)) return;
+  rehostingOwners.add(ownerUid);
+  try {
+    await ensureBakedRelay();
+    const client = relayClient();
+    // For persistent document rooms roomId === docId, so the roomId probes
+    // the doc's liveness. If the relay says it's actually still there, keep
+    // the existing session retrying — this was only a transient outage.
+    const roomId = sess.session.roomId;
+    if (
+      client &&
+      !(await durableRoomGone(client, {
+        docId: roomId,
+        roomId,
+        shareCode: sess.shareCode,
+        createdAt: '',
+      }))
+    ) {
+      return;
+    }
+    if (!sessions.has(ownerUid)) return; // ended/closed meanwhile
+    showToast('The co-editing room was gone — created a fresh one for this document');
+    await replaceDurableRoom(deps, sess);
+  } catch (err) {
+    console.warn('Re-host of a gone durable room failed:', err);
+  } finally {
+    rehostingOwners.delete(ownerUid);
+  }
+}
+
+/** Tear down a durable session and host a FRESH room seeded from the local
+ *  view. The view carries the current content, so nothing local is lost.
+ *
+ *  Reports failure instead of swallowing it: the auto-start path stays quiet
+ *  on error by design, so a failed re-host used to leave the file silently
+ *  pointing at the OLD (unreachable) room — the user saw nothing change and
+ *  reopening went straight back to "reconnecting" (field bug 2026-07-20). */
+async function replaceDurableRoom(deps: CollabUiDeps, sess: ActiveSession): Promise<boolean> {
+  const ownerUid = sess.ownerUid;
+  // Kill any pending retry for the OLD pointer first — otherwise its timer
+  // fires mid-rehost and races the new session onto the dead room.
+  clearSharedDocReconnect(ownerUid);
+  setSharedDocOpenState(ownerUid, null);
+  await sess.session.stop();
+  await teardownSession(sess); // clears the resume record + shared-doc pointer
+  const ok = await autoStartSharedDocFlow(depsForOwner(deps, ownerUid));
+  if (!ok) {
+    showToast(
+      'Could not create a fresh co-editing room — this document stays local for now. ' +
+        'Check Settings → Collaboration, then reopen the file to retry.',
+    );
+  }
+  return ok;
+}
+
+/** A durable room that keeps answering 409 "full". The usual cause is this
+ *  app's OWN leaked streams from earlier quits/crashes (the relay counts a
+ *  socket until it reaps it), which wedges the file on "reconnecting"
+ *  indefinitely. Offer the escape that always works — a fresh room — instead
+ *  of retrying silently forever. Asked, not automatic: if the room really is
+ *  full of live partners, replacing it would split the group. */
+async function offerRehostForFullRoom(deps: CollabUiDeps, sess: ActiveSession): Promise<void> {
+  const ownerUid = sess.ownerUid;
+  if (rehostingOwners.has(ownerUid)) return;
+  rehostingOwners.add(ownerUid);
+  try {
+    const ok = await confirmDialog(
+      "This document's co-editing room is refusing new connections (it reports being full). " +
+        'That is usually left over from an earlier crash or quit rather than real partners. ' +
+        'Creating a fresh room reconnects this document immediately — your copy is kept as-is, ' +
+        'and anyone else editing it picks up the new room when they reopen the file.',
+      {
+        title: 'Stuck reconnecting — start a fresh room?',
+        okLabel: 'Create Fresh Room',
+        cancelLabel: 'Keep Retrying',
+      },
+    );
+    if (!ok) return;
+    if (!sessions.has(ownerUid)) return; // ended/closed while the dialog was up
+    await replaceDurableRoom(deps, sess);
+  } catch (err) {
+    console.warn('Re-host of a full durable room failed:', err);
+  } finally {
+    rehostingOwners.delete(ownerUid);
+  }
 }
 
 function chipEl(): HTMLElement | null {
@@ -302,11 +531,16 @@ function isMultiDocWorkspace(): boolean {
   return document.body.classList.contains('pmd-multi-doc');
 }
 
-type BottomCollabState = 'synced' | 'sending' | 'reconnecting' | 'offline';
+type BottomCollabState = 'synced' | 'sending' | 'polling' | 'reconnecting' | 'offline';
 
 function bottomCollabState(status: CollabUiStatus): BottomCollabState {
   if (status.connected && status.queuedUpdates === 0) return 'synced';
   if (status.connected) return 'sending';
+  // Stream down but the relay answers REST: the document IS syncing, just by
+  // polling instead of live push (e.g. the room's stream slots are exhausted).
+  // Calling that "offline" was simply wrong — edits were flowing (field bug
+  // 2026-07-20).
+  if (status.relayReachable) return 'polling';
   return status.queuedUpdates > 0 ? 'offline' : 'reconnecting';
 }
 
@@ -316,6 +550,12 @@ function bottomCollabTitle(status: CollabUiStatus): string {
   if (state === 'sending') {
     const n = status.queuedUpdates;
     return `Live: sending ${n} update${n === 1 ? '' : 's'}`;
+  }
+  if (state === 'polling') {
+    const n = status.queuedUpdates;
+    return n > 0
+      ? `Syncing ${n} change${n === 1 ? '' : 's'} (no live connection — updates every few seconds)`
+      : 'Syncing (no live connection — updates every few seconds)';
   }
   if (state === 'offline') return 'Live: offline, retrying unsent changes';
   return 'Live: reconnecting';
@@ -486,8 +726,7 @@ function checkSoloSession(sess: ActiveSession, now = Date.now()): void {
   });
 }
 
-async function discardRecoveryJournalIfSynced(sess: ActiveSession): Promise<void> {
-  if (sess.session.role !== 'host' && sess.session.queuedUpdates > 0) return;
+async function discardRecoveryJournal(sess: ActiveSession): Promise<void> {
   const host = getHost();
   if (!host.journalsSupported) return;
   try {
@@ -495,6 +734,11 @@ async function discardRecoveryJournalIfSynced(sess: ActiveSession): Promise<void
   } catch (err) {
     console.warn(`Failed to drop synced co-edit journal for ${sess.ownerUid}:`, err);
   }
+}
+
+async function discardRecoveryJournalIfSynced(sess: ActiveSession): Promise<void> {
+  if (sess.session.queuedUpdates > 0) return;
+  await discardRecoveryJournal(sess);
 }
 
 async function autoEndSoloSession(sess: ActiveSession): Promise<void> {
@@ -531,8 +775,23 @@ function installWakeHooks(session: CollabSession): () => void {
   const onOnline = (): void => session.restart();
   window.addEventListener('online', onOnline);
   const offResume = getElectronHost()?.onPowerResumed?.(() => session.restart()) ?? null;
+  // Returning to the window is the moment a user notices a dead session —
+  // check liveness right then instead of waiting for the stall watchdog.
+  // ensureLive() is a no-op while the stream is healthy, so this stays
+  // free on ordinary tab/window switches.
+  const onVisible = (): void => {
+    if (document.visibilityState === 'visible') session.ensureLive();
+  };
+  document.addEventListener('visibilitychange', onVisible);
+  // Free the relay's participant slot on teardown. Without this every quit
+  // leaked a stream the relay kept counting, until the room answered 409
+  // "full" to its own owner and the file stuck on "reconnecting" forever.
+  const onPageHide = (): void => session.releaseForUnload();
+  window.addEventListener('pagehide', onPageHide);
   return () => {
     window.removeEventListener('online', onOnline);
+    document.removeEventListener('visibilitychange', onVisible);
+    window.removeEventListener('pagehide', onPageHide);
     offResume?.();
   };
 }
@@ -648,7 +907,11 @@ function installSeams(
  *  cancelled RESUME, or a close-but-keep); terminal paths clear it. Returns the
  *  record-clear promise so terminal callers can await deletion (so a re-read of
  *  the Sessions list doesn't flash a stale row); most callers ignore it. */
-function teardownSession(sess: ActiveSession, keepRecord = false): Promise<void> {
+function teardownSession(
+  sess: ActiveSession,
+  keepRecord = false,
+  preserveSharedDoc = false,
+): Promise<void> {
   unregisterCollabPluginSource(sess.ownerUid);
   sessions.delete(sess.ownerUid);
   // Release the cross-window live-session claim (registered in installSeams).
@@ -661,7 +924,7 @@ function teardownSession(sess: ActiveSession, keepRecord = false): Promise<void>
   let cleared: Promise<void> = Promise.resolve();
   if (keepRecord) sess.persist.dispose();
   else {
-    sess.clearSharedDoc();
+    if (!preserveSharedDoc) sess.clearSharedDoc();
     cleared = sess.persist.clear();
   }
   if (sessions.size === 0) {
@@ -732,6 +995,14 @@ function sessionCallbacks(deps: CollabUiDeps, getSess: () => ActiveSession | nul
           'official relay requires no account.)',
       );
     },
+    onMissingRoomPersisting: () => {
+      // A durable room has been 404/410 long enough to be gone for good —
+      // re-host from the local file so the doc stops sitting on
+      // "reconnecting" forever (field bug 2026-07-19).
+      const sess = getSess();
+      if (!sess || !sessions.has(sess.ownerUid) || !sess.session.durableRoom) return;
+      void rehostGoneDurableRoom(deps, sess);
+    },
     onBacklogMerged: (count: number) => {
       // Merge-visibility (M3): a travel-day backlog just landed — say
       // so, instead of the doc silently reshaping under the user.
@@ -757,6 +1028,20 @@ function sessionCallbacks(deps: CollabUiDeps, getSess: () => ActiveSession | nul
           ? 'Collaboration session ended'
           : 'Session ended — this copy is now yours alone',
       );
+    },
+    onFullPersisting: () => {
+      // Durable rooms retry a 409 silently, which reads as "stuck
+      // reconnecting" forever. The usual cause is this app's own leaked
+      // streams from earlier crashes/quits, and the room may never clear on
+      // its own — so offer the escape rather than just narrating.
+      const sess = getSess();
+      if (!sess || !sessions.has(sess.ownerUid) || !sess.session.durableRoom) {
+        showToast(
+          'Still connecting — the relay is clearing older connections for this document.',
+        );
+        return;
+      }
+      void offerRehostForFullRoom(deps, sess);
     },
     onFull: () => {
       const sess = getSess();
@@ -1113,7 +1398,6 @@ export async function connectSharedDocFlow(
   sharedDoc: SharedDocMetadata,
 ): Promise<boolean> {
   if (!collabEnabled()) return false;
-  if (!deps.getView()) return false;
   const decoded = decodeShareCode(sharedDoc.shareCode);
   if (!decoded || decoded.roomId !== sharedDoc.roomId) {
     showToast('This shared document has unreadable collaboration metadata');
@@ -1121,8 +1405,8 @@ export async function connectSharedDocFlow(
   }
 
   const ownerUid = deps.getOwnerUid?.() ?? '';
-  const markLocalCopy = (detail?: string): void =>
-    setSharedDocOpenState(ownerUid, { sharedDoc, status: 'local', detail });
+  const ownerDeps = depsForOwner(deps, ownerUid);
+  if (!ownerDeps.getView()) return false;
   setSharedDocOpenState(ownerUid, { sharedDoc, status: 'connecting' });
   const current = sessionFor(ownerUid);
   if (current) {
@@ -1130,37 +1414,28 @@ export async function connectSharedDocFlow(
       setSharedDocOpenState(ownerUid, null);
       return true;
     }
-    markLocalCopy('This document is already in another live collaboration session.');
-    showToast('This document is already in another session');
-    return false;
+    return keepSharedDocConnecting(
+      ownerDeps,
+      sharedDoc,
+      ownerUid,
+      'This document is already in another live collaboration session.',
+      'This document is already in another session',
+    );
   }
   for (const s of sessions.values()) {
     if (s.session.roomId === decoded.roomId) {
-      markLocalCopy('This shared document is already active elsewhere in this window.');
-      showToast('That shared document is already active in this window');
-      return true;
+      return keepSharedDocConnecting(
+        ownerDeps,
+        sharedDoc,
+        ownerUid,
+        'This shared document is already active elsewhere in this window.',
+        'That shared document is already active in this window',
+      );
     }
   }
-  if (await roomLiveElsewhere(decoded.roomId)) {
-    markLocalCopy('This shared document is already open in another CardMirror window.');
-    showToast('That shared document is already open in another CardMirror window.');
-    return true;
-  }
-
-  const record = await loadSessionRecord(decoded.roomId);
-  if (record) {
-    const ok = await resumeSessionFlow(deps, decoded.roomId, {
-      existingDoc: true,
-      durableRoom: true,
-    });
-    if (ok) {
-      setSharedDocOpenState(ownerUid, null);
-      deps.setSharedDocForUid?.(ownerUid, sharedDoc);
-    } else {
-      markLocalCopy('Saved session data is available, but reconnect did not complete.');
-    }
-    return ok;
-  }
+  // Stale duplicate-open room claims are common after sleep/crash. A saved
+  // shared .cmir should still join its durable relay room; the relay stream is
+  // the source of truth, and the room client handles real capacity/backoff.
 
   await ensureBakedRelay();
   const client = relayClient();
@@ -1169,30 +1444,70 @@ export async function connectSharedDocFlow(
     return false;
   }
 
+  // A durable pointer can outlive its room (relay redeploy, wiped storage, an
+  // archived doc). Joining a truly-gone room can never succeed — without this
+  // probe the retry loop toasts "session has ended" forever, and the stale
+  // pointer blocks ever starting a fresh session for this file. When the relay
+  // is REACHABLE and says the room is gone, drop the pointer + stale record
+  // and silently re-host a fresh persistent room seeded from the local file;
+  // the new pointer autosaves into the .cmir so other openers pick it up.
+  if (await durableRoomGone(client, sharedDoc)) {
+    clearSharedDocReconnect(ownerUid);
+    setSharedDocOpenState(ownerUid, null);
+    await deleteSessionRecord(decoded.roomId).catch(() => {});
+    ownerDeps.setSharedDocForUid?.(ownerUid, null);
+    showToast('The previous co-editing room was gone — created a fresh one for this document');
+    return autoStartSharedDocFlow(ownerDeps);
+  }
+
+  const record = await loadSessionRecord(decoded.roomId);
+  if (record) {
+    const ok = await resumeSessionFlow(ownerDeps, decoded.roomId, {
+      existingDoc: true,
+      durableRoom: true,
+    });
+    if (ok) {
+      setSharedDocOpenState(ownerUid, null);
+      ownerDeps.setSharedDocForUid?.(ownerUid, sharedDoc);
+    } else {
+      keepSharedDocConnecting(
+        ownerDeps,
+        sharedDoc,
+        ownerUid,
+        'Saved session data is available, but reconnect did not complete.',
+      );
+    }
+    return ok;
+  }
+
   let sessRef: ActiveSession | null = null;
   try {
     const session = await CollabSession.join({
       ...decoded,
       client,
       durableRoom: true,
-      callbacks: sessionCallbacks(deps, () => sessRef),
+      callbacks: sessionCallbacks(ownerDeps, () => sessRef),
     });
-    sessRef = installSeams(session, deps, sharedDoc.shareCode, ownerUid);
-    deps.setSharedDocForUid?.(ownerUid, sharedDoc);
-    deps.refreshPlugins();
+    sessRef = installSeams(session, ownerDeps, sharedDoc.shareCode, ownerUid);
+    ownerDeps.setSharedDocForUid?.(ownerUid, sharedDoc);
+    ownerDeps.refreshPlugins();
     sessRef.commentsSync.pull();
     session.start();
     sessRef.lastStatus = { connected: true, queuedUpdates: 0 };
     updateChip({ connected: true, queuedUpdates: 0 });
     showToast('Shared document connected');
-    deps.getView()?.focus();
+    ownerDeps.getView()?.focus();
     return true;
   } catch (err) {
     if (sessRef) void teardownSession(sessRef, /* keepRecord */ true);
     const msg = relayFailureMessage(err, { initiating: false, verb: 'connect shared document' });
-    markLocalCopy(msg);
-    showToast(`${msg}. Local copy is open.`);
-    return false;
+    return keepSharedDocConnecting(
+      ownerDeps,
+      sharedDoc,
+      ownerUid,
+      msg,
+      `${msg}. Co-editing will keep retrying.`,
+    );
   }
 }
 
@@ -1230,7 +1545,7 @@ export async function resumeSessionFlow(
   // Cross-WINDOW guard: another window holding this room live claims its
   // synthetic key in the duplicate-open registry; probing it also focuses
   // that window (so the user lands on the live session, not an error).
-  if (await roomLiveElsewhere(roomId)) {
+  if (!opts?.durableRoom && await roomLiveElsewhere(roomId)) {
     showToast('That session is already open in another CardMirror window.');
     return true; // live elsewhere — an invite/row for it is redundant here
   }
@@ -1456,7 +1771,7 @@ async function endOrLeaveSession(sess: ActiveSession): Promise<boolean> {
   const cleared = teardownSession(sess);
   if (wasChip) updateChip(null);
   await cleared; // record actually gone before we return
-  await discardRecoveryJournalIfSynced(sess);
+  await discardRecoveryJournal(sess);
   return true;
 }
 
@@ -1470,6 +1785,17 @@ async function closeKeepResumableSession(uid: string): Promise<boolean> {
   if (!sess) return true;
   const wasChip = isChipSession(sess.ownerUid);
   await sess.session.stop(); // disconnect only — the room + record survive
+  if (sess.session.durableRoom) {
+    if (!(await sess.persist.verifiedFlush())) {
+      sess.session.start(); // reconnect; the session stays live, caller aborts
+      return false;
+    }
+    const cleared = teardownSession(sess, /* keepRecord */ true, /* preserveSharedDoc */ true);
+    if (wasChip) updateChip(null);
+    await cleared;
+    await discardRecoveryJournal(sess);
+    return true;
+  }
   // Capture the final state (incl. any still-unsynced edits) AFTER the drain so
   // sentVersion is accurate — VERIFIED: the close path drops the recovery
   // journal, so this record is about to be the doc's only copy. A silent

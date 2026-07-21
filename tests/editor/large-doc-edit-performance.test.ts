@@ -7,6 +7,7 @@ import {
   markUnreadPlugin,
 } from '../../src/editor/mark-unread-plugin.js';
 import {
+  MAX_SELF_REF_RENDER_DOC_SIZE,
   makeSelfRefPlugin,
   selfRefPerfProbe,
 } from '../../src/editor/self-transclusion-plugin.js';
@@ -105,6 +106,28 @@ describe('large-doc edit fast paths', () => {
     });
     expect(mirrored).toContain('alpha beta');
     expect(selfRefPerfProbe.rederiveScans).toBeGreaterThan(0);
+  });
+
+  it('bounds derived self-ref render content so large docs do not balloon', () => {
+    const largeBody = 'x'.repeat(9_000);
+    const doc = docOf([
+      block('Source', 'src'),
+      card('A', largeBody),
+      block('Other', 'other'),
+      createSelfRefNode(schema, 'src', 'Source'),
+      createSelfRefNode(schema, 'src', 'Source'),
+    ]);
+    let state = EditorState.create({ doc, plugins: [makeSelfRefPlugin()] });
+
+    state = state.apply(state.tr.insertText('!', bodyEnd(state.doc, largeBody)));
+
+    const renderedSizes: number[] = [];
+    state.doc.descendants((node) => {
+      if (node.type.name === 'self_ref') renderedSizes.push(node.content.size);
+      return true;
+    });
+    expect(state.doc.nodeSize).toBeLessThanOrEqual(MAX_SELF_REF_RENDER_DOC_SIZE);
+    expect(renderedSizes.filter((size) => size > 0)).toHaveLength(1);
   });
 
   it('scopes absorption to the touched top-level neighborhood on ordinary typing', () => {

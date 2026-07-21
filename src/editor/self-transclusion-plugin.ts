@@ -20,7 +20,7 @@
 
 import { Plugin, PluginKey } from 'prosemirror-state';
 import type { Transaction, EditorState } from 'prosemirror-state';
-import type { Node as PMNode, Fragment } from 'prosemirror-model';
+import { Fragment, type Node as PMNode } from 'prosemirror-model';
 import { isSelfRef, makeProjectionResolver } from './self-transclusion.js';
 import { rewriteHeadingIdsInFragment } from './transclusion.js';
 
@@ -32,6 +32,8 @@ export const selfRefPluginKey = new PluginKey<SelfRefState>('selfRefContent');
 export const selfRefPerfProbe = {
   rederiveScans: 0,
 };
+export const MAX_SELF_REF_RENDER_CONTENT_SIZE = 20_000;
+export const MAX_SELF_REF_RENDER_DOC_SIZE = 20_000;
 
 /** Meta stamped on the plugin's own re-derive transaction: the read-only filter
  *  lets it through, and appendTransaction won't re-fire on its own output. */
@@ -104,6 +106,16 @@ function affectedRange(
   return { oldFrom, oldTo, newFrom, newTo };
 }
 
+function sharedNodeSize(node: PMNode): number {
+  if (node.isText || node.isLeaf) return node.nodeSize;
+  if (isSelfRef(node)) return 2;
+  let contentSize = 0;
+  node.forEach((child) => {
+    contentSize += sharedNodeSize(child);
+  });
+  return contentSize + 2;
+}
+
 /** A transaction re-deriving every stale view's children, or null when all views
  *  already match their projected source. */
 function rederiveTransaction(state: EditorState): Transaction | null {
@@ -111,12 +123,23 @@ function rederiveTransaction(state: EditorState): Transaction | null {
   const doc = state.doc;
   const resolve = makeProjectionResolver(doc);
   const edits: { from: number; to: number; content: Fragment }[] = [];
+  let projectedDocSize = sharedNodeSize(doc);
   doc.descendants((node, pos) => {
     if (!isSelfRef(node)) return true;
     const target = rewriteHeadingIdsInFragment(
       resolve(String(node.attrs['source_heading_id'] ?? '')).content,
       () => '',
     );
+    if (target.size > MAX_SELF_REF_RENDER_CONTENT_SIZE) {
+      if (node.content.size > 0) edits.push({ from: pos + 1, to: pos + node.nodeSize - 1, content: Fragment.empty });
+      return false;
+    }
+    const nextProjectedSize = projectedDocSize + target.size;
+    if (target.size > 0 && nextProjectedSize > MAX_SELF_REF_RENDER_DOC_SIZE) {
+      if (node.content.size > 0) edits.push({ from: pos + 1, to: pos + node.nodeSize - 1, content: Fragment.empty });
+      return false;
+    }
+    projectedDocSize = nextProjectedSize;
     if (!node.content.eq(target)) edits.push({ from: pos + 1, to: pos + node.nodeSize - 1, content: target });
     return false; // a view's children hold no nested view (they're inlined) — don't descend
   });
@@ -150,7 +173,10 @@ export function makeSelfRefPlugin(): Plugin {
           Math.max(0, range.newFrom),
           Math.min(newState.doc.content.size, range.newTo),
         );
-        const count = Math.max(0, prev.count - oldCount + newCount);
+        const estimated = Math.max(0, prev.count - oldCount + newCount);
+        const count = prev.count > 0 || estimated !== prev.count
+          ? countSelfRefs(newState.doc)
+          : estimated;
         return count === prev.count ? prev : { count };
       },
     },
@@ -162,8 +188,11 @@ export function makeSelfRefPlugin(): Plugin {
     },
     appendTransaction(trs, _old, newState) {
       if (!trs.some((t) => t.docChanged)) return null;
-      if (trs.some((t) => t.getMeta(SELF_REF_REDERIVE))) return null; // our own output
       if ((selfRefPluginKey.getState(newState)?.count ?? 0) === 0) return null;
+      // Re-check even when this batch includes our own prior re-derive. A remote
+      // merge can arrive in the same append cascade after the derived-content
+      // refresh; because rederiveTransaction is idempotent, the safe behavior is
+      // to inspect the final doc and only emit when a live view is still stale.
       return rederiveTransaction(newState);
     },
     view(editorView) {

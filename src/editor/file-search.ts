@@ -17,7 +17,7 @@
 
 import type { Node as PMNode } from 'prosemirror-model';
 import { collectHeadings, computeHeadingRange } from './headings.js';
-import { buildDescriptor, type AnchorDescriptor } from './learn-anchor.js';
+import { buildDescriptorIn, flattenDoc, type AnchorDescriptor } from './learn-anchor.js';
 
 /** Structural object kinds that can appear in within-file results. */
 export type FileObjectKind = 'pocket' | 'hat' | 'block' | 'tag' | 'cite' | 'analytic';
@@ -64,6 +64,9 @@ export interface FileEntry {
   name: string;
   /** Last-modified time — the version key for the warm cache. */
   mtimeMs: number;
+  /** On-disk size when the lister provided it — the evidence indexer skips
+   *  pathological giants instead of reading them into renderer memory. */
+  size?: number;
   /** Optional pre-lowercased combined search text for hot search paths. */
   searchText?: string;
 }
@@ -123,6 +126,8 @@ export interface EvidenceSearchRow {
   anchor: AnchorDescriptor;
   from: number;
   to: number;
+  /** Optional pre-lowercased primary text for hot search paths. */
+  textLower?: string;
   /** Optional pre-lowercased combined search text for hot search paths. */
   searchText?: string;
 }
@@ -296,30 +301,83 @@ function evidenceKindForNode(type: string): EvidenceRowKind | null {
   return null;
 }
 
+/** Preview window centered on the match. A row can qualify via a SECONDARY
+ *  field (label/filename/folder) that isn't in `text` at all, so not every
+ *  token is guaranteed to appear here — but when several ARE, the window
+ *  spans from the earliest to the latest hit instead of just the first
+ *  query token, so a multi-word match doesn't read as if only one word had
+ *  been searched. */
 function snippetFor(text: string, query: string): string {
   const clean = text.replace(/\s+/g, ' ').trim();
+  const lower = clean.toLowerCase();
   const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
-  const first = tokens.find((tok) => clean.toLowerCase().includes(tok));
-  if (!first) return clean.length > 150 ? `${clean.slice(0, 147)}...` : clean;
-  const at = clean.toLowerCase().indexOf(first);
-  const from = Math.max(0, at - 52);
-  const to = Math.min(clean.length, at + Math.max(first.length, 1) + 90);
+  const hits = tokens
+    .map((tok) => ({ tok, at: lower.indexOf(tok) }))
+    .filter((h) => h.at >= 0);
+  if (hits.length === 0) return clean.length > 150 ? `${clean.slice(0, 147)}...` : clean;
+  const firstAt = Math.min(...hits.map((h) => h.at));
+  const lastHit = hits.reduce((a, b) => (b.at > a.at ? b : a));
+  const lastEnd = lastHit.at + Math.max(lastHit.tok.length, 1);
+  const from = Math.max(0, firstAt - 52);
+  const to = Math.min(clean.length, Math.max(firstAt + 90, lastEnd + 20));
   const prefix = from > 0 ? '...' : '';
   const suffix = to < clean.length ? '...' : '';
   return `${prefix}${clean.slice(from, to)}${suffix}`;
+}
+
+/** Cap on the stored `anchor.quote` for an evidence row. A card body can run
+ *  thousands of chars; without a cap the quote silently duplicates the row's
+ *  full text a second time (the anchor's prefix/suffix context is already
+ *  enough to relocate it uniquely). See `buildDescriptorIn` in
+ *  learn-anchor.ts. */
+const EVIDENCE_ANCHOR_MAX_QUOTE = 400;
+
+/** Per-file cap on the memory-heavy full-body rows (`body` / `paragraph`).
+ *  EVERY structural row (pocket/hat/block/tag/cite/analytic/undertag) is
+ *  always kept — those are short and are what users actually search (tag
+ *  text, author/date cites) — but a single huge backfile can hold hundreds
+ *  of long card bodies. Without a per-file cap those early giant files fill
+ *  the global row budget (EVIDENCE_MAX_TOTAL_ROWS) before the walk ever
+ *  reaches later files, so the tail of the library becomes unsearchable —
+ *  the "doesn't go through everything" report (field 2026-07-20). Capping
+ *  bodies per file keeps every file represented under the same global
+ *  budget; only the deep body text of unusually large files is trimmed
+ *  (its tags/cites still index in full, and the on-disk cache is unchanged
+ *  for the in-file dive). */
+const EVIDENCE_MAX_BODY_ROWS_PER_FILE = 80;
+
+/** Body-like kinds whose per-file count is bounded (the long, heavy rows). */
+function isBodyEvidenceKind(kind: EvidenceRowKind): boolean {
+  return kind === 'body' || kind === 'paragraph';
 }
 
 /** Full-text evidence index for the Search Evidence command.
  *  This walks every searchable textblock, not only headings, so body text,
  *  tags, analytics, and cite paragraphs all surface as openable results.
  *  Each row stores an AnchorDescriptor, allowing the opener to re-locate the
- *  text after a `.docx` import or small edits shift raw positions. */
+ *  text after a `.docx` import or small edits shift raw positions.
+ *
+ *  Rows deliberately leave `textLower` / `searchText` unset here: every
+ *  producer (the index worker, the main-thread fallback, and cache
+ *  hydration) already fills `searchText` via `??=` right after extraction,
+ *  and `textLower` is filled lazily — memoized onto the row the first time
+ *  a search actually scans it (see the `??=` in `searchEvidenceRows[Async]`),
+ *  not recomputed every keystroke. A row never searched this session never
+ *  pays for either field. Keeping the row itself minimal at rest is what
+ *  lets a fixed row budget cover more of the corpus (slimmer-rows follow-up
+ *  to field bug 2026-07-20). */
 export function extractEvidenceRows(
   doc: PMNode,
   file: FileEntry,
 ): EvidenceSearchRow[] {
   const rows: EvidenceSearchRow[] = [];
   let currentStructuralLabel = '';
+  let bodyRowCount = 0;
+  // Flatten ONCE for the whole file. buildDescriptor() flattens internally,
+  // so calling it per row was O(rows x docSize) — 102 s and 2.7 GB on a
+  // single 0.5 MB debate file, which is what crashed Search Evidence
+  // (field bug 2026-07-20).
+  const flat = flattenDoc(doc);
   doc.descendants((node, pos) => {
     const kind = evidenceKindForNode(node.type.name);
     if (!kind || !node.isTextblock) return true;
@@ -334,6 +392,15 @@ export function extractEvidenceRows(
     ) {
       currentStructuralLabel = text;
     }
+    // Bound the long body rows per file so one huge backfile can't crowd
+    // later files out of the global row budget (see the constant's note).
+    // `descendants` returning true still recurses into the skipped node's
+    // children — but a card_body / paragraph textblock has only inline
+    // content, so nothing searchable is lost by not emitting a row for it.
+    if (isBodyEvidenceKind(kind)) {
+      if (bodyRowCount >= EVIDENCE_MAX_BODY_ROWS_PER_FILE) return true;
+      bodyRowCount += 1;
+    }
     const from = pos + 1;
     const to = pos + 1 + node.content.size;
     const fileName = stripFileExt(baseName(file.name));
@@ -346,11 +413,13 @@ export function extractEvidenceRows(
       mtimeMs: file.mtimeMs,
       label,
       text,
-      snippet: text,
-      anchor: buildDescriptor(doc, from, to),
+      // Always overwritten with a trimmed snippetFor() result before a row
+      // reaches the UI (both searchEvidenceRows branches do this) — storing
+      // the full text here a second time would be pure waste.
+      snippet: '',
+      anchor: buildDescriptorIn(flat, from, to, EVIDENCE_ANCHOR_MAX_QUOTE),
       from,
       to,
-      searchText: `${text.toLowerCase()} ${label.toLowerCase()} ${fileName.toLowerCase()} ${dirName(file.relPath).toLowerCase()}`,
     });
     return true;
   });
@@ -385,7 +454,13 @@ export function searchEvidenceRows(
   const perTierLimit = Number.isFinite(finiteLimit) ? Math.max(finiteLimit * 4, finiteLimit) : Number.POSITIVE_INFINITY;
   for (let index = 0; index < scanLimit; index += 1) {
     const row = rows[index]!;
-    const tier = matchTierLower(row.text.toLowerCase(), evidenceSearchText(row), tokens, q, t0);
+    // Cache the lowercase form on the row itself (once, ever): rows are kept
+    // in memory across the whole session, so leaving this uncached made every
+    // query re-lowercase every scanned row's full text — a real regression
+    // once `extractEvidenceRows` stopped precomputing it up front (slimmer
+    // rows, field bug 2026-07-20).
+    const textLower = (row.textLower ??= row.text.toLowerCase());
+    const tier = matchTierLower(textLower, evidenceSearchText(row), tokens, q, t0);
     if (tier === null) continue;
     const bucket = buckets[tier]!;
     if (bucket.length < perTierLimit) bucket.push(row);
@@ -472,7 +547,8 @@ export async function searchEvidenceRowsAsync(
   for (let index = 0; index < scanLimit; index += 1) {
     throwIfEvidenceSearchAborted(opts.signal);
     const row = rows[index]!;
-    const tier = matchTierLower(row.text.toLowerCase(), evidenceSearchText(row), tokens, q, t0);
+    const textLower = (row.textLower ??= row.text.toLowerCase());
+    const tier = matchTierLower(textLower, evidenceSearchText(row), tokens, q, t0);
     if (tier !== null) {
       const bucket = buckets[tier]!;
       if (bucket.length < perTierLimit) bucket.push(row);

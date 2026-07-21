@@ -82,28 +82,26 @@ function imageFingerprint(node: PMNode): string {
 }
 
 function flatten(doc: PMNode): Flat {
-  let text = '';
+  // Collect whole runs and join once: appending char-by-char built a rope of
+  // one node per character, which dominated flatten's cost on big documents.
+  const parts: string[] = [];
   const pos: number[] = [];
   doc.descendants((node, p) => {
     if (node.isText) {
       const t = node.text ?? '';
-      for (let i = 0; i < t.length; i++) {
-        text += t[i];
-        pos.push(p + i);
-      }
+      parts.push(t);
+      for (let i = 0; i < t.length; i++) pos.push(p + i);
     } else if (node.type.name === 'image') {
       // Emit a sentinel token for the image; every char maps to the
       // image's own position, so a quote of just the sentinel resolves to
       // the image's [p, p+1) range.
       const s = OBJ + imageFingerprint(node);
-      for (let i = 0; i < s.length; i++) {
-        text += s[i];
-        pos.push(p);
-      }
+      parts.push(s);
+      for (let i = 0; i < s.length; i++) pos.push(p);
     }
     return true;
   });
-  return { text, pos };
+  return { text: parts.join(''), pos };
 }
 
 /** PM position just after flat char `idx-1` (i.e. the right edge of the
@@ -115,18 +113,61 @@ function endPos(flat: Flat, idx: number): number {
 }
 
 /** Build a descriptor for the selection `[from, to)` in `doc`. */
-export function buildDescriptor(doc: PMNode, from: number, to: number): AnchorDescriptor {
-  const flat = flatten(doc);
-  let start = flat.pos.findIndex((p) => p >= from);
-  if (start < 0) start = flat.text.length;
-  let end = flat.pos.findIndex((p) => p >= to);
-  if (end < 0) end = flat.text.length;
+/** First flat index whose PM position is >= `target`, or `pos.length` when
+ *  none is. `pos` is ascending, so this is a binary search — the old linear
+ *  `findIndex` made bulk descriptor building O(rows x docSize). */
+function firstIndexAtOrAfter(pos: readonly number[], target: number): number {
+  let lo = 0;
+  let hi = pos.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (pos[mid]! >= target) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
+}
+
+/** Build a descriptor against an ALREADY-FLATTENED doc.
+ *
+ *  Use this whenever building many descriptors for one document: `flatten`
+ *  walks the whole doc and allocates a full text string plus a
+ *  position-per-character array, so calling `buildDescriptor` per row is
+ *  O(rows x docSize) in both time and memory. Indexing one 0.5 MB debate
+ *  file that way took 102 s and 2.7 GB — the Search Evidence crash (field
+ *  bug 2026-07-20). Flatten once, then call this per range.
+ *
+ *  `maxQuoteLen` bounds the stored quote (unbounded by default, for the
+ *  single-selection callers below). The bulk evidence indexer passes a cap:
+ *  a card body can run thousands of chars, and without a cap the quote
+ *  duplicates the row's full text a second time in memory — the dominant
+ *  cost in the "11 KB/row" evidence-index budget (field bug 2026-07-20,
+ *  slimmer-rows follow-up). The stored prefix/suffix context is enough to
+ *  relocate the passage uniquely even with a short quote; re-opening a
+ *  capped row selects the first `maxQuoteLen` chars of it rather than the
+ *  whole block. */
+export function buildDescriptorIn(
+  flat: Flat,
+  from: number,
+  to: number,
+  maxQuoteLen = Number.POSITIVE_INFINITY,
+): AnchorDescriptor {
+  let start = firstIndexAtOrAfter(flat.pos, from);
+  if (start >= flat.pos.length) start = flat.text.length;
+  let end = firstIndexAtOrAfter(flat.pos, to);
+  if (end >= flat.pos.length) end = flat.text.length;
+  if (end - start > maxQuoteLen) end = start + maxQuoteLen;
   return {
     quote: flat.text.slice(start, end),
     prefix: flat.text.slice(Math.max(0, start - CONTEXT), start),
     suffix: flat.text.slice(end, end + CONTEXT),
     approxPos: start,
   };
+}
+
+/** Single-shot descriptor for one range (a user selection). Flattens the doc;
+ *  for bulk use `flattenDoc` + `buildDescriptorIn`. */
+export function buildDescriptor(doc: PMNode, from: number, to: number): AnchorDescriptor {
+  return buildDescriptorIn(flatten(doc), from, to);
 }
 
 /** Length of the common suffix of `a` and the trailing of `b` (how well a

@@ -48,8 +48,15 @@ async function loadDesktopModules() {
   return { homeScreen: home.homeScreen, store };
 }
 
-async function flush(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 0));
+/** The Sessions section renders after async IndexedDB reads; under a loaded
+ *  parallel test run one macrotask is not always enough. Poll until the
+ *  section has rows (or time out and let the assertions report). */
+async function flush(until?: () => boolean): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  do {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    if (!until || until()) return;
+  } while (Date.now() < deadline);
 }
 
 describe('home screen collaboration sessions', () => {
@@ -72,7 +79,7 @@ describe('home screen collaboration sessions', () => {
     try {
       homeScreen.mount(document.body, callbacks());
       homeScreen.show();
-      await flush();
+      await flush(() => (document.body.textContent ?? '').includes('Invite session'));
 
       expect(document.body.textContent).not.toContain('Shared brief.cmir');
       expect(document.body.textContent).toContain('Invite session');

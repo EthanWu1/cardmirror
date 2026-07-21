@@ -32,11 +32,33 @@ export function captureFocusForDialog(): () => void {
   };
 }
 
+/** Semantic dialog icon kinds — one visual system for every modal:
+ *  info (blue i), question (blue ?), warning (amber triangle !),
+ *  danger (red !). */
+export type DialogIconKind = 'info' | 'question' | 'warning' | 'danger';
+
+const DIALOG_ICON_GLYPHS: Record<DialogIconKind, string> = {
+  info: 'i',
+  question: '?',
+  warning: '!',
+  danger: '!',
+};
+
+/** Build the shared dialog icon badge. Exported so one-off dialogs
+ *  (unsaved-close, save-as, in-editor confirm) render the same family. */
+export function dialogIconEl(kind: DialogIconKind): HTMLSpanElement {
+  const icon = document.createElement('span');
+  icon.className = `pmd-alert-icon pmd-alert-icon-${kind}`;
+  icon.setAttribute('aria-hidden', 'true');
+  icon.textContent = DIALOG_ICON_GLYPHS[kind];
+  return icon;
+}
+
 function appendAlertContent(
   dialog: HTMLElement,
   message: string,
   title = 'CardMirror',
-  opts: { icon?: boolean } = {},
+  opts: { icon?: DialogIconKind | false } = {},
 ): void {
   const header = document.createElement('div');
   header.className = 'pmd-alert-title';
@@ -46,11 +68,7 @@ function appendAlertContent(
   const row = document.createElement('div');
   row.className = 'pmd-alert-row';
   if (opts.icon !== false) {
-    const icon = document.createElement('span');
-    icon.className = 'pmd-alert-icon';
-    icon.setAttribute('aria-hidden', 'true');
-    icon.textContent = '!';
-    row.appendChild(icon);
+    row.appendChild(dialogIconEl(opts.icon ?? 'warning'));
   } else {
     row.classList.add('pmd-alert-row-no-icon');
   }
@@ -406,14 +424,19 @@ export function promptForRouteChoice<T extends string>(
  *  to the webContents on dismiss — the editor keeps its selection and takes
  *  mouse events but no keystrokes until a reload (field bugs 2026-07-03 and
  *  2026-07-11; renderer-side `.focus()` after the alert does NOT fix it). */
-export function alertDialog(message: string, opts?: { title?: string }): Promise<void> {
+export function alertDialog(
+  message: string,
+  opts?: { title?: string; icon?: DialogIconKind },
+): Promise<void> {
   return new Promise((resolve) => {
     const restoreFocus = captureFocusForDialog();
     const overlay = document.createElement('div');
     overlay.className = 'pmd-route-overlay';
     const dialog = document.createElement('div');
     dialog.className = 'pmd-route-dialog pmd-text-prompt-dialog pmd-alert-dialog';
-    appendAlertContent(dialog, message, opts?.title ?? 'CardMirror');
+    appendAlertContent(dialog, message, opts?.title ?? 'CardMirror', {
+      icon: opts?.icon ?? 'warning',
+    });
 
     const buttons = document.createElement('div');
     buttons.className = 'pmd-text-prompt-buttons';
@@ -456,6 +479,9 @@ interface ConfirmDialogOptions {
   checkboxLabel?: string;
   checkboxInitial?: boolean;
   danger?: boolean;
+  /** Icon kind, or false for the compact icon-less layout. Defaults to
+   *  'danger' for destructive confirms and 'question' otherwise. */
+  icon?: DialogIconKind | false;
 }
 
 export interface ConfirmDialogResult {
@@ -473,7 +499,9 @@ export function confirmDialogDetailed(
     overlay.className = 'pmd-route-overlay';
     const dialog = document.createElement('div');
     dialog.className = 'pmd-route-dialog pmd-text-prompt-dialog pmd-alert-dialog';
-    appendAlertContent(dialog, message, opts?.title ?? 'CardMirror', { icon: false });
+    appendAlertContent(dialog, message, opts?.title ?? 'CardMirror', {
+      icon: opts?.icon ?? (opts?.danger ? 'danger' : 'question'),
+    });
 
     const buttons = document.createElement('div');
     buttons.className = 'pmd-text-prompt-buttons';
