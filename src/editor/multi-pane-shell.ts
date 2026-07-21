@@ -151,6 +151,13 @@ function newDocUid(): string {
   return `doc-${nextDocUid++}`;
 }
 
+/** Per-record scroll memory (editor body + nav body scrollTop). Switching
+ *  tabs within a slot swaps the shared `.pmd-pane-body` / `.pmd-multi-nav-body`
+ *  child, which collapses those scrollers to the top — so without this each
+ *  doc would jump to the top of both the document and its outline every time
+ *  you came back to its tab. Keyed by record so it never leaks. */
+const paneScrollMemory = new WeakMap<PaneRecord, { editor: number; nav: number }>();
+
 /** Two pane arrangements are identical (same panes, order, tabs, visible tab)?
  *  Used to skip a no-op drag-to-split reflow. */
 function paneLayoutsEqual(a: readonly PaneLayout[], b: readonly PaneLayout[]): boolean {
@@ -1274,6 +1281,10 @@ class Slot {
   private detachVisible(): void {
     const rec = this.visible;
     if (!rec) return;
+    // Remember this doc's scroll before its DOM leaves the (shared) scrollers,
+    // so returning to its tab lands where the user left off in both the
+    // document and its outline.
+    paneScrollMemory.set(rec, { editor: this.bodyEl.scrollTop, nav: this.navBodyEl.scrollTop });
     if (rec.editorEl.parentElement === this.bodyEl) {
       this.bodyEl.removeChild(rec.editorEl);
     }
@@ -1295,6 +1306,16 @@ class Slot {
     this.paneEl.classList.toggle('pmd-pane-flow', isFlowRecord(rec));
     this.bodyEl.appendChild(rec.editorEl);
     if (isDocRecord(rec)) this.navBodyEl.appendChild(rec.navEl);
+    // Restore this doc's remembered scroll (0 for a never-shown doc). Apply
+    // now AND next frame: the editor's full height may not be laid out on the
+    // synchronous mount, which would clamp the first set short.
+    const saved = paneScrollMemory.get(rec);
+    const applyScroll = (): void => {
+      this.bodyEl.scrollTop = saved?.editor ?? 0;
+      this.navBodyEl.scrollTop = saved?.nav ?? 0;
+    };
+    applyScroll();
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(applyScroll);
     this.chipNameEl.textContent = rec.filename;
     this.refreshChip();
     this.refreshWordCount();
