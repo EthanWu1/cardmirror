@@ -1374,6 +1374,15 @@ html:has(body.pmd-speech-banner-visible) {
 body.pmd-host-electron #ribbon .ribbon-window-btn {
   display: inline-flex;
 }
+/* macOS: the window uses native hidden-inset controls (traffic lights, top
+   left) so the OS can tile/snap it — hide the app's own window buttons, and
+   pad the ribbon's left edge so its content clears the traffic lights. */
+body.pmd-mac #ribbon .ribbon-window-btn {
+  display: none;
+}
+body.pmd-mac #ribbon {
+  padding-left: 78px;
+}
 #ribbon .ribbon-window-close-btn:hover:not(:disabled) {
   background: color-mix(in srgb, var(--pmd-c-danger) 86%, transparent);
   color: var(--pmd-c-text-on-accent);

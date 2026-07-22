@@ -324,6 +324,7 @@ const skipCloseConfirm = new Set<number>();
 let quitInitiated = false;
 
 function createWindow(initialDoc?: InitialDocPayload): BrowserWindow {
+  const isMac = process.platform === 'darwin';
   const win = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -335,7 +336,17 @@ function createWindow(initialDoc?: InitialDocPayload): BrowserWindow {
     // degradation from there.
     minWidth: 0,
     minHeight: 0,
-    frame: false,
+    // macOS: a standard *titled* window with the title bar hidden — so the OS
+    // treats it as a real window (green-button "Tile Window Left/Right", edge
+    // snap, and third-party tilers all work) while the custom chrome shows
+    // through. A fully frameless window (frame:false) loses all of that on
+    // macOS. Windows/Linux keep the frameless chrome + custom controls, where
+    // Aero Snap / Win+arrow already work frameless. The traffic lights sit
+    // inset over the ribbon (the renderer insets ribbon content for them and
+    // hides its own window buttons on mac).
+    ...(isMac
+      ? { titleBarStyle: 'hiddenInset' as const, trafficLightPosition: { x: 16, y: 24 } }
+      : { frame: false }),
     resizable: true,
     title: 'CardMirror',
     webPreferences: {

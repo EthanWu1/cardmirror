@@ -80,11 +80,24 @@ export const namedStyleNormalizerPlugin: Plugin = new Plugin({
           tr.removeMark(pos, pos + node.nodeSize, directMark);
           if (!hasNamed) tr.addMark(pos, pos + node.nodeSize, namedMark.create());
         }
-      } else if (isStructural && hasNamed) {
-        // Structural uses direct underline; flip named → direct.
-        if (!tr) tr = newState.tr;
-        tr.removeMark(pos, pos + node.nodeSize, namedMark);
-        if (!hasDirect) tr.addMark(pos, pos + node.nodeSize, directMark.create());
+      } else if (isStructural) {
+        if (hasNamed) {
+          // Structural uses direct underline; flip named → direct.
+          if (!tr) tr = newState.tr;
+          tr.removeMark(pos, pos + node.nodeSize, namedMark);
+          if (!hasDirect) tr.addMark(pos, pos + node.nodeSize, directMark.create());
+        }
+        if (hasCiteOrEmph) {
+          // Cite / emphasis are BODY character styles. On a structural heading
+          // (tag / pocket / hat / block / analytic / undertag) they are always
+          // wrong: a tag that picked one up renders as an emphasis box (or cite
+          // styling) AND perpetuates through copy-paste, since the clipboard
+          // export re-emits the mark and the paste re-imports it. Strip them so
+          // a heading's look always comes from its block style alone.
+          if (!tr) tr = newState.tr;
+          tr.removeMark(pos, pos + node.nodeSize, citeMark);
+          tr.removeMark(pos, pos + node.nodeSize, emphasisMark);
+        }
       }
       return true;
     });
@@ -137,10 +150,18 @@ export function normalizeUnderlineMarks(doc: PMNode): PMNode {
             if (!hasNamed) marks = namedMark.create().addToSet(marks);
             changed = true;
           }
-        } else if (isStructural && hasNamed) {
-          marks = marks.filter((m) => m.type !== namedMark);
-          if (!hasDirect) marks = directMark.create().addToSet(marks);
-          changed = true;
+        } else if (isStructural) {
+          if (hasNamed) {
+            marks = marks.filter((m) => m.type !== namedMark);
+            if (!hasDirect) marks = directMark.create().addToSet(marks);
+            changed = true;
+          }
+          if (hasCiteOrEmph) {
+            // Cite / emphasis never belong on a structural heading (see the
+            // plugin above) — strip so imports land clean.
+            marks = marks.filter((m) => m.type !== citeMark && m.type !== emphasisMark);
+            changed = true;
+          }
         }
         children.push(marks === child.marks ? child : child.mark(marks));
       });

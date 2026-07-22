@@ -333,6 +333,15 @@ document.body.classList.add('pmd-host-' + getHost().kind);
 if (getHost().supportsInPlaceSave) {
   document.body.classList.add('pmd-inplace-save');
 }
+// macOS desktop uses a hidden-inset native title bar (so the OS can tile/snap
+// the window), which shows its own traffic-light controls — so hide the app's
+// custom window buttons there and inset the ribbon for the traffic lights.
+if (
+  getElectronHost() &&
+  (navigator.platform.startsWith('Mac') || navigator.userAgent.includes('Macintosh'))
+) {
+  document.body.classList.add('pmd-mac');
+}
 
 const editorEl = document.getElementById('editor')!;
 /** Single-doc scroll container. `#app` is `position: fixed` +
