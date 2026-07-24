@@ -903,6 +903,8 @@ let multiDocPromptSaveAllForQuit: (() => Promise<boolean>) | null = null;
 /** Whether any pane is unsaved or has a live session — drives the generic
  *  "close this window?" confirm on an otherwise-silent window close. */
 let multiDocHasUnsavedOrLiveForQuit: (() => boolean) | null = null;
+/** Total open tabs across panes — the window close always confirms when > 1. */
+let multiDocOpenTabCount: (() => number) | null = null;
 
 /** Full focused-file plumbing for the Save / Save-As flow — reads
  *  the filename plus the on-disk handle and on-disk format. */
@@ -1035,6 +1037,9 @@ export function enableMultiDocMode(opts: {
    *  uses this to add a generic "close this window?" confirm when the close
    *  would otherwise be silent. */
   hasUnsavedOrLiveForQuit?: () => boolean;
+  /** Total open tabs across all panes — the window-close handler always
+   *  confirms when this is > 1, even if every tab is saved. */
+  openTabCount?: () => number;
   /** Called from single-doc save flows RIGHT BEFORE serializing so a
    *  successful save can mark the focused DocRecord clean + drop its
    *  journal — but only if no edits landed while the write was in
@@ -1092,6 +1097,7 @@ export function enableMultiDocMode(opts: {
   multiDocSetFilenameForUid = opts.setFilenameForUid ?? null;
   multiDocPromptSaveAllForQuit = opts.promptSaveAllForQuit ?? null;
   multiDocHasUnsavedOrLiveForQuit = opts.hasUnsavedOrLiveForQuit ?? null;
+  multiDocOpenTabCount = opts.openTabCount ?? null;
   multiDocCaptureFocusedCleanToken = opts.captureFocusedCleanToken ?? null;
   multiDocOnRecoveredDoc = opts.onRecoveredDoc ?? null;
   multiDocJournalAll = opts.journalAll ?? null;
@@ -8558,16 +8564,23 @@ async function handleUserCloseRequest(): Promise<void> {
   }
 }
 
-/** Generic "close this window?" confirm, shown on a window close that has no
- *  unsaved work of its own to prompt about — the user asked to be warned
- *  before the window closes every time, not only when something is dirty. */
-function confirmCloseWindow(): Promise<boolean> {
-  return confirmDialog('Are you sure you want to close this window?', {
-    title: 'Close window',
-    okLabel: 'Close window',
-    cancelLabel: 'Keep open',
-    icon: 'question',
-  });
+/** "Close this window?" confirm. Count-aware: with more than one tab open it
+ *  spells out how many will close (the user wants confirmation whenever
+ *  several tabs would go at once, even if all are saved); a single tab gets
+ *  the plain wording. */
+function confirmCloseWindow(tabCount: number): Promise<boolean> {
+  const multi = tabCount > 1;
+  return confirmDialog(
+    multi
+      ? `This window has ${tabCount} tabs open. Close them all?`
+      : 'Are you sure you want to close this window?',
+    {
+      title: 'Close window',
+      okLabel: multi ? 'Close all tabs' : 'Close window',
+      cancelLabel: 'Keep open',
+      icon: 'question',
+    },
+  );
 }
 
 async function handleUserCloseRequestInner(
@@ -8580,13 +8593,16 @@ async function handleUserCloseRequestInner(
   // aborts the quit via `cancelClose` so a later ordinary close still leaves the
   // app in the dock on macOS.
   if (multiDocActive) {
-    // Always warn before the window closes. When panes are unsaved (or have a
-    // live session), promptSaveAllForQuit IS the warning; when everything is
-    // clean the close would otherwise be silent, so add a generic confirm.
+    // Always confirm the window close. Fire the generic confirm when MORE THAN
+    // ONE tab is open (even if all saved — closing loses the whole set), or
+    // when nothing is dirty/live (an otherwise-silent close). A single dirty
+    // tab falls straight through to its own save prompt, which is the
+    // confirmation. `promptSaveAllForQuit` then still handles any unsaved work.
+    const tabCount = multiDocOpenTabCount ? multiDocOpenTabCount() : 1;
     const needsSavePrompt = multiDocHasUnsavedOrLiveForQuit
       ? multiDocHasUnsavedOrLiveForQuit()
       : false;
-    if (!needsSavePrompt && !(await confirmCloseWindow())) {
+    if ((tabCount > 1 || !needsSavePrompt) && !(await confirmCloseWindow(tabCount))) {
       await electronHost.cancelClose?.();
       return;
     }
@@ -8635,8 +8651,9 @@ async function handleUserCloseRequestInner(
   }
   if (!activeContentDirty()) {
     // Nothing unsaved — still confirm the window close (the user asked to be
-    // warned every time, not only when there's unsaved work).
-    if (!(await confirmCloseWindow())) {
+    // warned every time, not only when there's unsaved work). Single-doc mode
+    // is one tab.
+    if (!(await confirmCloseWindow(1))) {
       await electronHost.cancelClose?.();
       return;
     }

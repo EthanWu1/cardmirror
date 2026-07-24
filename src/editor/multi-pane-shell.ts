@@ -1333,10 +1333,13 @@ class Slot {
     // outline scroll is retried until the list is tall enough for it to stick.
     const saved = paneScrollMemory.get(rec);
     if (saved?.anchor && isDocRecord(rec)) {
-      // Refine over a few ticks: coordsAtPos forces a synchronous layout so the
-      // measurement is exact, and re-measuring lets the scroll converge as the
-      // virtualized cards materialize. setTimeout (not rAF) so it still runs
-      // when the window is backgrounded — rAF is throttled to a halt there.
+      // Land the scroll on the FIRST pass SYNCHRONOUSLY — before the browser
+      // paints — so the pane never flashes at the top and then jumps (the
+      // "glitch then reset"). coordsAtPos forces a synchronous layout, so the
+      // measurement is valid immediately after the mount. Follow-up passes then
+      // refine (on setTimeout, not rAF, which is throttled to a halt in a
+      // backgrounded window) as the virtualized cards materialize their true
+      // heights, but those are small settles, not a jump from 0.
       const { pos, topBefore } = saved.anchor;
       const view = rec.view;
       const refine = (tries: number): void => {
@@ -1352,7 +1355,7 @@ class Slot {
         this.bodyEl.scrollTop += delta;
         if (tries > 0) setTimeout(() => refine(tries - 1), 16);
       };
-      setTimeout(() => refine(8), 0);
+      refine(6);
     } else {
       this.bodyEl.scrollTop = 0;
     }
@@ -1363,7 +1366,7 @@ class Slot {
         setTimeout(() => restoreNav(tries - 1), 16);
       }
     };
-    setTimeout(() => restoreNav(6), 0);
+    restoreNav(4);
     this.chipNameEl.textContent = rec.filename;
     this.refreshChip();
     this.refreshWordCount();
@@ -2701,6 +2704,12 @@ class MultiPaneShell {
       if (!(await this.slots[id].promptSaveDirtyForQuit())) return false;
     }
     return true;
+  }
+
+  /** Total open tabs across all panes — the close handler confirms a window
+   *  close whenever this is > 1, even when every tab is saved. */
+  openTabCount(): number {
+    return SLOT_IDS.reduce((n, id) => n + this.slots[id].stack.length, 0);
   }
 
   /** Does any open pane have unsaved changes OR a live co-editing session?
@@ -4556,6 +4565,7 @@ export function mountMultiPaneShell(): void {
     markDirtyForUid: (uid) => shell!.markDirtyForUid(uid),
     promptSaveAllForQuit: () => shell!.promptSaveAllForQuit(),
     hasUnsavedOrLiveForQuit: () => shell!.anyUnsavedOrLiveForQuit(),
+    openTabCount: () => shell!.openTabCount(),
     onRecoveredDoc: (entry) => shell!.onRecoveredDoc(entry),
     journalAll: () => shell!.journalAll(),
     reduceToFocusedForModeSwitch: () => shell!.reduceToFocusedForModeSwitch(),
