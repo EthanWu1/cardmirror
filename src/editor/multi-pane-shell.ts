@@ -151,12 +151,23 @@ function newDocUid(): string {
   return `doc-${nextDocUid++}`;
 }
 
-/** Per-record scroll memory (editor body + nav body scrollTop). Switching
- *  tabs within a slot swaps the shared `.pmd-pane-body` / `.pmd-multi-nav-body`
- *  child, which collapses those scrollers to the top — so without this each
- *  doc would jump to the top of both the document and its outline every time
- *  you came back to its tab. Keyed by record so it never leaks. */
-const paneScrollMemory = new WeakMap<PaneRecord, { editor: number; nav: number }>();
+/** Per-record scroll memory for tab switches. Switching tabs within a slot
+ *  swaps the shared `.pmd-pane-body` / `.pmd-multi-nav-body` child, collapsing
+ *  those scrollers to the top — so without this each doc would jump to the top
+ *  of both the document and its outline every time you came back to its tab.
+ *
+ *  The EDITOR anchors to the CARET's doc position (its pane-relative Y), NOT a
+ *  raw scrollTop: the document virtualizes cards (`content-visibility: auto`),
+ *  so a saved pixel offset lands ABOVE the real spot on return — the cards
+ *  between top and target haven't materialized their true heights yet, so the
+ *  scroller is shorter than final and the restore clamps short. `coordsAtPos`
+ *  re-measures the caret's real position across several frames and lands
+ *  exactly on it (and works regardless of card gutters, unlike a hit-test).
+ *  The outline (a plain list) uses a scrollTop retried until it sticks. */
+const paneScrollMemory = new WeakMap<
+  PaneRecord,
+  { anchor: { pos: number; topBefore: number } | null; nav: number }
+>();
 
 /** Two pane arrangements are identical (same panes, order, tabs, visible tab)?
  *  Used to skip a no-op drag-to-split reflow. */
@@ -1281,10 +1292,20 @@ class Slot {
   private detachVisible(): void {
     const rec = this.visible;
     if (!rec) return;
-    // Remember this doc's scroll before its DOM leaves the (shared) scrollers,
-    // so returning to its tab lands where the user left off in both the
-    // document and its outline.
-    paneScrollMemory.set(rec, { editor: this.bodyEl.scrollTop, nav: this.navBodyEl.scrollTop });
+    // Remember where the user was before this doc's DOM leaves the (shared)
+    // scrollers — the caret's doc position + its current offset from the pane
+    // top for the document, a scrollTop for the outline.
+    let anchor: { pos: number; topBefore: number } | null = null;
+    if (isDocRecord(rec) && (rec.view.dom as HTMLElement).isConnected) {
+      try {
+        const pos = rec.view.state.selection.head;
+        const y = rec.view.coordsAtPos(pos).top - this.bodyEl.getBoundingClientRect().top;
+        anchor = { pos, topBefore: y };
+      } catch {
+        anchor = null;
+      }
+    }
+    paneScrollMemory.set(rec, { anchor, nav: this.navBodyEl.scrollTop });
     if (rec.editorEl.parentElement === this.bodyEl) {
       this.bodyEl.removeChild(rec.editorEl);
     }
@@ -1306,16 +1327,43 @@ class Slot {
     this.paneEl.classList.toggle('pmd-pane-flow', isFlowRecord(rec));
     this.bodyEl.appendChild(rec.editorEl);
     if (isDocRecord(rec)) this.navBodyEl.appendChild(rec.navEl);
-    // Restore this doc's remembered scroll (0 for a never-shown doc). Apply
-    // now AND next frame: the editor's full height may not be laid out on the
-    // synchronous mount, which would clamp the first set short.
+    // Restore where the user was (nothing saved → a never-shown doc starts at
+    // the top). The editor anchor re-measures the caret across frames so it
+    // lands on the exact position even as virtualized cards materialize; the
+    // outline scroll is retried until the list is tall enough for it to stick.
     const saved = paneScrollMemory.get(rec);
-    const applyScroll = (): void => {
-      this.bodyEl.scrollTop = saved?.editor ?? 0;
-      this.navBodyEl.scrollTop = saved?.nav ?? 0;
+    if (saved?.anchor && isDocRecord(rec)) {
+      // Refine over a few ticks: coordsAtPos forces a synchronous layout so the
+      // measurement is exact, and re-measuring lets the scroll converge as the
+      // virtualized cards materialize. setTimeout (not rAF) so it still runs
+      // when the window is backgrounded — rAF is throttled to a halt there.
+      const { pos, topBefore } = saved.anchor;
+      const view = rec.view;
+      const refine = (tries: number): void => {
+        if (!(view.dom as HTMLElement).isConnected) return;
+        let y: number;
+        try {
+          y = view.coordsAtPos(pos).top - this.bodyEl.getBoundingClientRect().top;
+        } catch {
+          return;
+        }
+        const delta = y - topBefore;
+        if (Math.abs(delta) < 1) return;
+        this.bodyEl.scrollTop += delta;
+        if (tries > 0) setTimeout(() => refine(tries - 1), 16);
+      };
+      setTimeout(() => refine(8), 0);
+    } else {
+      this.bodyEl.scrollTop = 0;
+    }
+    const navTarget = saved?.nav ?? 0;
+    const restoreNav = (tries: number): void => {
+      this.navBodyEl.scrollTop = navTarget;
+      if (tries > 0 && Math.abs(this.navBodyEl.scrollTop - navTarget) > 1) {
+        setTimeout(() => restoreNav(tries - 1), 16);
+      }
     };
-    applyScroll();
-    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(applyScroll);
+    setTimeout(() => restoreNav(6), 0);
     this.chipNameEl.textContent = rec.filename;
     this.refreshChip();
     this.refreshWordCount();
