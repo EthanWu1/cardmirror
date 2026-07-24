@@ -53,9 +53,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cardmirror-macos
-          path: |
-            apps/desktop/release/*.dmg
-            apps/desktop/release/*.zip
-            apps/desktop/release/latest-mac.yml
-            apps/desktop/release/*.blockmap
+          # Only the installers (.dmg). The .zip/.blockmap/latest-mac.yml are
+          # auto-update deltas, not needed to install, and uploading them for
+          # both arches (~400-500 MB/run) exhausts the account's Actions
+          # artifact-storage quota — the upload then fails with "Artifact
+          # storage quota has been hit" even though the build succeeded.
+          path: apps/desktop/release/*.dmg
           if-no-files-found: error
+          retention-days: 7

@@ -77,11 +77,13 @@ jobs:
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: cardmirror-mac-artifacts
-          path: |
-            apps/desktop/release/*.dmg
-            apps/desktop/release/*.zip
-            apps/desktop/release/latest-mac.yml
-            apps/desktop/release/*.blockmap
+          name: cardmirror-mac-arm64-dmg
+          # Upload ONLY the Apple-Silicon .dmg. The .zip / .blockmap / latest-
+          # mac.yml are auto-update deltas, not needed to install a test build,
+          # and their combined size (~400-500 MB/run across both arches) is what
+          # exhausts the account's Actions artifact-storage quota — the upload
+          # then fails with "Artifact storage quota has been hit" even though the
+          # build succeeded. Add `*x64.dmg` here if you also need an Intel build.
+          path: apps/desktop/release/*arm64.dmg
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 5
