@@ -156,17 +156,26 @@ function newDocUid(): string {
  *  those scrollers to the top — so without this each doc would jump to the top
  *  of both the document and its outline every time you came back to its tab.
  *
- *  The EDITOR anchors to the CARET's doc position (its pane-relative Y), NOT a
- *  raw scrollTop: the document virtualizes cards (`content-visibility: auto`),
- *  so a saved pixel offset lands ABOVE the real spot on return — the cards
- *  between top and target haven't materialized their true heights yet, so the
- *  scroller is shorter than final and the restore clamps short. `coordsAtPos`
- *  re-measures the caret's real position across several frames and lands
- *  exactly on it (and works regardless of card gutters, unlike a hit-test).
+ *  The EDITOR restore is two-layer, because neither layer alone is right:
+ *    - `scrollTop` is applied first, synchronously. It is exact whenever the
+ *      layout is unchanged (the common case) and, being sync, the pane never
+ *      paints at the top and then jumps.
+ *    - `anchor` then corrects for the document virtualizing its cards
+ *      (`content-visibility: auto`): heights between the top and the target are
+ *      estimates until they materialize, so a pure pixel restore can settle
+ *      slightly off.
+ *  The anchor is a position that was VISIBLE in the viewport, never the caret:
+ *  `coordsAtPos` on an off-screen position measures unrendered content and
+ *  reports an estimate, which is exactly what left the user "slightly above"
+ *  when they had scrolled away from the caret (field 2026-07-24).
  *  The outline (a plain list) uses a scrollTop retried until it sticks. */
 const paneScrollMemory = new WeakMap<
   PaneRecord,
-  { anchor: { pos: number; topBefore: number } | null; nav: number }
+  {
+    scrollTop: number;
+    anchor: { pos: number; topBefore: number } | null;
+    nav: number;
+  }
 >();
 
 /** Two pane arrangements are identical (same panes, order, tabs, visible tab)?
@@ -1287,25 +1296,51 @@ class Slot {
     return true;
   }
 
+  /** A doc position currently visible near the top of this pane, plus its
+   *  offset from the pane's top edge — the reference the scroll restore
+   *  refines against. Deliberately a VISIBLE position: `coordsAtPos` on
+   *  off-screen content measures unrendered (`content-visibility: auto`)
+   *  cards and returns an estimate, which restores to the wrong place.
+   *  Probes a few depths because the first hit-test can land in a card's
+   *  gutter (no text there) and return null. */
+  private captureVisibleAnchor(rec: DocRecord): { pos: number; topBefore: number } | null {
+    const dom = rec.view.dom as HTMLElement;
+    if (!dom.isConnected) return null;
+    const paneTop = this.bodyEl.getBoundingClientRect().top;
+    const domRect = dom.getBoundingClientRect();
+    if (domRect.width <= 0) return null;
+    const left = domRect.left + domRect.width / 2;
+    for (const dy of [4, 24, 64, 140, 260]) {
+      let hit: { pos: number } | null = null;
+      try {
+        hit = rec.view.posAtCoords({ left, top: paneTop + dy });
+      } catch {
+        hit = null;
+      }
+      if (!hit) continue;
+      try {
+        return { pos: hit.pos, topBefore: rec.view.coordsAtPos(hit.pos).top - paneTop };
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
   /** Detach the currently-mounted record's DOM (without destroying
    *  its view — the view stays live for fast swap-back). */
   private detachVisible(): void {
     const rec = this.visible;
     if (!rec) return;
     // Remember where the user was before this doc's DOM leaves the (shared)
-    // scrollers — the caret's doc position + its current offset from the pane
-    // top for the document, a scrollTop for the outline.
-    let anchor: { pos: number; topBefore: number } | null = null;
-    if (isDocRecord(rec) && (rec.view.dom as HTMLElement).isConnected) {
-      try {
-        const pos = rec.view.state.selection.head;
-        const y = rec.view.coordsAtPos(pos).top - this.bodyEl.getBoundingClientRect().top;
-        anchor = { pos, topBefore: y };
-      } catch {
-        anchor = null;
-      }
-    }
-    paneScrollMemory.set(rec, { anchor, nav: this.navBodyEl.scrollTop });
+    // scrollers: the raw scroll offsets, plus a doc position that is currently
+    // ON SCREEN to correct for card virtualization on the way back.
+    const anchor = isDocRecord(rec) ? this.captureVisibleAnchor(rec) : null;
+    paneScrollMemory.set(rec, {
+      scrollTop: this.bodyEl.scrollTop,
+      anchor,
+      nav: this.navBodyEl.scrollTop,
+    });
     if (rec.editorEl.parentElement === this.bodyEl) {
       this.bodyEl.removeChild(rec.editorEl);
     }
@@ -1332,14 +1367,16 @@ class Slot {
     // lands on the exact position even as virtualized cards materialize; the
     // outline scroll is retried until the list is tall enough for it to stick.
     const saved = paneScrollMemory.get(rec);
+    // Put the scroll back SYNCHRONOUSLY — before the browser paints — so the
+    // pane never flashes at the top and then jumps (the "glitch then reset").
+    this.bodyEl.scrollTop = saved?.scrollTop ?? 0;
     if (saved?.anchor && isDocRecord(rec)) {
-      // Land the scroll on the FIRST pass SYNCHRONOUSLY — before the browser
-      // paints — so the pane never flashes at the top and then jumps (the
-      // "glitch then reset"). coordsAtPos forces a synchronous layout, so the
-      // measurement is valid immediately after the mount. Follow-up passes then
-      // refine (on setTimeout, not rAF, which is throttled to a halt in a
-      // backgrounded window) as the virtualized cards materialize their true
-      // heights, but those are small settles, not a jump from 0.
+      // Then correct for virtualization: re-measure the position that WAS at
+      // this offset and nudge until it is again. coordsAtPos forces a
+      // synchronous layout, so the first pass is valid immediately; later
+      // passes settle as off-screen cards materialize their true heights.
+      // setTimeout, not rAF — rAF is throttled to a halt in a backgrounded
+      // window, which had made the whole restore silently no-op.
       const { pos, topBefore } = saved.anchor;
       const view = rec.view;
       const refine = (tries: number): void => {
@@ -1356,8 +1393,6 @@ class Slot {
         if (tries > 0) setTimeout(() => refine(tries - 1), 16);
       };
       refine(6);
-    } else {
-      this.bodyEl.scrollTop = 0;
     }
     const navTarget = saved?.nav ?? 0;
     const restoreNav = (tries: number): void => {

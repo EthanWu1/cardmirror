@@ -3755,6 +3755,21 @@ applyParagraphSpacing();
 // the first Search Evidence open is already fast (desktop only; no-op on
 // the web edition and after the first call).
 startEvidenceWarmup();
+// Warm the collaboration module too. It is lazily imported (it pulls the
+// multi-megabyte Loro CRDT wasm), so the FIRST use — opening a shared .cmir,
+// or hitting Start Session — paid the whole download + wasm instantiate on the
+// critical path: several seconds of "opening…" before the session could go
+// live (field report 2026-07-24). Preloading during idle moves that cost off
+// the moment the user is waiting on. Best-effort: a failure here changes
+// nothing, since every real entry point still awaits `loadCollabUi()`.
+// Plain setTimeout, NOT scheduleIdle/requestIdleCallback: idle callbacks are
+// suspended while the window is backgrounded, so the warm never happened for
+// the user who launches the app and switches away — exactly when it matters.
+setTimeout(() => {
+  void loadCollabUi().catch(() => {
+    /* offline / chunk fetch failed — the on-demand load retries later */
+  });
+}, 4_000);
 applyFormattingPanel(
   settings.get('formattingPanelMode'),
   stylePreview,

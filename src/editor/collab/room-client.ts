@@ -347,7 +347,13 @@ export interface RoomStreamOptions {
 
 const DEFAULT_STREAM_MIN_BACKOFF_MS = 150;
 const DEFAULT_STREAM_MAX_BACKOFF_MS = 8_000;
-const DEFAULT_STREAM_STALL_MS = 90_000;
+/** Read-stall timeout. The relay emits an SSE heartbeat every 25 s (plus
+ *  presence traffic), so silence beyond ~35 s means a half-open socket rather
+ *  than a quiet room — recycle it. Was 90 s, which left a dead-but-"connected"
+ *  stream undetected for a minute and a half; combined with the slow catch-up
+ *  that produced the mid-round desyncs reported 2026-07-24. Must stay
+ *  comfortably ABOVE the relay's heartbeat or healthy streams get churned. */
+const DEFAULT_STREAM_STALL_MS = 35_000;
 const FULL_RETRY_NOTICE_MS = 45_000;
 const MISSING_ROOM_NOTICE_MS = 20_000;
 

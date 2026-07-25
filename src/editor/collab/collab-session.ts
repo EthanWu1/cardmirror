@@ -55,6 +55,19 @@ export const DEFAULT_COLLAB_FLUSH_MS = 120;
  *  belt-and-suspenders catch-up. */
 export const DEGRADED_POLL_MS = 4_000;
 
+/** How often to catch up while the push stream reports CONNECTED.
+ *
+ *  A stream can be "connected" and yet silently deliver nothing — a half-open
+ *  socket (sleep, Wi-Fi handoff, NAT rebind, a proxy that dropped the upstream)
+ *  looks alive to the client until the read-stall watchdog fires. Catch-up used
+ *  to run on `catchUpMs` (5 MINUTES) in that state, so a silently-dead stream
+ *  meant the doc simply stopped receiving for tens of seconds — the "it desyncs
+ *  for ~30 seconds mid-round" report (field 2026-07-24). A catch-up with
+ *  nothing new is one cheap GET that returns an empty page, so polling this
+ *  often is affordable insurance and caps worst-case staleness at a few
+ *  seconds no matter what the stream is doing. */
+export const HEALTHY_POLL_MS = 5_000;
+
 type SyncDoc = Parameters<typeof LoroSyncPlugin>[0]['doc'];
 
 /** Mirrors loro-prosemirror's configLoroTextStyle: PM `inclusive` is the
@@ -519,7 +532,13 @@ export class CollabSession {
     const tick = Math.max(250, Math.min(this.catchUpMs, DEGRADED_POLL_MS));
     this.catchUpTimer = setInterval(() => {
       if (this.stream?.connected) {
-        if (Date.now() - this.lastCatchUpAt >= this.catchUpMs) void this.catchUp();
+        // Connected is NOT proof of delivery: a half-open socket reports
+        // connected while delivering nothing until the stall watchdog fires.
+        // Poll on HEALTHY_POLL_MS anyway (a no-op GET when nothing is new) so
+        // a silently-dead stream costs seconds of staleness, not minutes.
+        if (Date.now() - this.lastCatchUpAt >= Math.min(this.catchUpMs, HEALTHY_POLL_MS)) {
+          void this.catchUp();
+        }
         return;
       }
       void this.catchUp();
