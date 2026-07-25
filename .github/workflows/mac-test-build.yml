@@ -16,6 +16,13 @@ name: macOS test build
 on:
   workflow_dispatch:
 
+# `contents: write` so the build can publish the .dmg to a Release. Release
+# assets do NOT draw on the Actions artifact-storage quota (which repeatedly
+# filled up and failed the upload even though the build succeeded), and they
+# give a stable download URL instead of an expiring zip.
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build mac artifacts
@@ -74,16 +81,31 @@ jobs:
         # the script ends with a bare `electron-builder` call.
         run: npm --prefix apps/desktop run dist -- --publish never
 
-      - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: cardmirror-mac-arm64-dmg
-          # Upload ONLY the Apple-Silicon .dmg. The .zip / .blockmap / latest-
-          # mac.yml are auto-update deltas, not needed to install a test build,
-          # and their combined size (~400-500 MB/run across both arches) is what
-          # exhausts the account's Actions artifact-storage quota — the upload
-          # then fails with "Artifact storage quota has been hit" even though the
-          # build succeeded. Add `*x64.dmg` here if you also need an Intel build.
-          path: apps/desktop/release/*arm64.dmg
-          if-no-files-found: error
-          retention-days: 5
+      - name: Publish the .dmg to the rolling "mac-dev" prerelease
+        # Deliberately a RELEASE asset, not an upload-artifact: release assets
+        # don't count against the Actions artifact-storage quota (which kept
+        # filling up and failing the upload), they don't expire, and the
+        # download URL is stable. ONE rolling tag that gets overwritten each
+        # run, so this can't accumulate storage the way artifacts did.
+        # Uses the preinstalled gh CLI + the automatic GITHUB_TOKEN — no PAT,
+        # no third-party action.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: mac-dev
+        run: |
+          set -euo pipefail
+          # Fails loudly (set -e) when the build produced no arm64 dmg, which is
+          # what we want; head -n1 keeps a stray extra match from corrupting the
+          # single-file argument below.
+          DMG=$(ls apps/desktop/release/*arm64.dmg | head -n1)
+          echo "Publishing $DMG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DMG" --clobber
+          else
+            gh release create "$TAG" "$DMG" \
+              --prerelease \
+              --title "macOS dev build (Apple Silicon)" \
+              --notes "Latest Apple-Silicon .dmg from the \`macOS test build\` workflow. Overwritten by each run; not a versioned release."
+          fi
+          echo "### macOS dev build published" >> "$GITHUB_STEP_SUMMARY"
+          echo "Download: $(gh release view "$TAG" --json url -q .url)" >> "$GITHUB_STEP_SUMMARY"
