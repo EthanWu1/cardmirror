@@ -262,6 +262,33 @@ def _push_to_streams(recipient: str, message: dict) -> None:
 # room id → open stream queues (single-worker only, like _streams)
 _room_streams: dict[str, set["asyncio.Queue[dict]"]] = {}
 
+# room id → recent presence frames [(monotonic_ts, base64_blob), …], newest
+# last. Presence is ephemeral by design (never persisted, never in the DB), but
+# a stream-less peer has no other way to learn who is in the room, so keep a
+# short in-memory tail that `GET /rooms/{id}/presence` can serve. Bounded by
+# both age and count so a busy room cannot grow this without limit.
+PRESENCE_TTL_SECONDS = 20
+PRESENCE_MAX_PER_ROOM = 40
+_room_presence: dict[str, list[tuple[float, str]]] = {}
+
+
+def _remember_presence(room_id: str, b64: str) -> None:
+    now = time.monotonic()
+    tail = [e for e in _room_presence.get(room_id, []) if now - e[0] < PRESENCE_TTL_SECONDS]
+    tail.append((now, b64))
+    _room_presence[room_id] = tail[-PRESENCE_MAX_PER_ROOM:]
+
+
+def _recent_presence(room_id: str) -> list[str]:
+    now = time.monotonic()
+    tail = [e for e in _room_presence.get(room_id, []) if now - e[0] < PRESENCE_TTL_SECONDS]
+    if tail:
+        _room_presence[room_id] = tail
+    else:
+        _room_presence.pop(room_id, None)
+    return [b64 for _ts, b64 in tail]
+
+
 # room id → { client id → that client's live stream queue }. Lets a
 # reconnecting client RECLAIM its own slot: when the same client opens a new
 # stream, its previous stream (often a proxy-orphaned ghost the server never
@@ -773,9 +800,9 @@ def post_room_snapshot(
     dependencies=[Depends(require_relay_token)],
 )
 async def post_room_presence(room_id: str, request: Request) -> JSONResponse:
-    """Ephemeral fan-out only — never stored, never touches the DB (this
-    is the hot path at cursor-move rates). An unknown room simply has no
-    open streams, so the frame goes nowhere."""
+    """Fan out to open streams AND keep briefly in memory so peers without a
+    stream can poll it (see GET below). Never touches the DB — this is the hot
+    path at cursor-move rates."""
     raw = await request.body()
     if not raw:
         raise HTTPException(400, "empty presence")
@@ -783,7 +810,24 @@ async def post_room_presence(room_id: str, request: Request) -> JSONResponse:
         raise HTTPException(413, "presence too large")
     b64 = base64.b64encode(raw).decode("ascii")
     _push_to_room(room_id, {"t": "p", "blob": b64})
+    _remember_presence(room_id, b64)
     return JSONResponse({}, status_code=202)
+
+
+@app.get(
+    "/relay/rooms/{room_id}/presence",
+    dependencies=[Depends(require_relay_token)],
+)
+async def get_room_presence(room_id: str) -> JSONResponse:
+    """Recent presence blobs for peers that cannot hold a stream.
+
+    Presence used to be push-only, so a client whose stream was refused (room
+    at the slot cap) or silently half-open received document updates by polling
+    but NEVER learned who else was in the room: no collaborator avatars, and
+    each side could see the other as absent while edits still flowed — the
+    asymmetric "icons only show on one side" report (field 2026-07-25). The
+    blobs stay opaque ciphertext; the relay only timestamps them."""
+    return JSONResponse({"presence": _recent_presence(room_id)})
 
 
 @app.get("/relay/rooms/{room_id}/stream", dependencies=[Depends(require_relay_token)])

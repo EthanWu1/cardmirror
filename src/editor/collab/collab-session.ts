@@ -543,6 +543,10 @@ export class CollabSession {
       }
       void this.catchUp();
       void this.drainQueue();
+      // Presence is push-only over the stream, so without this a stream-less
+      // peer syncs edits but never sees anyone's avatar — and appears absent
+      // to no one, since its own POSTs still land. Poll it too.
+      void this.pollPresence();
     }, tick);
     this.auditKickoff = setTimeout(() => void this.auditRoomHistory(), this.auditDelayMs);
     this.auditTimer = setInterval(() => void this.auditRoomHistory(), 30 * 60_000);
@@ -1053,6 +1057,27 @@ export class CollabSession {
       await this.client.postPresence(this.roomId, await encryptBlob(this.key, blob));
     } catch {
       /* presence is fire-and-forget */
+    }
+  }
+
+  /** Pull recent presence over REST — the stream-down substitute for the `p`
+   *  frames the push channel would deliver. Without this a peer whose stream
+   *  is refused or half-open shows NO collaborator avatars while still
+   *  appearing present to everyone else (its own POSTs keep landing), which
+   *  reads as "only one side is synced". Fire-and-forget: an older relay
+   *  without the endpoint returns nothing and this stays a no-op. */
+  private async pollPresence(): Promise<void> {
+    if (this.ended || !this.callbacks.onPresence) return;
+    try {
+      for (const sealed of await this.client.fetchPresence(this.roomId)) {
+        try {
+          this.callbacks.onPresence(await decryptBlob(this.key, sealed));
+        } catch {
+          /* wrong-key or corrupt frame — drop, same as the stream path */
+        }
+      }
+    } catch {
+      /* offline / older relay — the next tick retries */
     }
   }
 

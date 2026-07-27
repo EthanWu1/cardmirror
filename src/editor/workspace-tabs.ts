@@ -390,8 +390,11 @@ export class WorkspaceTabStrip {
         break;
       }
     }
-    const siblings = Array.from(
-      targetSeg.querySelectorAll<HTMLElement>('.pmd-tab:not(.pmd-tab-dragging)'),
+    // Filter by uid, not the drag class — a rebuild mid-drag drops the class
+    // (see the note in onTabPointerUp) and would leave the dragged tab in the
+    // list, skewing the caret index.
+    const siblings = Array.from(targetSeg.querySelectorAll<HTMLElement>('.pmd-tab')).filter(
+      (t) => t.dataset['uid'] !== drag.uid,
     );
     let index = siblings.length;
     for (let i = 0; i < siblings.length; i++) {
@@ -431,9 +434,17 @@ export class WorkspaceTabStrip {
     const target = drag.inStrip;
     if (!target) return;
     const toSlotId = target.segEl.dataset['slot'] ?? slotId;
-    const siblingUids = Array.from(
-      target.segEl.querySelectorAll<HTMLElement>('.pmd-tab:not(.pmd-tab-dragging)'),
-    ).map((t) => t.dataset['uid'] ?? '');
+    // Exclude the dragged tab BY UID, not by the `.pmd-tab-dragging` class: a
+    // strip rebuild mid-drag (any shell refresh — focus, title, dirty flag)
+    // replaces these elements and the fresh ones carry no drag class, so a
+    // class-based filter silently kept the dragged tab in the list and then
+    // spliced it in a second time. The duplicate made the order longer than
+    // the stack, which the shell's sanity check rejected — dropping the
+    // reorder entirely. That is why dragging tabs stopped doing anything
+    // (field report 2026-07-25).
+    const siblingUids = Array.from(target.segEl.querySelectorAll<HTMLElement>('.pmd-tab'))
+      .map((t) => t.dataset['uid'] ?? '')
+      .filter((u) => u !== '' && u !== uid);
     const order = [...siblingUids];
     order.splice(Math.min(target.index, order.length), 0, uid);
     if (toSlotId === slotId) {

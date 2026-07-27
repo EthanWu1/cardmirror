@@ -272,6 +272,25 @@ export class RoomsClient {
     });
   }
 
+  /** Recent presence blobs for peers that cannot hold a stream. Presence is
+   *  normally pushed over SSE; when the stream is down (room at the slot cap,
+   *  or half-open) this is the only way to learn who else is in the room.
+   *  Returns [] on an older relay that has no such endpoint, so a client
+   *  running ahead of its server just behaves as before. */
+  async fetchPresence(roomId: string): Promise<Uint8Array[]> {
+    const path = `/rooms/${roomId}/presence`;
+    let res: Response;
+    try {
+      res = await this.request(path, { headers: this.headers() });
+    } catch (err) {
+      if (err instanceof RoomsError && (err.status === 404 || err.status === 405)) return [];
+      throw err;
+    }
+    const body = await this.readJson<{ presence?: string[] }>(res, path);
+    if (!Array.isArray(body.presence)) return [];
+    return body.presence.map((b) => base64ToBytes(b));
+  }
+
   async deleteRoom(roomId: string): Promise<void> {
     await this.request(`/rooms/${roomId}`, { method: 'DELETE', headers: this.headers() });
   }
