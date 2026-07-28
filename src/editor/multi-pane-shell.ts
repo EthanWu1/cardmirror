@@ -75,6 +75,7 @@ import { selfRefSelectionPos } from './self-transclusion-commands.js';
 import { transclusionDivergenceKey } from './transclusion-divergence-plugin.js';
 import { promptForText, promptForChoice, alertDialog } from './text-prompt.js';
 import { showToast } from './toast.js';
+import { cloudSyncFolderLabel, cloudSyncCoEditWarning } from './cloud-sync-folder.js';
 import {
   buildEditorPlugins,
   enableMultiDocMode,
@@ -177,6 +178,24 @@ const paneScrollMemory = new WeakMap<
     nav: number;
   }
 >();
+
+/** Paths already warned about this session, so reopening a doc (or switching
+ *  panes) doesn't nag repeatedly. */
+const cloudFolderWarned = new Set<string>();
+
+/** Warn when a CO-EDITED document is opened from a cloud-sync folder. The room
+ *  pointer lives inside the `.cmir`, so a sync client replacing the file can
+ *  split the collaborators into different rooms, break the session outright, or
+ *  spawn "conflicted copy" files — the confirmed cause of the field reports on
+ *  2026-07-27. Warn rather than block: a private (unshared) Dropbox folder is
+ *  harmless, and only the user knows whether the folder is shared. */
+function warnIfCoEditedInCloudFolder(handle: unknown, filename: string): void {
+  if (typeof handle !== 'string' || handle === '') return;
+  const label = cloudSyncFolderLabel(handle);
+  if (!label || cloudFolderWarned.has(handle)) return;
+  cloudFolderWarned.add(handle);
+  showToast(cloudSyncCoEditWarning(label, filename), { durationMs: 15_000 });
+}
 
 /** Two pane arrangements are identical (same panes, order, tabs, visible tab)?
  *  Used to skip a no-op drag-to-split reflow. */
@@ -3335,6 +3354,7 @@ class MultiPaneShell {
     } else {
       ({ doc, threads, docId } = await fromDocxFull(opened.bytes));
     }
+    if (sharedDoc) warnIfCoEditedInCloudFolder(opened.handle, opened.name);
     const slot = this.slots[target];
     const record = buildDocRecord(opened.name, doc, slot, {
       handle: opened.handle ?? null,
