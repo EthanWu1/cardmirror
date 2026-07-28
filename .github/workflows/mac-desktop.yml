@@ -53,11 +53,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cardmirror-macos
-          # Only the installers (.dmg). The .zip/.blockmap/latest-mac.yml are
-          # auto-update deltas, not needed to install, and uploading them for
-          # both arches (~400-500 MB/run) exhausts the account's Actions
-          # artifact-storage quota — the upload then fails with "Artifact
-          # storage quota has been hit" even though the build succeeded.
-          path: apps/desktop/release/*.dmg
+          # Keeps the .zip + latest-mac.yml alongside the .dmg on purpose: they
+          # are the electron-updater feed, so this workflow can supply an
+          # auto-update build, not just an installer. (A previous trim dropped
+          # them to save artifact storage and silently removed that capability
+          # — update-publishing.test.ts guards it.) For a quota-free install-only
+          # build use "macOS test build", which publishes the dmg to a Release
+          # instead of consuming artifact storage.
+          path: |
+            apps/desktop/release/*.dmg
+            apps/desktop/release/*.zip
+            apps/desktop/release/latest-mac.yml
+            apps/desktop/release/*.blockmap
           if-no-files-found: error
           retention-days: 7
