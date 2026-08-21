@@ -24,9 +24,10 @@
  */
 
 const DB_NAME = 'cardmirror-collab';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const SESSIONS = 'sessions';
 const PREFETCH = 'invite-prefetch';
+const SEED_CACHE = 'seed-cache';
 const CHANNEL = 'pmd-collab-sessions';
 
 export interface PersistedSessionRecord {
@@ -116,6 +117,11 @@ function openDb(): Promise<IDBDatabase | null> {
         if (!db.objectStoreNames.contains(PREFETCH)) {
           db.createObjectStore(PREFETCH, { keyPath: 'roomId' });
         }
+        // v2. Each guard is independent so an existing v1 database gains only
+        // the missing store and keeps its session records.
+        if (!db.objectStoreNames.contains(SEED_CACHE)) {
+          db.createObjectStore(SEED_CACHE, { keyPath: 'key' });
+        }
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => resolve(null); // storage denied — persistence degrades to none
@@ -201,4 +207,50 @@ export async function loadPrefetch(roomId: string): Promise<InvitePrefetchRecord
 
 export async function deletePrefetch(roomId: string): Promise<void> {
   await del(PREFETCH, roomId);
+}
+
+// ── Seed cache ───────────────────────────────────────────────────────
+
+/** A CRDT snapshot already seeded from a specific document, so re-hosting an
+ *  unchanged file skips the super-linear seeding entirely (see
+ *  `collab-seed-core.ts`). Keyed by a content digest, NOT by filename: the
+ *  same bytes must hit and any edit must miss. */
+export interface SeedCacheRecord {
+  /** Key: content digest of the document JSON. */
+  key: string;
+  snapshot: Uint8Array;
+  /** Cheap secondary check against a digest collision seeding a WRONG doc. */
+  nodeSize: number;
+  createdAt: number;
+}
+
+/** Total cached seed bytes to keep. A huge master file's snapshot is ~6 MB, so
+ *  this holds roughly a tournament's worth of distinct files before the oldest
+ *  are evicted. */
+const SEED_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+
+export async function loadSeedCache(key: string): Promise<SeedCacheRecord | null> {
+  return get<SeedCacheRecord>(SEED_CACHE, key);
+}
+
+export async function saveSeedCache(record: SeedCacheRecord): Promise<void> {
+  await put(SEED_CACHE, record);
+  await pruneSeedCache();
+}
+
+/** Evict oldest-first until the store is under the byte cap. */
+export async function pruneSeedCache(maxBytes = SEED_CACHE_MAX_BYTES): Promise<void> {
+  const rows = await all<SeedCacheRecord>(SEED_CACHE);
+  let total = rows.reduce((n, r) => n + (r.snapshot?.length ?? 0), 0);
+  if (total <= maxBytes) return;
+  for (const row of rows.sort((a, b) => a.createdAt - b.createdAt)) {
+    if (total <= maxBytes) break;
+    total -= row.snapshot?.length ?? 0;
+    await del(SEED_CACHE, row.key);
+  }
+}
+
+/** Test/maintenance helper: drop every cached seed. */
+export async function clearSeedCache(): Promise<void> {
+  await pruneSeedCache(-1);
 }

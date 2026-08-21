@@ -47,6 +47,7 @@ import {
   importRoomKey,
 } from './collab-crypto.js';
 import { RoomsClient, RoomsError, RoomStream, type RoomUpdate } from './room-client.js';
+import { seedLoroDoc } from './collab-seed.js';
 
 type SyncDoc = Parameters<typeof LoroSyncPlugin>[0]['doc'];
 
@@ -293,8 +294,16 @@ export class CollabSession {
 
     const loroDoc = new LoroDoc();
     configTextStyle(loroDoc);
-    updateLoroToPmState(loroDoc as SyncDoc, new Map(), EditorState.create({ doc: opts.pmDoc }));
-    loroDoc.commit();
+    // Seeding is the expensive half of starting a session on an already-open
+    // document and its cost is super-linear: measured on a synthetic debate
+    // file, 2000 cards 0.5s / 4000 1.6s / 8000 5.7s, while parsing the same
+    // .cmir stays linear (99ms at 8000) and importing the resulting snapshot
+    // costs ~49ms. Run inline it froze the editor for seconds on a big master
+    // file — indistinguishable from a crash. `seedLoroDoc` moves it to a
+    // worker for documents big enough to be worth the hop, caches the result
+    // by content digest, and imports the snapshot here. Small docs and
+    // worker-less runtimes seed inline, identically.
+    await seedLoroDoc(loroDoc, opts.pmDoc);
 
     const session = new CollabSession({ ...opts, roomId, key, role: 'host', loroDoc });
     const seed = loroDoc.export({ mode: 'snapshot' });
