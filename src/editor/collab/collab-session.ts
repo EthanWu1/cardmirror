@@ -68,6 +68,33 @@ type SyncDoc = Parameters<typeof LoroSyncPlugin>[0]['doc'];
  */
 globalThis.__CM_MOVABLE_LIST__ = compareAppVersions(appVersion, MOVABLE_ROOMS_MIN_VERSION) >= 0;
 
+/** How often to poll for remote updates while the push stream is DOWN. The
+ *  relay still serves REST in that state, so polling keeps the document
+ *  syncing (a few seconds behind) instead of waiting for the slow
+ *  belt-and-suspenders catch-up. */
+export const DEGRADED_POLL_MS = 4_000;
+
+/** How often to catch up while the push stream reports CONNECTED.
+ *
+ *  A stream can be "connected" and yet silently deliver nothing — a half-open
+ *  socket (sleep, Wi-Fi handoff, NAT rebind, a proxy that dropped the
+ *  upstream) looks alive to the client indefinitely. Catch-up used to run on
+ *  `catchUpMs` (5 MINUTES) in that state, so a silently-dead stream meant the
+ *  doc simply stopped receiving for minutes mid-round. A catch-up with
+ *  nothing new is one cheap GET returning an empty page, so polling this
+ *  often is affordable insurance. */
+export const HEALTHY_POLL_MS = 5_000;
+
+/** Granularity of the catch-up scheduler. Must DIVIDE both poll intervals
+ *  above, not equal them: the scheduler fires on this period and each branch
+ *  decides whether its own interval has elapsed. A tick equal to one interval
+ *  beats against the other and silently stretches it — a 4s tick gating on a
+ *  5s threshold could only pass every OTHER tick, measured at 8.06s to
+ *  reconverge against a zombie relay. A bare timer callback that decides to
+ *  do nothing costs nothing measurable; the flush timer already runs an order
+ *  of magnitude more often. */
+export const POLL_TICK_MS = 1_000;
+
 export function configTextStyle(doc: LoroDoc): void {
   doc.configTextStyle(
     Object.fromEntries(
@@ -200,6 +227,12 @@ export class CollabSession {
   private sending = false;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private catchUpTimer: ReturnType<typeof setInterval> | null = null;
+  /** When a catch-up last SUCCEEDED. */
+  private lastCatchUpAt = 0;
+  /** When the scheduler last STARTED a catch-up, success or not. Scheduling
+   *  gates on the ATTEMPT: gating on success would retry at tick rate for as
+   *  long as the relay keeps erroring. */
+  private lastCatchUpTickAt = 0;
   private auditTimer: ReturnType<typeof setInterval> | null = null;
   private auditKickoff: ReturnType<typeof setTimeout> | null = null;
   private sendRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -512,7 +545,27 @@ export class CollabSession {
       this.flush();
       this.checkEcho();
     }, this.flushMs);
-    this.catchUpTimer = setInterval(() => void this.catchUp(), this.catchUpMs);
+    // Adaptive catch-up. With live push working this is only a
+    // belt-and-suspenders heal; with the stream DOWN — most importantly when
+    // the room's stream slots are exhausted and it answers 409 forever — REST
+    // still works, so poll fast and keep the document syncing both ways.
+    this.lastCatchUpTickAt = Date.now();
+    const tick = Math.max(250, Math.min(this.catchUpMs, POLL_TICK_MS));
+    this.catchUpTimer = setInterval(() => {
+      const since = Date.now() - this.lastCatchUpTickAt;
+      if (this.stream?.connected) {
+        // Connected is NOT proof of delivery (see HEALTHY_POLL_MS).
+        if (since >= Math.min(this.catchUpMs, HEALTHY_POLL_MS)) {
+          this.lastCatchUpTickAt = Date.now();
+          void this.catchUp();
+        }
+        return;
+      }
+      if (since < Math.min(this.catchUpMs, DEGRADED_POLL_MS)) return;
+      this.lastCatchUpTickAt = Date.now();
+      void this.catchUp();
+      void this.drainQueue();
+    }, tick);
     this.auditKickoff = setTimeout(() => void this.auditRoomHistory(), this.auditDelayMs);
     this.auditTimer = setInterval(() => void this.auditRoomHistory(), 30 * 60_000);
   }
@@ -977,6 +1030,7 @@ export class CollabSession {
       // successful catch-up over plain HTTP must not paint the chip
       // synced while push delivery is still down.
       this.connected = this.stream ? this.stream.connected : true;
+      this.lastCatchUpAt = Date.now();
       this.emitStatus();
     } catch (err) {
       if (err instanceof RoomsError && (err.status === 410 || err.status === 404)) {
