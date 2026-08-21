@@ -44,6 +44,37 @@ export interface RoomUpdate {
   blob: Uint8Array;
 }
 
+interface AbortControllerLike {
+  signal: AbortSignal;
+  abort(): void;
+}
+
+const NODE_UTIL_MODULE = 'node:util';
+
+/** jsdom's AbortSignal is not Node's, and Node's fetch (undici) rejects a
+ *  foreign signal with "Expected signal to be an instance of AbortSignal" —
+ *  which silently kills every streamed request under vitest+jsdom, so the
+ *  whole collab suite fails to converge for a reason that has nothing to do
+ *  with the sync logic. Browsers never take this path. */
+function isJsdomRuntime(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return (navigator.userAgent ?? '').toLowerCase().includes('jsdom/');
+}
+
+async function makeFetchAbortController(): Promise<AbortControllerLike> {
+  if (isJsdomRuntime()) {
+    try {
+      const util = (await import(/* @vite-ignore */ NODE_UTIL_MODULE)) as typeof import('node:util');
+      if (typeof util.transferableAbortController === 'function') {
+        return util.transferableAbortController();
+      }
+    } catch {
+      /* Browser bundles never enter this path; fall back if node:util is absent. */
+    }
+  }
+  return new AbortController();
+}
+
 export interface FetchUpdatesResult {
   snapshot: { blob: Uint8Array; coversThroughSeq: number } | null;
   /** True when the server withheld the snapshot because the caller's
@@ -267,7 +298,7 @@ export interface RoomStreamOptions {
 }
 
 export class RoomStream {
-  private controller: AbortController | null = null;
+  private controller: AbortControllerLike | null = null;
   private stopped = true;
   private backoffMs: number;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -387,7 +418,7 @@ export class RoomStream {
 
   private async connectLoop(): Promise<void> {
     if (this.stopped) return;
-    this.controller = new AbortController();
+    this.controller = await makeFetchAbortController();
     const fetchImpl = this.opts.fetchImpl ?? boundFetch;
     try {
       const sidQ = this.opts.sid ? `?sid=${encodeURIComponent(this.opts.sid)}` : '';
