@@ -99,3 +99,6 @@ COLLAB_MOVE_SPIKE_identity-test.ts
 COLLAB_MOVE_SPIKE.md
 WEB_COLLAB_STUDY.md
 TOAST_AUDIT.md
+
+# electron-builder output (any suffixed variant)
+release*/

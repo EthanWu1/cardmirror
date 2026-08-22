@@ -1007,6 +1007,24 @@ function enterVerb(source: PaletteResult['source']): string {
 
 const SEARCH_PLACEHOLDER = 'Search…';
 
+export function clampPaletteToViewport(opts: {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  margin?: number;
+}): { left: number; top: number } {
+  const margin = opts.margin ?? 8;
+  const maxLeft = Math.max(margin, opts.viewportWidth - opts.width - margin);
+  const maxTop = Math.max(margin, opts.viewportHeight - opts.height - margin);
+  return {
+    left: Math.round(Math.min(Math.max(margin, opts.left), maxLeft)),
+    top: Math.round(Math.min(Math.max(margin, opts.top), maxTop)),
+  };
+}
+
 class QuickCardSearchUI {
   private root: HTMLDivElement | null = null;
   private input!: HTMLInputElement;
@@ -1192,16 +1210,41 @@ class QuickCardSearchUI {
     });
   }
 
-  /** Center over the target pane and clamp the width to fit it, so the
-   *  bar shrinks elegantly in narrow / multi-pane windows. Re-run on
-   *  resize since panes reflow with the window. */
+  /** Clamp the width to fit the active pane while CSS keeps the palette
+   *  centered slightly above mid-screen. Re-run on resize since panes
+   *  reflow with the window. */
   private reposition(): void {
     if (!this.root) return;
     const rect = this.paneEl?.getBoundingClientRect();
     const available = rect && rect.width > 0 ? rect.width : window.innerWidth;
-    const centerX = rect && rect.width > 0 ? rect.left + rect.width / 2 : window.innerWidth / 2;
-    this.root.style.left = `${Math.round(centerX)}px`;
-    this.root.style.width = `${Math.round(Math.max(240, Math.min(540, available - 24)))}px`;
+    const width = Math.round(Math.max(240, Math.min(540, available - 24)));
+    this.root.style.width = `${width}px`;
+
+    let left = rect && rect.width > 0 ? rect.left + Math.max(8, (rect.width - width) / 2) : (window.innerWidth - width) / 2;
+    let top = Math.round(window.innerHeight * 0.42);
+    try {
+      if (!this.view) throw new Error('no active editor view');
+      const caret = this.view.coordsAtPos(this.view.state.selection.head);
+      left = caret.left - 12;
+      const estimatedHeight = Math.max(this.root.offsetHeight, 180);
+      top = caret.bottom + 8;
+      if (top + estimatedHeight > window.innerHeight - 8) {
+        top = caret.top - estimatedHeight - 8;
+      }
+    } catch {
+      /* Fall back to a centered pane position when the view has no measurable caret. */
+    }
+
+    const clamped = clampPaletteToViewport({
+      left,
+      top,
+      width,
+      height: Math.max(this.root.offsetHeight, 180),
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    });
+    this.root.style.left = `${clamped.left}px`;
+    this.root.style.top = `${clamped.top}px`;
   }
 
   private onResize = (): void => this.reposition();
