@@ -15,6 +15,11 @@
  * the Receive pill's Join).
  */
 
+import {
+  createSoloSessionWatch,
+  observeSoloSessionPresence,
+  type SoloSessionWatch,
+} from './solo-session.js';
 import type { EditorView } from 'prosemirror-view';
 import { LoroUndoPlugin, loroSyncPluginKey, loroUndoPluginKey, undo as loroUndo, redo as loroRedo } from 'loro-prosemirror';
 import { settings } from '../settings.js';
@@ -117,6 +122,10 @@ interface ActiveSession {
    *  record, which is deleted on Leave/End/tombstone. */
   history: HistoryHandle;
   wakeCleanup: () => void;
+  /** Tracks how long this session has been alone, so a session nobody joined
+   *  (or everyone left) shuts itself down instead of syncing to no one. */
+  soloWatch: SoloSessionWatch;
+  autoEndingSolo: boolean;
   /** Unsubscribe the meta-map (title) watcher installed by installSeams. */
   metaUnsub: () => void;
   /** Latest connection status for THIS session. The shared status-bar chip only
@@ -352,6 +361,51 @@ function renderPresenceDots(container: HTMLElement): void {
 function refreshPresenceDots(): void {
   const dots = chipEl()?.querySelector('.pmd-collab-chip-dots');
   if (dots instanceof HTMLElement) renderPresenceDots(dots);
+  checkSoloSessions();
+}
+
+function sessionStatusForSolo(sess: ActiveSession): { connected: boolean; queuedUpdates: number } {
+  return {
+    connected: sess.lastStatus?.connected ?? true,
+    queuedUpdates: sess.session.queuedUpdates,
+  };
+}
+
+function checkSoloSessions(now = Date.now()): void {
+  for (const sess of sessions.values()) checkSoloSession(sess, now);
+}
+
+/** End a session that has been alone past the grace window. A DURABLE document
+ *  is exempt: it is meant to outlive its participants, so being alone in one is
+ *  normal rather than a stranded session. */
+function checkSoloSession(sess: ActiveSession, now = Date.now()): void {
+  if (sess.session.durableRoom) return;
+  if (sess.autoEndingSolo) return;
+  const shouldEnd = observeSoloSessionPresence(
+    sess.soloWatch,
+    sess.cursors.presence(),
+    sessionStatusForSolo(sess),
+    now,
+  );
+  if (!shouldEnd) return;
+  sess.autoEndingSolo = true;
+  void autoEndSoloSession(sess).finally(() => {
+    const live = sessionFor(sess.ownerUid);
+    if (live === sess) sess.autoEndingSolo = false;
+  });
+}
+
+async function autoEndSoloSession(sess: ActiveSession): Promise<void> {
+  if (!sessions.has(sess.ownerUid)) return;
+  const ownerUid = sess.ownerUid;
+  const wasHost = sess.session.role === 'host';
+  if (!(await endOrLeaveSession(sess))) return;
+  if (sessions.has(ownerUid)) return;
+  showToast(
+    wasHost
+      ? 'Co-editing ended because only you were left in the session'
+      : 'Co-editing stopped because only you were left in the session',
+  );
 }
 
 let presenceTimer: ReturnType<typeof setInterval> | null = null;
@@ -484,6 +538,8 @@ function installSeams(
     history,
     wakeCleanup,
     metaUnsub,
+    soloWatch: createSoloSessionWatch(),
+    autoEndingSolo: false,
     lastStatus: null,
   };
   sessions.set(ownerUid, sess);

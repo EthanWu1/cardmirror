@@ -26,6 +26,8 @@
  * declares its view, the controller treats it as cross-view.
  */
 
+import { cloudSyncFolderLabel, cloudSyncCoEditWarning } from './cloud-sync-folder.js';
+import type { SharedDocMetadata } from '../native/index.js';
 import { showPaneRouteOverlay, type PaneRouteSlot } from './pane-route-overlay.js';
 import { createRound } from './flow/flow-model.js';
 import type { FlowFormat, FlowRound, FlowSide } from './flow/flow-model.js';
@@ -615,6 +617,22 @@ function focusPaneRecord(record: PaneRecord | null | undefined): void {
 }
 
 
+
+const cloudFolderWarned = new Set<string>();
+
+/** Warn when a CO-EDITED document is opened from a cloud-sync folder. The room
+ *  pointer lives inside the `.cmir`, so a sync client replacing the file can
+ *  split the collaborators into different rooms, break the session outright, or
+ *  spawn "conflicted copy" files — the confirmed cause of the field reports on
+ *  2026-07-27. Warn rather than block: a private (unshared) Dropbox folder is
+ *  harmless, and only the user knows whether the folder is shared. */
+function warnIfCoEditedInCloudFolder(handle: unknown, filename: string): void {
+  if (typeof handle !== 'string' || handle === '') return;
+  const label = cloudSyncFolderLabel(handle);
+  if (!label || cloudFolderWarned.has(handle)) return;
+  cloudFolderWarned.add(handle);
+  showToast(cloudSyncCoEditWarning(label, filename), { durationMs: 15_000 });
+}
 
 class Slot {
   readonly id: SlotId;
@@ -3507,11 +3525,13 @@ class MultiPaneShell {
     // above stays the SAVE format.)
     const isDocxBytes =
       openBytes.length >= 2 && openBytes[0] === 0x50 && openBytes[1] === 0x4b;
+    let sharedDoc: SharedDocMetadata | null = null;
     if (!isDocxBytes) {
-      ({ doc, threads, docId } = parseNative(openBytes));
+      ({ doc, threads, docId, sharedDoc } = parseNative(openBytes));
     } else {
       ({ doc, threads, docId } = await fromDocxFull(openBytes));
     }
+    if (sharedDoc) warnIfCoEditedInCloudFolder(opened.handle, opened.name);
     const slot = this.slots[target];
     const record = buildDocRecord(opened.name, doc, slot, {
       handle: opened.handle ?? null,

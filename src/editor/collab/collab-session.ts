@@ -459,6 +459,8 @@ export class CollabSession {
     minBackoffMs?: number;
     maxBackoffMs?: number;
     updateByteLimit?: number;
+    /** Persistent document rooms are durable; see the constructor option. */
+    durableRoom?: boolean;
   }): Promise<CollabSession> {
     const key = await importRoomKey(opts.keyBytes);
     const loroDoc = new LoroDoc();
@@ -503,6 +505,8 @@ export class CollabSession {
     minBackoffMs?: number;
     maxBackoffMs?: number;
     snapshotEvery?: number;
+    /** Persistent document rooms are durable; see the constructor option. */
+    durableRoom?: boolean;
   }): Promise<CollabSession> {
     const key = await importRoomKey(opts.keyBytes);
     const loroDoc = new LoroDoc();
