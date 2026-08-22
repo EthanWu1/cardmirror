@@ -615,6 +615,7 @@ function focusPaneRecord(record: PaneRecord | null | undefined): void {
 }
 
 
+
 class Slot {
   readonly id: SlotId;
   /** Top-level pane element (chip + editor + footer). Hidden when

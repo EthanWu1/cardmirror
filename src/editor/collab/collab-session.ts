@@ -258,6 +258,10 @@ export class CollabSession {
    *  ?from= on presence posts so the server skips echoing our own
    *  cursor frames back (pure egress savings — the cursor layer drops
    *  own-peer frames anyway). */
+  /** Presence self-echo nonce, per SESSION and deliberately random. It is NOT
+   *  a client identity: the relay uses it only to skip echoing a presence
+   *  frame back to its sender, so two sessions on one machine must not share
+   *  it or each would suppress the other's presence. */
   private readonly streamSid: string = Math.random().toString(36).slice(2, 14);
   /** ROOM-HOLDINGS bookkeeping for the incremental history audit.
    *  The room's content is (verified snapshot) + (update rows above its
