@@ -1,4 +1,6 @@
 export type PaneRouteChoice<Slot extends string> = Slot | 'separate';
+import { pushOverlay, popOverlay } from './overlay-stack.js';
+import { captureFocusForDialog } from './text-prompt.js';
 
 export interface PaneRouteSlot<Slot extends string> {
   id: Slot;
@@ -54,6 +56,15 @@ export function showPaneRouteOverlay<Slot extends string>(
   opts: PaneRouteOverlayOptions<Slot>,
 ): Promise<PaneRouteChoice<Slot> | null> {
   return new Promise((resolve) => {
+    // Register on the shared overlay stack so background number-key handlers
+    // stand down — without it, picking a slot with '1'/'2'/'3' over the home
+    // screen ALSO fires the matching home action.
+    const overlayToken = pushOverlay();
+    // Arm focus explicitly and restore it synchronously on close, before the
+    // caller's own view.focus() runs, so the caller's focus wins the ordering.
+    // (Electron's async focus restoration on dialog teardown has landed after
+    // a renderer-side focus() before now.)
+    const restoreFocus = captureFocusForDialog();
     const overlay = document.createElement('div');
     overlay.className = 'pmd-route-overlay pmd-pane-route-overlay';
 
@@ -74,6 +85,8 @@ export function showPaneRouteOverlay<Slot extends string>(
       document.removeEventListener('keydown', onKey);
       removalObserver.disconnect();
       overlay.remove();
+      popOverlay(overlayToken);
+      restoreFocus();
       resolve(choice);
     };
 

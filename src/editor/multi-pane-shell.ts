@@ -3408,91 +3408,16 @@ class MultiPaneShell {
 
   /** Show the inline "Send to slot…" picker; resolves with the
    *  chosen slot, or null if the user cancels. */
+  /** "Open <file> into..." — the shared pane-route overlay, so this picker
+   *  looks and behaves like every other routing prompt. */
   private promptForSlot(filename: string): Promise<SlotId | null> {
-    return new Promise((resolve) => {
-      // Register on the shared overlay stack so background number-key
-      // handlers stand down — without this, picking a slot with '1'/'2'/
-      // '3' over the home screen ALSO fired the matching home action
-      // (isAnyOverlayOpen() saw no overlay).
-      const overlayToken = pushOverlay();
-      // Deterministic focus story (2026-07-27 focus audit: this was
-      // the ONE overlay dialog with no focus arming, and Electron's
-      // async focus restoration on dialog teardown has twice before
-      // landed AFTER a renderer-side .focus() — the prime suspect for
-      // the intermittent "new doc ignores styling" repro). Focus moves
-      // INTO the dialog on open and is restored synchronously on
-      // close, BEFORE the caller's own view.focus() runs — so the
-      // caller's focus always wins the ordering.
-      const restoreFocus = captureFocusForDialog();
-      const overlay = document.createElement('div');
-      overlay.className = 'pmd-route-overlay';
-      // Single resolution path for all four ways out (slot click,
-      // Cancel, Escape, digit key) so the document-level keydown
-      // listener always detaches — a mouse-completed pick must not
-      // leave a stale handler that eats the next typed '1'/'2'/'3'.
-      let removeKeys = (): void => {};
-      const finish = (choice: SlotId | null): void => {
-        popOverlay(overlayToken);
-        removeKeys();
-        overlay.remove();
-        restoreFocus();
-        resolve(choice);
-      };
-      const dialog = document.createElement('div');
-      dialog.className = 'pmd-route-dialog';
-      const header = document.createElement('div');
-      header.className = 'pmd-route-header';
-      header.textContent = `Open ${filename} into…`;
-      dialog.appendChild(header);
-      const row = document.createElement('div');
-      row.className = 'pmd-route-buttons';
-      for (const id of SLOT_IDS) {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'pmd-route-btn';
-        const slot = this.slots[id];
-        const stackLabel =
-          slot.stack.length === 0
-            ? '(empty)'
-            : `${slot.visible?.filename ?? ''}${slot.stack.length > 1 ? ` (+${slot.stack.length - 1})` : ''}`;
-        btn.innerHTML = `<strong>${id.replace('slot', 'Slot ')}</strong><br><span>${stackLabel}</span>`;
-        btn.addEventListener('click', () => finish(id));
-        row.appendChild(btn);
-      }
-      dialog.appendChild(row);
-      const cancel = document.createElement('button');
-      cancel.type = 'button';
-      cancel.className = 'pmd-route-cancel';
-      cancel.textContent = 'Cancel';
-      cancel.addEventListener('click', () => finish(null));
-      dialog.appendChild(cancel);
-      overlay.appendChild(dialog);
-      document.body.appendChild(overlay);
-      // Esc cancels; 1 / 2 / 3 pick the corresponding slot. Skips
-      // chords with modifiers so e.g. Ctrl+1 keeps its slot-focus
-      // meaning even if a picker is open.
-      // Capture-phase + swallow (see installModalKeys): the picker
-      // opens over a focused editor on every multi-pane open, so a
-      // bubble-phase listener let unhandled keys — Enter especially —
-      // reach ProseMirror and edit the doc underneath.
-      removeKeys = installModalKeys(dialog, overlayToken, (e) => {
-        if (e.key === 'Escape') {
-          finish(null);
-          return true;
-        }
-        if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return false;
-        let idx = -1;
-        if (e.key === '1') idx = 0;
-        else if (e.key === '2') idx = 1;
-        else if (e.key === '3') idx = 2;
-        if (idx >= 0) {
-          finish(SLOT_IDS[idx]!);
-          return true;
-        }
-        return false;
-      });
-      armDialogFocus(dialog, 'dialog', `Open ${filename} into a slot`);
-    });
+    return showPaneRouteOverlay({
+      filename,
+      slots: this.routeSlots(),
+      activeSlotId: this.focusedSlot?.id ?? null,
+      allowSeparate: false,
+      ariaLabel: `Open ${filename} into workspace`,
+    }) as Promise<SlotId | null>;
   }
 
   /** Parse + import + mount the host-provided OpenedFile into the
