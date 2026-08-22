@@ -730,6 +730,33 @@ def post_room_snapshot(
     return Response(status_code=204)
 
 
+# room id -> recent presence frames [(monotonic_ts, base64_blob), ...], newest
+# last. Presence is ephemeral by design (never persisted, never in the DB), but
+# a stream-less peer has no other way to learn who is in the room, so keep a
+# short in-memory tail that `GET /rooms/{id}/presence` can serve. Bounded by
+# both age and count so a busy room cannot grow this without limit.
+PRESENCE_TTL_SECONDS = 20
+PRESENCE_MAX_PER_ROOM = 40
+_room_presence: dict[str, list[tuple[float, str]]] = {}
+
+
+def _remember_presence(room_id: str, b64: str) -> None:
+    now = time.monotonic()
+    tail = [e for e in _room_presence.get(room_id, []) if now - e[0] < PRESENCE_TTL_SECONDS]
+    tail.append((now, b64))
+    _room_presence[room_id] = tail[-PRESENCE_MAX_PER_ROOM:]
+
+
+def _recent_presence(room_id: str) -> list[str]:
+    now = time.monotonic()
+    tail = [e for e in _room_presence.get(room_id, []) if now - e[0] < PRESENCE_TTL_SECONDS]
+    if tail:
+        _room_presence[room_id] = tail
+    else:
+        _room_presence.pop(room_id, None)
+    return [b64 for _ts, b64 in tail]
+
+
 @app.post(
     "/relay/rooms/{room_id}/presence",
     status_code=202,
@@ -749,8 +776,25 @@ async def post_room_presence(
     if len(raw) > 64 * 1024:
         raise HTTPException(413, "presence too large")
     b64 = base64.b64encode(raw).decode("ascii")
+    _remember_presence(room_id, b64)
     _push_to_room(room_id, {"t": "p", "blob": b64}, skip_sid=sender)
     return JSONResponse({}, status_code=202)
+
+
+@app.get(
+    "/relay/rooms/{room_id}/presence",
+    dependencies=[Depends(require_relay_token)],
+)
+async def get_room_presence(room_id: str) -> JSONResponse:
+    """Recent presence blobs for peers that cannot hold a stream.
+
+    Presence is push-only over the stream, so a client whose stream was
+    refused (room at the slot cap) or silently half-open receives document
+    updates by polling but NEVER learns who else is in the room: no
+    collaborator avatars, and each side can see the other as absent while
+    edits still flow. The blobs stay opaque ciphertext; the relay only
+    timestamps them."""
+    return JSONResponse({"presence": _recent_presence(room_id)})
 
 
 @app.get("/relay/rooms/{room_id}/stream", dependencies=[Depends(require_relay_token)])

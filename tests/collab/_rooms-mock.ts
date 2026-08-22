@@ -15,6 +15,8 @@ interface Room {
   snapshot: { blob: string; coversThroughSeq: number } | null;
   tombstoned: boolean;
   streams: Set<http.ServerResponse>;
+  /** Recent presence frames [ts, base64], newest last (see relay/server.py). */
+  presence: Array<[number, string]>;
 }
 
 export interface RoomsMock {
@@ -34,12 +36,16 @@ export interface RoomsMock {
   updateCount(roomId: string): number;
   /** Total stream CONNECT attempts (incl. ones that never helloed). */
   streamAttempts(): number;
+  /** Cap on concurrent streams per room. Drop it to 1 to make the NEXT peer
+   *  genuinely stream-less (the relay answers 409), which is the real
+   *  condition presence-over-REST exists for. */
+  setMaxStreams(n: number): void;
   /** Zombie-instance simulation: store + ack posts but skip stream
    *  fan-out (streams stay open with heartbeats, receiving nothing). */
   mutePush(on: boolean): void;
 }
 
-const MAX_STREAMS_PER_ROOM = 10;
+let maxStreamsPerRoom = 10;
 const PAGE = 200;
 
 export function startRoomsMock(): Promise<RoomsMock> {
@@ -92,7 +98,7 @@ export function startRoomsMock(): Promise<RoomsMock> {
 
     if (req.method === 'POST' && !roomId) {
       const id = randomUUID().replace(/-/g, '');
-      rooms.set(id, { updates: [], snapshot: null, tombstoned: false, streams: new Set() });
+      rooms.set(id, { updates: [], snapshot: null, tombstoned: false, streams: new Set(), presence: [] });
       return json(
         res,
         201,
@@ -174,11 +180,23 @@ export function startRoomsMock(): Promise<RoomsMock> {
       return json(res, 204);
     }
 
+    if (req.method === 'GET' && sub === 'presence') {
+      const room = rooms.get(roomId);
+      const now = Date.now();
+      const tail = (room?.presence ?? []).filter(([ts]) => now - ts < 20_000);
+      if (room) room.presence = tail;
+      return json(res, 200, { presence: tail.map(([, b64]) => b64) });
+    }
+
     if (req.method === 'POST' && sub === 'presence') {
       const raw = await readBody(req);
       const from = url.searchParams.get('from');
       const room = rooms.get(roomId);
       if (room && !room.tombstoned) {
+        room.presence = [
+          ...room.presence.filter(([ts]) => Date.now() - ts < 20_000),
+          [Date.now(), raw.toString('base64')] as [number, string],
+        ].slice(-40);
         const frame = `data: ${JSON.stringify({ t: 'p', blob: raw.toString('base64') })}\n\n`;
         for (const s of room.streams) {
           if (from !== null && streamSids.get(s) === from) continue; // no self-echo
@@ -192,7 +210,7 @@ export function startRoomsMock(): Promise<RoomsMock> {
       streamAttempts++;
       const room = roomOr(res, roomId);
       if (!room) return;
-      if (room.streams.size >= MAX_STREAMS_PER_ROOM) {
+      if (room.streams.size >= maxStreamsPerRoom) {
         return json(res, 409, { error: 'room is full' });
       }
       const lastSeq = room.updates.length
@@ -243,6 +261,9 @@ export function startRoomsMock(): Promise<RoomsMock> {
             server.closeAllConnections?.();
           }),
         streamCount: (id) => rooms.get(id)?.streams.size ?? 0,
+        setMaxStreams: (n: number) => {
+          maxStreamsPerRoom = n;
+        },
         streamAttempts: () => streamAttempts,
         updateCount: (id) => rooms.get(id)?.updates.length ?? 0,
       });

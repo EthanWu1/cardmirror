@@ -255,6 +255,25 @@ export class RoomsClient {
     });
   }
 
+  /** Recent presence blobs for a peer that cannot hold a stream. Presence is
+   *  push-only over SSE, so a stream-less peer syncs edits but never learns
+   *  who else is in the room — no avatars, and it looks absent to everyone
+   *  while its own posts still land. Older relays have no GET here; treat
+   *  that as "no presence available" rather than an error. */
+  async fetchPresence(roomId: string): Promise<Uint8Array[]> {
+    const path = `/rooms/${roomId}/presence`;
+    let res: Response;
+    try {
+      res = await this.request(path, { headers: this.headers() });
+    } catch (err) {
+      if (err instanceof RoomsError && (err.status === 404 || err.status === 405)) return [];
+      throw err;
+    }
+    const body = await this.readJson<{ presence?: string[] }>(res, path);
+    if (!Array.isArray(body.presence)) return [];
+    return body.presence.map((b) => base64ToBytes(b));
+  }
+
   async deleteRoom(roomId: string): Promise<void> {
     await this.request(`/rooms/${roomId}`, { method: 'DELETE', headers: this.headers() });
   }

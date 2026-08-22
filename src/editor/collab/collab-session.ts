@@ -571,6 +571,9 @@ export class CollabSession {
       this.lastCatchUpTickAt = Date.now();
       void this.catchUp();
       void this.drainQueue();
+      // Presence is push-only over the stream, so without this a stream-less
+      // peer syncs edits but never sees anyone's avatar.
+      void this.pollPresence();
     }, tick);
     this.auditKickoff = setTimeout(() => void this.auditRoomHistory(), this.auditDelayMs);
     this.auditTimer = setInterval(() => void this.auditRoomHistory(), 30 * 60_000);
@@ -1247,6 +1250,24 @@ export class CollabSession {
   }
 
   // --- compaction ---
+
+  /** Pull presence over REST while the push stream is down. Without this a
+   *  stream-less peer syncs edits but shows no collaborators, and appears
+   *  absent to them — even though its own presence POSTs still land. */
+  private async pollPresence(): Promise<void> {
+    if (this.ended || !this.callbacks.onPresence) return;
+    try {
+      for (const sealed of await this.client.fetchPresence(this.roomId)) {
+        try {
+          this.callbacks.onPresence(await decryptBlob(this.key, sealed));
+        } catch {
+          /* wrong-key or corrupt frame - drop, same as the stream path */
+        }
+      }
+    } catch {
+      /* offline or an older relay - the next tick retries */
+    }
+  }
 
   private async uploadSnapshot(): Promise<void> {
     // NEVER compact over ops that haven't integrated: coversThroughSeq

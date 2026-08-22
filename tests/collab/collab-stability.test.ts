@@ -304,3 +304,55 @@ describe('unload frees the relay stream slot (the ghost-slot 409)', () => {
     await host.session.stop();
   }, 60_000);
 });
+
+describe('presence over REST when the stream is down', () => {
+  it('a peer refused a stream still learns who else is in the room', async () => {
+    // Presence is push-only over SSE. A peer whose stream is refused — the
+    // room is at its slot cap — receives document updates by polling but never
+    // learns who else is there: no collaborator avatars, and it looks absent
+    // to everyone else even though its own presence POSTs land.
+    const seen: Uint8Array[] = [];
+    const { session: host, shareCode } = await CollabSession.host({
+      pmDoc: simpleDoc('presence over rest'),
+      client,
+      ...FAST,
+    });
+    mkView(host.plugins());
+    await settle();
+    host.start();
+    await sleep(150);
+
+    // The host holds the room's only stream slot, so the joiner gets a 409 and
+    // is genuinely stream-less — REST is its ONLY route to presence.
+    mock.setMaxStreams(1);
+    const decoded = decodeShareCode(shareCode)!;
+    const joiner = await CollabSession.join({
+      ...decoded,
+      client,
+      ...FAST,
+      callbacks: { onPresence: (blob) => seen.push(blob) },
+    });
+    mkView(joiner.plugins());
+    await settle();
+    joiner.start();
+    await sleep(300);
+    expect(joiner.debugState().streamConnected, 'joiner must be stream-less').toBe(false);
+
+    seen.length = 0;
+    await host.sendPresence(new TextEncoder().encode('host-is-here'));
+
+    let got = false;
+    for (let i = 0; i < 40; i++) {
+      await sleep(250);
+      if (seen.length > 0) {
+        got = true;
+        break;
+      }
+    }
+    expect(got, 'stream-less peer never received presence over REST').toBe(true);
+
+    mock.setMaxStreams(10);
+    await joiner.stop();
+    await host.stop();
+  }, 60_000);
+});
