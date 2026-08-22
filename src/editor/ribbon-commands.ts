@@ -4393,6 +4393,7 @@ export type RibbonCommandId =
   | 'addQuickCard'
   | 'manageQuickCards'
   | 'openQuickCardSearch'
+  | 'openEvidenceSearch'
   | 'collabStartSession'
   | 'collabJoinSession'
   | 'collabCopyShareCode'
@@ -4615,6 +4616,7 @@ export const RIBBON_COMMAND_IDS: RibbonCommandId[] = [
   'addQuickCard',
   'manageQuickCards',
   'openQuickCardSearch',
+  'openEvidenceSearch',
   'collabStartSession',
   'collabJoinSession',
   'collabCopyShareCode',
@@ -4797,6 +4799,7 @@ export const RIBBON_COMMAND_LABELS: Record<RibbonCommandId, string> = {
   addQuickCard: 'Add Quick Card',
   manageQuickCards: 'Manage Quick Cards',
   openQuickCardSearch: 'Search Everything',
+  openEvidenceSearch: 'Search Evidence',
   collabStartSession: 'Start Collaboration Session',
   collabJoinSession: 'Join Collaboration Session',
   collabCopyShareCode: 'Copy Session Share Code',
@@ -5152,6 +5155,7 @@ export const DEFAULT_RIBBON_KEYS: Record<RibbonCommandId, string | string[]> = {
   addQuickCard: '',
   manageQuickCards: '',
   openQuickCardSearch: 'Mod-Shift-Space',
+  openEvidenceSearch: 'Mod-Shift-E',
   collabStartSession: '',
   collabJoinSession: '',
   collabCopyShareCode: '',
@@ -5396,6 +5400,7 @@ export interface RibbonContext {
   /** Open the floating quick-card search palette. Works with no
    *  active doc (browse-only; insert no-ops). */
   openQuickCardSearch: () => void;
+  openEvidenceSearch: () => void;
   collabStartSession: () => void;
   collabJoinSession: () => void;
   collabCopyShareCode: () => void;
@@ -5542,6 +5547,7 @@ const DEFAULT_RIBBON_CONTEXT: RibbonContext = {
   addQuickCard: () => {},
   manageQuickCards: () => {},
   openQuickCardSearch: () => {},
+  openEvidenceSearch: () => {},
   collabStartSession: () => {},
   collabJoinSession: () => {},
   collabCopyShareCode: () => {},
@@ -6162,6 +6168,12 @@ function commandFor(id: RibbonCommandId, ctx: RibbonContext): Command {
       return (_state, dispatch) => {
         if (!dispatch) return true;
         ctx.openQuickCardSearch();
+        return true;
+      };
+    case 'openEvidenceSearch':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.openEvidenceSearch();
         return true;
       };
     case 'collabStartSession':

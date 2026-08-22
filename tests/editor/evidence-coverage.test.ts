@@ -15,6 +15,7 @@
 import { describe, it, expect } from 'vitest';
 import { schema } from '../../src/schema/index.js';
 import { extractEvidenceRows, makeFileEntry, type FileEntry } from '../../src/editor/file-search.js';
+import { evidenceResult } from '../../src/editor/quick-card-search-ui.js';
 import { perFileBudget } from '../../src/editor/evidence-index.js';
 
 const t = (s: string) => schema.text(s);
@@ -98,5 +99,23 @@ describe('perFileBudget', () => {
       const b = perFileBudget(files, 200_000);
       expect(b.maxBodyRows).toBeLessThan(b.maxRows);
     }
+  });
+});
+
+describe('result rendering', () => {
+  it("gives a card's three rows three distinct headlines", () => {
+    const rows = extractEvidenceRows(backfile(1), file, 100);
+    expect(rows.length).toBe(3); // tag + cite + body
+
+    // The data still shares a label — that is the structural CONTEXT.
+    expect(new Set(rows.map((r) => r.label)).size).toBe(1);
+
+    // What the user sees must nonetheless be three different rows.
+    const names = rows.map((r) => evidenceResult(r).name);
+    expect(new Set(names).size, `duplicate headlines: ${JSON.stringify(names)}`).toBe(3);
+
+    // And the tag context is still reachable, in the meta line.
+    const bodyRow = rows.find((r) => r.kind === 'body' || r.kind === 'paragraph')!;
+    expect(evidenceResult(bodyRow).meta).toContain('Warming causes extinction 0');
   });
 });

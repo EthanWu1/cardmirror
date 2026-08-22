@@ -2017,6 +2017,21 @@ const ribbonContext: RibbonContext = {
       docPath: view ? getViewDocPath(view) : null,
     });
   },
+  openEvidenceSearch: () => {
+    // Same palette, opened straight into evidence mode: searches INSIDE the
+    // corpus (tags, cites, card bodies) rather than over filenames, and Enter
+    // opens the hit's file scrolled to the card.
+    const paneEl =
+      (view?.dom.closest('.pmd-pane') as HTMLElement | null) ?? editorEl ?? null;
+    quickCardSearchUI.open({
+      view,
+      paneEl,
+      runCommand: runRibbonCommandById,
+      openFilePath: openFileByPath,
+      openFileAtDescriptor: openFileByPathAtDescriptor,
+      mode: 'evidence',
+    });
+  },
   insertLiveZone: () => {
     // Same picker, in transclude mode: pick a file, drill to a header, insert a
     // live zone. Needs the current doc's path to build a portable source ref.
@@ -4269,6 +4284,7 @@ const VIEWLESS_RIBBON_COMMANDS = new Set<AnyCommandId>([
   // Quick-card search palette — opens browse-only without a doc, so
   // its Mod-Shift-Space binding must work view-less too.
   'openQuickCardSearch',
+  'openEvidenceSearch',
   'insertLiveZone',
   'insertSelfLiveZone',
   'insertInDocCopy',
@@ -4316,6 +4332,7 @@ function runViewlessRibbon(id: AnyCommandId): void {
     case 'toggleNavPane': ribbonContext.toggleNavPane(); return;
     case 'goHome': ribbonContext.goHome(); return;
     case 'openQuickCardSearch': ribbonContext.openQuickCardSearch(); return;
+    case 'openEvidenceSearch': ribbonContext.openEvidenceSearch(); return;
     case 'insertLiveZone': ribbonContext.insertLiveZone(); return;
     case 'insertSelfLiveZone': ribbonContext.insertSelfLiveZone(); return;
     case 'insertInDocCopy': ribbonContext.insertInDocCopy(); return;
@@ -6851,6 +6868,18 @@ async function openFileByPath(path: string, name: string): Promise<void> {
     return;
   }
   await routeOpenedFile({ name: file.name, bytes: file.bytes, handle: file.handle });
+}
+
+/** Open `path` and land on `descriptor` — the evidence palette's Enter. Routes
+ *  through the same source-view path Learn uses, so the file opens (or focuses,
+ *  if already open) with the anchored text selected and scrolled into view. */
+async function openFileByPathAtDescriptor(
+  path: string,
+  name: string,
+  descriptor: AnchorDescriptor,
+): Promise<boolean> {
+  await showFlashcardSource({ path, name, descriptor }, () => {});
+  return true;
 }
 
 /** Resolve `descriptor` against the active view's doc and select +

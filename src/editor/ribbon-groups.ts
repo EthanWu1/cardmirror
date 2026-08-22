@@ -166,7 +166,7 @@ export const RIBBON_GROUPS: RibbonGroup[] = [
     // commands, settings, and files — so it lives in its own group
     // rather than under Quick Cards.
     title: 'Search',
-    commands: ['openQuickCardSearch'],
+    commands: ['openQuickCardSearch', 'openEvidenceSearch'],
   },
   {
     title: 'View',
