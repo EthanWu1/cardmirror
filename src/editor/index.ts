@@ -96,6 +96,7 @@ import {
   quickCardSearchUI,
   openQuickCardTagPicker,
   prewarmQuickCardFiles,
+
 } from './quick-card-search-ui.js';
 import {
   learnStore,
@@ -325,6 +326,7 @@ import { captureCleanToken } from './save-clean-token.js';
 import { wireWebEditionHeaderButtons } from './web-download.js';
 import { computeSelectionChrome, type SelectionChrome } from './selection-chrome.js';
 import { formatSpeechFilename } from './speech-filename.js';
+import { startEvidenceWarmup } from './evidence-warmup.js';
 
 // Install the last-resort error hooks before ANY app wiring — an exception
 // during boot or in a fire-and-forget flow must never be invisible again.
@@ -8811,6 +8813,10 @@ void quickCardsStore.init();
 // opened, so the first search's `.docx` parse is already cached and never
 // janks a keystroke. No-op off Electron / without a file-search root.
 prewarmQuickCardFiles();
+// Parse the evidence corpus into the persistent row cache shortly after boot,
+// so Search Evidence opens against a warm index instead of paying a full cold
+// parse on first use. Desktop-only and best-effort; see evidence-warmup.ts.
+startEvidenceWarmup();
 
 // Single cross-window dropzone pill, anchored to the editor's
 // bottom-left corner (NOT the nav pane — dragging onto a nav-bottom
