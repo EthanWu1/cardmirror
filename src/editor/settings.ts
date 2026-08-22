@@ -1404,6 +1404,8 @@ export interface Settings {
   /** Render the three-pane workspace's slots/stacks as a Chrome-style tab
    *  strip. Requires `multiDocWorkspace`; off by default while it matures. */
   tabbedWorkspace: boolean;
+  /** Preset used when Create Flow opens a new native CardMirror Flow doc. */
+  defaultFlowFormat: 'ld' | 'pf' | 'policy';
   /** Which UI shell the web edition uses on this device. `'auto'`
    *  picks the mobile shell on coarse-pointer screens narrower than
    *  1024px (resolved once per load — rotating mid-session doesn't
@@ -1800,6 +1802,7 @@ const DEFAULTS: Settings = {
   prependTranslationMarker: true,
   multiDocWorkspace: false,
   tabbedWorkspace: false,
+  defaultFlowFormat: 'ld',
   mobileLayout: 'auto',
   multiDocLayoutMode: 'compact',
   quickCardActiveTags: [],
@@ -4524,6 +4527,8 @@ function sanitize(s: Settings): Settings {
     prependTranslationMarker: s.prependTranslationMarker === false ? false : true,
     multiDocWorkspace: !!s.multiDocWorkspace,
     tabbedWorkspace: !!s.tabbedWorkspace,
+    defaultFlowFormat:
+      s.defaultFlowFormat === 'pf' || s.defaultFlowFormat === 'policy' ? s.defaultFlowFormat : 'ld',
     mobileLayout:
       s.mobileLayout === 'mobile' || s.mobileLayout === 'desktop'
         ? s.mobileLayout

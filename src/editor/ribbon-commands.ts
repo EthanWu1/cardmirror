@@ -4329,6 +4329,9 @@ export type RibbonCommandId =
   | 'sendHeadingsToFlowCell'
   | 'pullFromFlow'
   | 'createFlow'
+  | 'createLegacyExcelFlow'
+  | 'addAffFlow'
+  | 'addNegFlow'
   | 'startFlowHost'
   | 'toggleVoice'
   | 'openCardCutter'
@@ -4560,6 +4563,9 @@ export const RIBBON_COMMAND_IDS: RibbonCommandId[] = [
   'sendHeadingsToFlowCell',
   'pullFromFlow',
   'createFlow',
+  'createLegacyExcelFlow',
+  'addAffFlow',
+  'addNegFlow',
   'startFlowHost',
   'toggleVoice',
   'openCardCutter',
@@ -4742,7 +4748,10 @@ export const RIBBON_COMMAND_LABELS: Record<RibbonCommandId, string> = {
   sendHeadingsToFlowColumn: 'Send Headings to Flow (one cell per line)',
   sendHeadingsToFlowCell: 'Send Headings to Flow (single cell)',
   pullFromFlow: 'Pull Selection from Flow',
-  createFlow: 'Create New Flow',
+  createFlow: 'Create Flow',
+  createLegacyExcelFlow: 'Create Excel Flow (Legacy)',
+  addAffFlow: 'Add Aff Flow',
+  addNegFlow: 'Add Neg Flow',
   startFlowHost: 'Start Flow Connection',
   toggleVoice: 'Toggle voice control',
   openCardCutter: 'Cut card with AI…',
@@ -5088,6 +5097,9 @@ export const DEFAULT_RIBBON_KEYS: Record<RibbonCommandId, string | string[]> = {
   sendHeadingsToFlowCell: '',
   pullFromFlow: '',
   createFlow: '',
+  createLegacyExcelFlow: '',
+  addAffFlow: '',
+  addNegFlow: '',
   startFlowHost: '',
   toggleVoice: 'Mod-Shift-V',
   openCardCutter: 'Mod-Alt-c',
@@ -5333,6 +5345,9 @@ export interface RibbonContext {
   sendHeadingsToFlowCell: () => void;
   pullFromFlow: () => void;
   createFlow: () => void;
+  createLegacyExcelFlow: () => void;
+  addAffFlow: () => void;
+  addNegFlow: () => void;
   /** Pre-warm the persistent Flow PowerShell host (Windows only). */
   startFlowHost: () => void;
   /** Toggle the voice-control session on/off (desktop only). */
@@ -5515,6 +5530,9 @@ const DEFAULT_RIBBON_CONTEXT: RibbonContext = {
   sendHeadingsToFlowCell: () => {},
   pullFromFlow: () => {},
   createFlow: () => {},
+  createLegacyExcelFlow: () => {},
+  addAffFlow: () => {},
+  addNegFlow: () => {},
   startFlowHost: () => {},
   toggleVoice: () => {},
   openCardCutter: () => {},
@@ -5841,6 +5859,24 @@ function commandFor(id: RibbonCommandId, ctx: RibbonContext): Command {
       return (_state, dispatch) => {
         if (!dispatch) return true;
         ctx.pullFromFlow();
+        return true;
+      };
+    case 'createLegacyExcelFlow':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.createLegacyExcelFlow();
+        return true;
+      };
+    case 'addAffFlow':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.addAffFlow();
+        return true;
+      };
+    case 'addNegFlow':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.addNegFlow();
         return true;
       };
     case 'createFlow':

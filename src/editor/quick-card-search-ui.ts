@@ -1454,6 +1454,9 @@ class QuickCardSearchUI {
       // Main-thread fallback for environments without Web Workers (jsdom /
       // tests, defensive). Production Electron uses the worker pool.
       indexFileOnMain: async (entry, bytes, format, limits) => {
+        // Flows carry no searchable document object; the corpus filter above
+        // already excludes them, so this is a type-level guard.
+        if (format === 'cmflow') return [];
         const doc = await parseFileDoc(bytes, format);
         const extracted = extractEvidenceRows(doc, entry, limits);
         for (const row of extracted) row.searchText ??= evidenceSearchText(row);

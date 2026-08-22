@@ -162,13 +162,14 @@ export function baseName(p: string): string {
 
 /** Openable format of a listed file, by extension. The file scan yields
  *  only `.cmir` and `.docx`, so anything not `.docx` is treated as `cmir`. */
-/** Formats the app can open and index. `.cmflow` joins this when the flow
- *  subsystem lands; until then claiming it would advertise files nothing can
- *  open. */
-export type OpenableFileFormat = 'cmir' | 'docx';
+/** Formats the app can open. `.cmflow` is openable but has no searchable
+ *  document object, so the evidence indexer skips it. */
+export type OpenableFileFormat = 'cmir' | 'docx' | 'cmflow';
 
 export function fileFormat(pathOrName: string): OpenableFileFormat {
-  return /\.docx$/i.test(pathOrName) ? 'docx' : 'cmir';
+  if (/\.docx$/i.test(pathOrName)) return 'docx';
+  if (/\.cmflow$/i.test(pathOrName)) return 'cmflow';
+  return 'cmir';
 }
 
 /** Display name for a listed file: the openable extension (.cmir/.docx)

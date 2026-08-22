@@ -310,7 +310,8 @@ export interface SpawnWindowPayload {
   filename: string;
   bytes: Uint8Array;
   handle: string | null;
-  format: 'cmir' | 'docx' | null;
+  /** `.cmflow` spawns a Flow window rather than a document window. */
+  format: 'cmir' | 'docx' | 'cmflow' | null;
   /** Pre-existing doc uid (when the doc is being moved between
    *  windows or recovered from a journal). Null for fresh docs. */
   uid: string | null;

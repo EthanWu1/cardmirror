@@ -155,7 +155,7 @@ export async function runPullFromFlow(view: EditorView): Promise<void> {
   showToast(`Pulled ${cells.length} ${cells.length === 1 ? 'cell' : 'cells'} from Flow.`);
 }
 
-export async function runCreateFlow(): Promise<void> {
+export async function runCreateLegacyExcelFlow(): Promise<void> {
   const host = getElectronHost();
   if (!host?.flowCreate) {
     showToast(FLOW_WINDOWS_ONLY_MESSAGE);

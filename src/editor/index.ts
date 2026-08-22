@@ -7,6 +7,17 @@
  * multi-pane / mobile shells install to take over per-pane state.
  */
 
+import { createRound, type FlowRound, type FlowSide } from './flow/flow-model.js';
+import { parseFlowFile, parseFlowlineJson, serializeFlowFile } from './flow/flow-file.js';
+import { createFlowWorkspace, defaultFlowName, type FlowWorkspace } from './flow/flow-workspace.js';
+import {
+  flowFormatForFilename,
+  flowBaselineForRound,
+  suggestedFlowSaveName,
+  flowDirtyEquals,
+  type OpenedFlowFormat,
+} from './flow/flow-single-pane.js';
+import './flow/flow-workspace.css';
 import { EditorState, Plugin, Selection, TextSelection, type Command } from 'prosemirror-state';
 import { EditorView } from 'prosemirror-view';
 import { keymap } from 'prosemirror-keymap';
@@ -156,7 +167,12 @@ import { runReformatAllCites } from './ai/reformat-all-cites.js';
 import { runTranslate } from './translate.js';
 import { runRepairText } from './ai/repair-text.js';
 import { runRepairFormatting } from './ai/repair-formatting.js';
-import { runSendToFlow, runPullFromFlow, runCreateFlow, runStartFlowHost } from './flow-port.js';
+import {
+  runSendToFlow,
+  runPullFromFlow,
+  runCreateLegacyExcelFlow,
+  runStartFlowHost,
+} from './flow-port.js';
 import {
   readModePlugin,
   PMD_READ_MODE_TOGGLE,
@@ -934,6 +950,11 @@ let currentDoc: PMNode = makeNewDocBody();
  *  variable below via `setActiveView`. The single-doc open / mount
  *  paths delegate to the shell instead. */
 let multiDocActive = false;
+let multiDocOnCreateFlow: (() => Promise<boolean> | boolean) | null = null;
+let multiDocOnFlowOpen: ((opened: OpenedFile) => Promise<boolean> | boolean) | null = null;
+let multiDocSaveFocusedFlow: (() => Promise<boolean | null> | boolean | null) | null = null;
+let multiDocSaveFocusedFlowAs: (() => Promise<boolean | null> | boolean | null) | null = null;
+let multiDocAddFlowToFocused: ((side: FlowSide) => boolean | null) | null = null;
 /** When the multi-pane shell is active, this delegates file-open
  *  routing to its prompt-for-slot flow. */
 let multiDocOnFileOpen: ((opened: OpenedFile) => Promise<void> | void) | null = null;
@@ -1776,7 +1797,18 @@ const ribbonContext: RibbonContext = {
     if (view) void runPullFromFlow(view);
   },
   createFlow: () => {
-    void runCreateFlow();
+    // Native CardMirror Flow. The Excel/Verbatim exporter keeps its own
+    // command (createLegacyExcelFlow) rather than sharing this one.
+    void runCreateNativeFlow();
+  },
+  createLegacyExcelFlow: () => {
+    void runCreateLegacyExcelFlow();
+  },
+  addAffFlow: () => {
+    addFlowToActiveWorkspace('aff');
+  },
+  addNegFlow: () => {
+    addFlowToActiveWorkspace('neg');
   },
   startFlowHost: () => {
     void runStartFlowHost();
@@ -6294,6 +6326,10 @@ async function runOpenFlow(): Promise<void> {
  *  dialog and the command-palette file search, so file search opens in
  *  a new window / the slot picker rather than replacing the current doc. */
 async function routeOpenedFile(opened: OpenedFile): Promise<void> {
+  if (isFlowFilename(opened.name)) {
+    await routeOpenedFlowFile(opened);
+    return;
+  }
   // Decode a .cmir-journal into its wrapped doc (recovered, unsaved); a plain
   // .cmir/.docx passes through unchanged.
   const src = resolveOpenedFile(opened);
@@ -9380,6 +9416,24 @@ async function mountFromSpawnPayload(
   payload: Awaited<ReturnType<ReturnType<typeof getHost>['getInitialDoc']>>,
 ): Promise<void> {
   if (!payload) return;
+  // A spawned Flow window mounts the Flow workspace, not a document — the
+  // doc-mount path below would hand .cmflow bytes to the importer.
+  if (payload.format === 'cmflow' || isFlowFilename(payload.filename)) {
+    if (multiDocActive) {
+      await multiDocOnFlowOpen?.({
+        name: payload.filename,
+        bytes: payload.bytes,
+        handle: payload.handle ?? null,
+      });
+      return;
+    }
+    await mountOpenedFlowInPlace({
+      name: payload.filename,
+      bytes: payload.bytes,
+      handle: payload.handle ?? null,
+    });
+    return;
+  }
   // Initial-doc / file-association opens land here without passing
   // through routeOpenedFile, so a password-protected file must be
   // handled at this parse point too.
@@ -10161,3 +10215,281 @@ setOpenSourceOpener((targetView, pos) => {
     void openFileByPath(abs, abs.split(/[\\/]/).pop() ?? 'source.cmir');
   });
 });
+
+// ── Flow files ───────────────────────────────────────────────────────
+
+let activeFlowWorkspace: FlowWorkspace | null = null;
+let activeFlowHandle: unknown | null = null;
+let activeFlowFilename: string | null = null;
+let activeFlowFormat: OpenedFlowFormat | null = null;
+let activeFlowBaselineJson: string | null = null;
+let activeFlowCreatedAt: string | null = null;
+let activeFlowEditGen = 0;
+
+
+function setActiveFlowHandle(next: unknown | null): void {
+  const prev = activeFlowHandle;
+  activeFlowHandle = next;
+  if (prev === next) return;
+  const electron = getElectronHost();
+  if (!electron) return;
+  if (typeof prev === 'string' && prev) {
+    void electron.openPathRelease(prev);
+  }
+  if (typeof next === 'string' && next) {
+    void electron.openPathRegister(next);
+  }
+}
+
+
+function destroyActiveFlowWorkspace(clearState = true): void {
+  if (activeFlowWorkspace) {
+    activeFlowWorkspace.destroy();
+    activeFlowWorkspace = null;
+  }
+  document.body.classList.remove('pmd-flow-active');
+  if (!clearState) return;
+  setActiveFlowHandle(null);
+  activeFlowFilename = null;
+  activeFlowFormat = null;
+  activeFlowBaselineJson = null;
+  activeFlowCreatedAt = null;
+  activeFlowEditGen++;
+}
+
+
+function activeFlowRound(): FlowRound | null {
+  return activeFlowWorkspace?.getRound() ?? null;
+}
+
+
+function activeFlowIsDirty(): boolean {
+  const round = activeFlowRound();
+  return round ? flowDirtyEquals(round, activeFlowBaselineJson) : false;
+}
+
+
+function addFlowToActiveWorkspace(side: FlowSide): void {
+  if (multiDocActive && multiDocAddFlowToFocused) {
+    const added = multiDocAddFlowToFocused(side);
+    if (added !== null) {
+      if (!added) showToast('Open a Flow first.');
+      return;
+    }
+  }
+  if (!activeFlowWorkspace) {
+    showToast('Open a Flow first.');
+    return;
+  }
+  activeFlowWorkspace.addFlow(side);
+}
+
+
+function captureActiveFlowCleanToken(): () => boolean {
+  const workspace = activeFlowWorkspace;
+  const gen = activeFlowEditGen;
+  return () => {
+    if (!workspace || workspace !== activeFlowWorkspace) return false;
+    if (gen !== activeFlowEditGen) return false;
+    activeFlowBaselineJson = flowBaselineForRound(workspace.getRound());
+    return true;
+  };
+}
+
+
+function mountActiveFlowWorkspace(opts: {
+  round: FlowRound;
+  filename: string | null;
+  handle: unknown | null;
+  format: OpenedFlowFormat | null;
+  baselineJson: string | null;
+  createdAt?: string | null;
+  recordRecent?: boolean;
+}): void {
+  if (view) {
+    editorDragSurface.detach();
+    view.destroy();
+    view = null;
+  }
+  if (registeredSingleDocUid !== null) {
+    getSpeechDocResolver().unregisterView(registeredSingleDocUid);
+    registeredSingleDocUid = null;
+  }
+  destroyActiveFlowWorkspace();
+  void clearCurrentJournal();
+  currentDocFilename = null;
+  setCurrentDocHandle(null);
+  currentDocFormat = null;
+  currentDocId = null;
+  currentDocUid = newSessionDocUid();
+  currentDocDirty = false;
+  currentDocEditGen++;
+
+  activeFlowFilename = opts.filename;
+  activeFlowFormat = opts.format;
+  activeFlowBaselineJson = opts.baselineJson;
+  activeFlowCreatedAt = opts.createdAt ?? opts.round.createdAt ?? new Date().toISOString();
+  setActiveFlowHandle(opts.handle);
+  activeFlowEditGen++;
+
+  activeFlowWorkspace = createFlowWorkspace({
+    mount: editorEl,
+    round: opts.round,
+    onChange: () => {
+      activeFlowEditGen++;
+      markNonPristineStarter();
+      if (activeFlowIsDirty()) void runAutosaveAttempt();
+      refreshAutosaveBtn();
+    },
+    onRequestSave: () => {
+      void runSaveFlow();
+    },
+    onRequestClose: () => {
+      void handleCloseDocToHome();
+    },
+  });
+  document.body.classList.add('pmd-flow-active');
+  if (activeFlowBaselineJson === null && opts.baselineJson !== null) {
+    activeFlowBaselineJson = JSON.stringify(activeFlowWorkspace.getRound());
+  }
+  settings.set(
+    'autosaveEnabled',
+    opts.handle ? isAutosaveOnForPath(opts.handle) : settings.get('autosaveEnabled'),
+  );
+  if (opts.recordRecent) {
+    recordRecent({
+      handle: typeof opts.handle === 'string' ? opts.handle : null,
+      filename: opts.filename ?? defaultFlowName(opts.round.format),
+      format: 'cmflow',
+    });
+  }
+  markNonPristineStarter();
+  homeScreen.hide();
+  updateWindowTitle();
+  refreshAutosaveBtn();
+  activeFlowWorkspace.focus();
+}
+
+/** The active doc's persistent docId + session uid — mode-aware. In
+ *  multi-pane this is the focused pane's record; in single-doc the
+ *  module-level `currentDoc*` values. */
+
+
+function isFlowFilename(name: string | null | undefined): boolean {
+  return flowFormatForFilename(name) !== null;
+}
+
+/** Choose the PARSER for already-loaded doc bytes by sniffing them, not by the
+ *  doc's `format` field. A `.docx` is a zip — its bytes start with `PK`
+ *  (0x50 0x4b); native cmir is gzipped or raw JSON and never does. The `format`
+ *  field is the SAVE format, NOT a reliable parser hint: in-memory and journal
+ *  serializations are ALWAYS native cmir even for docx-saved docs, so a
+ *  mode-switch respawn or an opened `.cmir-journal` carries cmir bytes stamped
+ *  `format: 'docx'`. Sniffing the bytes is authoritative; trusting `format` here
+ *  sends those cmir bytes to the Word importer, which throws "not a zip file". */
+
+
+async function confirmFlowInPlaceReplacement(): Promise<boolean> {
+  // Mirrors the New-document path: only prompt when there are real edits to
+  // lose, then honour save / discard / cancel.
+  if (isPristineStarter) return true;
+  const choice = await confirmNewDocOverwrite();
+  if (choice === 'cancel') return false;
+  if (choice === 'save') return runSaveAsFlow();
+  return true;
+}
+
+
+async function mountOpenedFlowInPlace(opened: OpenedFile): Promise<boolean> {
+  const format = flowFormatForFilename(opened.name);
+  if (!format) return false;
+  try {
+    if (format === 'cmflow') {
+      const file = parseFlowFile(opened.bytes);
+      if (!(await confirmFlowInPlaceReplacement())) return false;
+      mountActiveFlowWorkspace({
+        round: file.round,
+        filename: opened.name,
+        handle: opened.handle ?? null,
+        format,
+        baselineJson: flowBaselineForRound(file.round),
+        createdAt: file.createdAt,
+        recordRecent: true,
+      });
+      return true;
+    }
+    const round = parseFlowlineJson(opened.bytes);
+    if (!(await confirmFlowInPlaceReplacement())) return false;
+    mountActiveFlowWorkspace({
+      round,
+      filename: suggestedFlowSaveName(opened.name),
+      handle: null,
+      format,
+      baselineJson: flowBaselineForRound(round),
+      createdAt: round.createdAt,
+    });
+    return true;
+  } catch (err) {
+    console.error('Failed to load Flow:', err);
+    void alertDialog(`Failed to load Flow: ${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+}
+
+
+async function routeOpenedFlowFile(opened: OpenedFile, opts: { forceInPlace?: boolean } = {}): Promise<boolean> {
+  const format = flowFormatForFilename(opened.name);
+  if (!format) return false;
+  if (multiDocActive) {
+    return (await multiDocOnFlowOpen?.(opened)) ?? false;
+  }
+  if (format === 'cmflow' && opened.handle != null) {
+    if (await isFileOpenInAnotherWindow(opened.handle)) {
+      showToast(`"${opened.name}" is already open in another window.`);
+      return false;
+    }
+    if (activeFlowHandle != null && (await isSameOpenHandle(activeFlowHandle, opened.handle))) {
+      showToast(`"${opened.name}" is already open.`);
+      homeScreen.hide();
+      return true;
+    }
+  }
+  const host = getHost();
+  if (!opts.forceInPlace && format === 'cmflow' && host.canSpawnWindow && !isPristineStarter) {
+    try {
+      await host.spawnWindow({
+        filename: opened.name,
+        bytes: opened.bytes,
+        handle: typeof opened.handle === 'string' ? opened.handle : null,
+        format: 'cmflow',
+        uid: null,
+      });
+      return true;
+    } catch (err) {
+      console.error('Spawn Flow window failed:', err);
+      void alertDialog(`Failed to open Flow in a new window: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
+  return mountOpenedFlowInPlace(opened);
+}
+
+
+async function runCreateNativeFlow(): Promise<boolean> {
+  if (multiDocActive) {
+    return (await multiDocOnCreateFlow?.()) ?? false;
+  }
+  const format = settings.get('defaultFlowFormat');
+  const round = createRound({ format });
+  if (!(await confirmFlowInPlaceReplacement())) return false;
+  mountActiveFlowWorkspace({
+    round,
+    filename: defaultFlowName(format),
+    handle: null,
+    format: 'cmflow',
+    baselineJson: flowBaselineForRound(round),
+    createdAt: round.createdAt,
+  });
+  return true;
+}
+

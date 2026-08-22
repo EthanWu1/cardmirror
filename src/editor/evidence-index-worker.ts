@@ -36,8 +36,7 @@ type EvidenceIndexResponse = EvidenceIndexSuccess | EvidenceIndexFailure;
 
 async function parseEvidenceFile(bytes: Uint8Array, format: OpenableFileFormat): Promise<PMNode> {
   if (format === 'docx') return fromDocx(bytes);
-  // `.cmflow` re-enters OpenableFileFormat with the flow subsystem; it has no
-  // searchable document object and will need rejecting here again then.
+  if (format === 'cmflow') throw new Error('Flow files do not have searchable document objects.');
   return parseNative(bytes).doc;
 }
 
