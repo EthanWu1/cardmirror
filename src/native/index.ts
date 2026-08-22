@@ -55,6 +55,16 @@ const FORMAT_VERSION = 1;
 /** Canonical file extension (no leading dot). */
 export const NATIVE_FILE_EXTENSION = 'cmir';
 
+/** Where a shared `.cmir` lives as a live co-editing document. Travels inside
+ *  the file so opening it anywhere can rejoin the room; the share code is the
+ *  security boundary (there are no roles or revocation yet). */
+export interface SharedDocMetadata {
+  docId: string;
+  roomId: string;
+  shareCode: string;
+  createdAt: string;
+}
+
 export interface NativeFile {
   format: typeof FORMAT_ID;
   formatVersion: number;
@@ -71,6 +81,9 @@ export interface NativeFile {
    *  (flashcards / AI threads / schedule) to this doc across renames and
    *  format changes. Minted on first save; absent on older files. */
   docId?: string;
+  /** Persistent collaboration pointer. Anyone who can read the file can use
+   *  this to rejoin the encrypted shared document. */
+  sharedDoc?: SharedDocMetadata;
 }
 
 export interface SerializeNativeOptions {
@@ -83,6 +96,9 @@ export interface SerializeNativeOptions {
   /** Stable per-document UUID (see `NativeFile.docId`). Written only
    *  when provided, so callers that don't track it are unaffected. */
   docId?: string;
+  /** Persistent collaboration pointer. Anyone who can read the file can use
+   *  this to rejoin the encrypted shared document. */
+  sharedDoc?: SharedDocMetadata;
 }
 
 /** Diagnostic hook for the save-time structural tripwire below. The
@@ -158,6 +174,9 @@ function buildNativeEnvelope(doc: PMNode, opts: SerializeNativeOptions): Uint8Ar
   if (opts.docId) {
     file.docId = opts.docId;
   }
+  if (opts.sharedDoc) {
+    file.sharedDoc = { ...opts.sharedDoc };
+  }
   return new TextEncoder().encode(JSON.stringify(file));
 }
 
@@ -188,6 +207,8 @@ export interface ParseNativeResult {
   threads: Thread[];
   /** Stable per-document UUID, or null on files that predate it. */
   docId: string | null;
+  /** Persistent collaboration pointer, or null for ordinary/local files. */
+  sharedDoc: SharedDocMetadata | null;
   meta: {
     createdBy: string;
     createdAt: string;
@@ -205,6 +226,32 @@ export class NativeDamagedError extends Error {
 /** Parse CardMirror native bytes back into a doc + threads. Throws
  *  with a descriptive message when the bytes aren't a valid CardMirror
  *  file — caller can show that to the user. */
+/** Validate the embedded pointer. A partial or malformed block is treated as
+ *  absent rather than trusted — a bad roomId would send the opener at a room
+ *  that does not exist. */
+function parseSharedDoc(value: unknown): SharedDocMetadata | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const raw = value as Partial<SharedDocMetadata>;
+  if (
+    typeof raw.docId !== 'string' ||
+    !raw.docId ||
+    typeof raw.roomId !== 'string' ||
+    !raw.roomId ||
+    typeof raw.shareCode !== 'string' ||
+    !raw.shareCode ||
+    typeof raw.createdAt !== 'string' ||
+    !raw.createdAt
+  ) {
+    return null;
+  }
+  return {
+    docId: raw.docId,
+    roomId: raw.roomId,
+    shareCode: raw.shareCode,
+    createdAt: raw.createdAt,
+  };
+}
+
 export function parseNative(bytes: Uint8Array): ParseNativeResult {
   return parseNativeImpl(bytes, false);
 }
@@ -336,6 +383,7 @@ function parseNativeImpl(
     doc,
     threads: Array.isArray(file.threads) ? file.threads : [],
     docId: typeof file.docId === 'string' && file.docId ? file.docId : null,
+    sharedDoc: parseSharedDoc(file.sharedDoc),
     meta: {
       createdBy: typeof file.createdBy === 'string' ? file.createdBy : '',
       createdAt: typeof file.createdAt === 'string' ? file.createdAt : '',

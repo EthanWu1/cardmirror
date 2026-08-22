@@ -90,6 +90,13 @@ export interface FetchUpdatesResult {
   snapCovers: number;
 }
 
+/** A persistent shared document and the room carrying its live edits. In this
+ *  slice docId === roomId; kept separate so the relay can decouple them. */
+export interface PersistentDocRoom {
+  docId: string;
+  roomId: string;
+}
+
 export interface RoomsClientOptions {
   /** Relay base URL including the `/relay` prefix, re-read per request. */
   baseUrl: () => string;
@@ -274,6 +281,23 @@ export class RoomsClient {
     return body.presence.map((b) => base64ToBytes(b));
   }
 
+  /** Create a PERSISTENT document room — same transport as a temporary room,
+   *  but the relay's sweeper leaves it alone so a shared `.cmir` reopened days
+   *  later still finds its history. */
+  async createPersistentDoc(): Promise<PersistentDocRoom> {
+    const res = await this.request('/docs', { method: 'POST', headers: this.headers() });
+    const body = await this.readJson<{ docId?: string; roomId?: string }>(res, '/docs');
+    if (!body.docId || !body.roomId) {
+      throw new RoomsError(0, 'malformed createPersistentDoc response');
+    }
+    return { docId: body.docId, roomId: body.roomId };
+  }
+
+  /** End a shared document for everyone (tombstone + archive). */
+  async deletePersistentDoc(docId: string): Promise<void> {
+    await this.request(`/docs/${docId}`, { method: 'DELETE', headers: this.headers() });
+  }
+
   async deleteRoom(roomId: string): Promise<void> {
     await this.request(`/rooms/${roomId}`, { method: 'DELETE', headers: this.headers() });
   }
@@ -316,6 +340,13 @@ export interface RoomStreamOptions {
   maxBackoffMs?: number;
   /** Abort the stream when no bytes have arrived for this long. 0 disables. */
   stallTimeoutMs?: number;
+  /** Keep retrying a 404/410 instead of ending. A PERSISTENT document outlives
+   *  its participants, so "no such room" is usually a relay restart or a
+   *  not-yet-visible write, not the end of the document. */
+  retryMissingRoom?: boolean;
+  /** Keep retrying a 409 even on a first join, for the same reason: a durable
+   *  room's slots may still hold ghosts from a previous session. */
+  retryFullRoom?: boolean;
 }
 
 /** A half-open socket neither delivers bytes nor closes, so a read can block
@@ -460,6 +491,12 @@ export class RoomStream {
         signal: this.controller.signal,
       });
       if (res.status === 410 || res.status === 404) {
+        if (this.opts.retryMissingRoom) {
+          // A persistent document outlives its participants: treat a missing
+          // room as transient (relay restart / replica lag) and keep trying.
+          this.scheduleRetry();
+          return;
+        }
         // Tombstoned (or GC'd all the way to gone): the session is over.
         this.stopped = true;
         this.opts.callbacks.onEnded();
@@ -470,7 +507,7 @@ export class RoomStream {
         // the count may include our own not-yet-reaped ghost connection
         // from the drop; the server clears those within a heartbeat
         // cycle, so retry instead of ending an established session.
-        if (!this.everHelloed) {
+        if (!this.everHelloed && !this.opts.retryFullRoom) {
           this.stopped = true;
           this.opts.callbacks.onFull();
           return;

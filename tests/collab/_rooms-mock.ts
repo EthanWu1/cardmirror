@@ -36,6 +36,8 @@ export interface RoomsMock {
   updateCount(roomId: string): number;
   /** Total stream CONNECT attempts (incl. ones that never helloed). */
   streamAttempts(): number;
+  /** Make the relay forget a room entirely (restart / replica lag). */
+  forgetRoom(roomId: string): void;
   /** Cap on concurrent streams per room. Drop it to 1 to make the NEXT peer
    *  genuinely stream-less (the relay answers 409), which is the real
    *  condition presence-over-REST exists for. */
@@ -57,7 +59,11 @@ export function startRoomsMock(): Promise<RoomsMock> {
   let helloDelayMs = 0;
   let guestPassValue: string | null = null;
   let streamAttempts = 0;
+  const END_FRAME = `data: ${JSON.stringify({ t: 'end' })}
+
+`;
   let pushMuted = false;
+  const persistentDocs = new Set<string>();
 
   const json = (res: http.ServerResponse, status: number, body?: unknown) => {
     res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -92,6 +98,31 @@ export function startRoomsMock(): Promise<RoomsMock> {
     if (req.headers.authorization !== `Bearer ${token}`) {
       return json(res, 401, { error: 'unauthorized' });
     }
+    // Persistent document rooms: same room transport, different lifetime.
+    const docsMatch = /^\/relay\/docs(?:\/([^/]+))?$/.exec(path);
+    if (docsMatch) {
+      const docId = docsMatch[1];
+      if (req.method === 'POST' && !docId) {
+        const id = randomUUID().replace(/-/g, '');
+        rooms.set(id, { updates: [], snapshot: null, tombstoned: false, streams: new Set(), presence: [] });
+        persistentDocs.add(id);
+        return json(res, 201, { docId: id, roomId: id });
+      }
+      if (req.method === 'DELETE' && docId) {
+        if (!persistentDocs.has(docId)) return json(res, 404, { error: 'no such document' });
+        const room = rooms.get(docId);
+        if (room && !room.tombstoned) {
+          room.tombstoned = true;
+          room.updates = [];
+          room.snapshot = null;
+          for (const st of room.streams) st.write(END_FRAME);
+        }
+        persistentDocs.delete(docId);
+        return json(res, 204);
+      }
+      return json(res, 404, { error: 'not found' });
+    }
+
     const m = /^\/relay\/rooms(?:\/([^/]+)(?:\/([a-z]+))?)?$/.exec(path);
     if (!m) return json(res, 404, { error: 'not found' });
     const [, roomId, sub] = m;
@@ -261,6 +292,11 @@ export function startRoomsMock(): Promise<RoomsMock> {
             server.closeAllConnections?.();
           }),
         streamCount: (id) => rooms.get(id)?.streams.size ?? 0,
+        forgetRoom: (id: string) => {
+          const room = rooms.get(id);
+          if (room) for (const st of room.streams) st.end();
+          rooms.delete(id);
+        },
         setMaxStreams: (n: number) => {
           maxStreamsPerRoom = n;
         },

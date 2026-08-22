@@ -30,6 +30,7 @@
  * truncate the log and joins stay fast on long sessions.
  */
 
+import type { SharedDocMetadata } from '../../native/index.js';
 import { LoroDoc, VersionVector, decodeImportBlobMeta } from 'loro-crdt';
 import type { Node as PMNode } from 'prosemirror-model';
 import type { Plugin } from 'prosemirror-state';
@@ -158,6 +159,10 @@ export interface CollabSessionOptions {
   /** Host compaction cadence: upload an encrypted snapshot every N
    *  posted updates. */
   snapshotEvery?: number;
+  /** Persistent `.cmir` document rooms are DURABLE: they outlive their
+   *  participants, so missing-room responses during reconnect keep retrying
+   *  instead of tearing the editor down. */
+  durableRoom?: boolean;
   /** Self-echo watchdog deadline (see field docs); injectable for tests. */
   echoTimeoutMs?: number;
   /** Delay before the first room-history audit; injectable for tests. */
@@ -178,6 +183,7 @@ export class CollabSession {
   readonly loroDoc: LoroDoc;
   readonly roomId: string;
   readonly role: 'host' | 'participant';
+  readonly durableRoom: boolean;
 
   private readonly client: RoomsClient;
   private readonly key: CryptoKey;
@@ -295,6 +301,7 @@ export class CollabSession {
     this.loroDoc = opts.loroDoc;
     this.roomId = opts.roomId;
     this.role = opts.role;
+    this.durableRoom = opts.durableRoom === true;
     this.client = opts.client;
     this.key = opts.key;
     this.callbacks = opts.callbacks ?? {};
@@ -318,6 +325,43 @@ export class CollabSession {
 
   /** Start a session on the current document. Uploads the seed state as
    *  update #1 and returns the share code alongside the session. */
+  /** Host a PERSISTENT shared document: a durable room plus the pointer that
+   *  gets written into the `.cmir`, so the file can rejoin the room later from
+   *  any machine that can read it. */
+  static async hostPersistent(opts: {
+    pmDoc: PMNode;
+    client: RoomsClient;
+    callbacks?: CollabSessionCallbacks;
+    flushMs?: number;
+    catchUpMs?: number;
+    minBackoffMs?: number;
+    maxBackoffMs?: number;
+    stallTimeoutMs?: number;
+    snapshotEvery?: number;
+    updateByteLimit?: number;
+  }): Promise<{
+    session: CollabSession;
+    shareCode: string;
+    guestPass: string | null;
+    sharedDoc: SharedDocMetadata;
+  }> {
+    let docId = '';
+    const hosted = await this.hostWithRoom({ ...opts, durableRoom: true }, async () => {
+      const doc = await opts.client.createPersistentDoc();
+      docId = doc.docId;
+      return { roomId: doc.roomId, guestPass: null };
+    });
+    return {
+      ...hosted,
+      sharedDoc: {
+        docId,
+        roomId: hosted.session.roomId,
+        shareCode: hosted.shareCode,
+        createdAt: new Date().toISOString(),
+      },
+    };
+  }
+
   static async host(opts: {
     pmDoc: PMNode;
     client: RoomsClient;
@@ -331,9 +375,32 @@ export class CollabSession {
     snapshotEvery?: number;
     updateByteLimit?: number;
   }): Promise<{ session: CollabSession; shareCode: string; guestPass: string | null }> {
+    return CollabSession.hostWithRoom(opts, () => opts.client.createRoom());
+  }
+
+  /** Shared body of `host` and `hostPersistent`: everything except HOW the
+   *  room is created (a temporary session room vs a durable document room). */
+  private static async hostWithRoom(
+    opts: {
+      pmDoc: PMNode;
+      client: RoomsClient;
+      callbacks?: CollabSessionCallbacks;
+      flushMs?: number;
+      catchUpMs?: number;
+      backlogNoticeMinBlindMs?: number;
+      receiveBatchMs?: number;
+      minBackoffMs?: number;
+      maxBackoffMs?: number;
+      stallTimeoutMs?: number;
+      snapshotEvery?: number;
+      updateByteLimit?: number;
+      durableRoom?: boolean;
+    },
+    createRoom: () => Promise<{ roomId: string; guestPass: string | null }>,
+  ): Promise<{ session: CollabSession; shareCode: string; guestPass: string | null }> {
     const keyBytes = generateRoomKeyBytes();
     const key = await importRoomKey(keyBytes);
-    const { roomId, guestPass } = await opts.client.createRoom();
+    const { roomId, guestPass } = await createRoom();
 
     const loroDoc = new LoroDoc();
     configTextStyle(loroDoc);
@@ -509,6 +576,8 @@ export class CollabSession {
       fetchImpl: this.client.opts.fetchImpl,
       roomId: this.roomId,
       sid: this.streamSid,
+      retryMissingRoom: this.durableRoom,
+      retryFullRoom: this.durableRoom,
       minBackoffMs: this.streamOpts.minBackoffMs,
       maxBackoffMs: this.streamOpts.maxBackoffMs,
       callbacks: {
@@ -788,6 +857,16 @@ export class CollabSession {
           }
         } catch (err) {
           if (err instanceof RoomsError && (err.status === 410 || err.status === 404)) {
+            if (this.durableRoom) {
+              // A durable document is not over just because the relay says
+              // "no such room" — reconnect and keep the queue.
+              this.connected = false;
+              this.awaitingEcho = null;
+              this.emitStatus();
+              this.stream?.restart();
+              this.scheduleSendRetry();
+              return;
+            }
             // 410 = tombstoned (host ended); 404 = the room itself is gone
             // (relay idle-GC). Both terminal — the stream already treats
             // them identically.
@@ -1085,6 +1164,15 @@ export class CollabSession {
       this.emitStatus();
     } catch (err) {
       if (err instanceof RoomsError && (err.status === 410 || err.status === 404)) {
+        if (this.durableRoom && !rethrow) {
+          // Same reasoning as the send path: a durable document survives a
+          // missing room. A STRICT initial sync still fails loudly.
+          this.connected = false;
+          this.awaitingEcho = null;
+          this.emitStatus();
+          this.stream?.restart();
+          return;
+        }
         this.handleEnded();
         // A STRICT initial sync (join/first resume tick) must NOT silently
         // succeed on an ended/expired room — otherwise the caller mounts a
