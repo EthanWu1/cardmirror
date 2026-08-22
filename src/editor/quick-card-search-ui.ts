@@ -2276,6 +2276,10 @@ class QuickCardSearchUI {
       this.resultsEl.appendChild(more);
     }
     this.resultsEl.querySelector('.pmd-qcs-row-active')?.scrollIntoView({ block: 'nearest' });
+    // Re-clamp now that the rows have given the panel its real height:
+    // positioning it while empty leaves a grown list hanging off the
+    // bottom of the screen.
+    this.reposition();
   }
 
   /** Move the active-row highlight without rebuilding the list.

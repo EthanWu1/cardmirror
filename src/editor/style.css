@@ -11440,23 +11440,6 @@ body.pmd-multi-nav-empty.pmd-multi-doc #status-bar {
 /* ---- Routing prompt overlay ---- */
 
 
-.pmd-route-dialog {
-  background: var(--pmd-c-dialog-bg);
-  border: 1px solid var(--pmd-c-dialog-border);
-  border-radius: 8px;
-  box-shadow: 0 16px 38px var(--pmd-c-shadow-deep);
-  color: var(--pmd-c-dialog-text);
-  padding: 1.05rem 1.2rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.85rem;
-  min-width: 360px;
-}
-.pmd-route-header {
-  color: var(--pmd-c-dialog-text);
-  font-weight: 500;
-  font-size: 0.95rem;
-}
 /* Web single-file tool progress modal (Clean / Convert / Compress). */
 .pmd-file-tool-progress {
   align-items: center;
@@ -16408,6 +16391,24 @@ body.pmd-pane-route-preview-right .pmd-multi-row {
   filter: brightness(1.04);
 }
 
+.pmd-route-dialog {
+  background: var(--pmd-c-dialog-bg);
+  border: 1px solid var(--pmd-c-dialog-border);
+  border-radius: 8px;
+  box-shadow: 0 16px 38px var(--pmd-c-shadow-deep);
+  color: var(--pmd-c-dialog-text);
+  padding: 1.05rem 1.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  min-width: 360px;
+}
+.pmd-route-header {
+  color: var(--pmd-c-dialog-text);
+  font-weight: 500;
+  font-size: 0.95rem;
+}
+
 .pmd-pane.pmd-pane-flow .pmd-pane-footer {
   display: none;
 }
@@ -16876,6 +16877,100 @@ body.pmd-pane-route-preview-right .pmd-multi-row {
   border-color: transparent;
 }
 
+/* Fork timer styling: compact mode, prep-label variants, and the
+   aff/neg prep colouring. The markup hooks (.pmd-timer-compact,
+   [data-prep-label]) already exist here; only these rules were
+   dropped in the migration. */
+#ribbon .pmd-timer-start[aria-pressed="true"] {
+  background: var(--pmd-c-accent);
+  color: var(--pmd-c-text-on-accent);
+}
+
+#ribbon .pmd-timer-panel button.pmd-timer-reset {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  height: auto;
+  align-self: stretch;
+  font-size: 1rem;
+  padding: 0 0.25rem;
+  min-width: 1.5rem;
+}
+
+#ribbon .pmd-timer-start {
+  grid-column: 3;
+  grid-row: 1;
+  min-width: 1.6rem;
+}
+
+#ribbon .pmd-timer-preset {
+  font-variant-numeric: tabular-nums;
+  min-width: 1.6rem;
+}
+
+#ribbon .pmd-timer-prep {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.15rem;
+  min-width: 3.2rem;
+  padding: 0 0.35rem;
+}
+
+#ribbon .pmd-timer-panel[data-prep-label="color"] .pmd-timer-prep-prefix {
+  display: none;
+}
+
+#ribbon .pmd-timer-panel[data-prep-label="color"] button.pmd-timer-neg {
+  min-width: 2.5rem;
+  padding: 0 0.25rem;
+}
+
+#ribbon .pmd-timer-panel[data-prep-label="both"] button.pmd-timer-neg {
+  padding: 0 1.7rem;
+}
+
+#ribbon .pmd-timer-panel[data-prep-label="both"] #timer-display[data-mode="affPrep"] {
+  color: var(--pmd-c-aff);
+}
+
+#ribbon .pmd-timer-panel[data-prep-label="both"] #timer-display[data-mode="negPrep"] {
+  color: var(--pmd-c-neg);
+}
+
+#ribbon .pmd-timer-panel[data-prep-label="both"] #timer-display[data-mode="affPrep"]::before {
+  content: "A: ";
+}
+
+#ribbon .pmd-timer-panel[data-prep-label="both"] #timer-display[data-mode="negPrep"]::before {
+  content: "N: ";
+}
+
+#ribbon .pmd-timer-panel.pmd-timer-compact .pmd-timer-preset {
+  display: none;
+}
+
+#ribbon .pmd-timer-panel.pmd-timer-compact .pmd-timer-display {
+  grid-column: 1 / span 2;
+}
+
+#ribbon .pmd-timer-panel.pmd-timer-compact button.pmd-timer-reset {
+  grid-column: 3;
+  grid-row: 2;
+  height: 1.45rem;
+  align-self: auto;
+  font-size: 1rem;
+  padding: 0 0.2rem;
+  min-width: 0;
+}
+
+#ribbon .pmd-timer-panel.pmd-timer-compact button.pmd-timer-aff {
+  grid-column: 4;
+}
+
+#ribbon .pmd-timer-panel.pmd-timer-compact button.pmd-timer-neg {
+  grid-column: 4;
+}
+
 .pmd-collab-top-presence {
   display: inline-flex;
   align-items: center;
@@ -16891,6 +16986,12 @@ body.pmd-pane-route-preview-right .pmd-multi-row {
   display: none;
 }
 
+
+@keyframes pmd-live-dot-pulse {
+  0% { transform: scale(1); opacity: 1; }
+  65% { transform: scale(1.38); opacity: 0.68; }
+  100% { transform: scale(1); opacity: 1; }
+}
 .pmd-collab-live-dot {
   width: 0.52rem;
   height: 0.52rem;
@@ -16945,4 +17046,36 @@ body.pmd-pane-route-preview-right .pmd-multi-row {
 
 .pmd-collab-avatar-self {
   box-shadow: 0 0 0 1px var(--pmd-c-border), 0 0 0 3px color-mix(in srgb, var(--pmd-c-accent) 24%, transparent);
+}
+
+/* Fork home-screen responsive collapse: the sidebar shell drops to a
+   single column on narrow windows. Appended last so it overrides the
+   unprefixed home rules, matching the fork. */
+@media (max-width: 720px) {
+  .pmd-home-screen {
+    overflow: auto;
+  }
+  .pmd-home-shell {
+    grid-template-columns: 1fr;
+    height: auto;
+    min-height: 100%;
+  }
+  .pmd-home-sidebar {
+    border-right: none;
+    border-bottom: 1px solid var(--pmd-c-border-soft);
+  }
+  .pmd-home-actions {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  .pmd-home-main {
+    padding: 0 16px 32px;
+  }
+  .pmd-home-search-section {
+    width: 100%;
+    margin: 20px 0 1.2rem;
+  }
+  .pmd-home-search-name {
+    max-width: 56%;
+  }
 }
