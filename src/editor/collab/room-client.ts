@@ -295,7 +295,14 @@ export interface RoomStreamOptions {
   /** Backoff bounds, injectable for tests. */
   minBackoffMs?: number;
   maxBackoffMs?: number;
+  /** Abort the stream when no bytes have arrived for this long. 0 disables. */
+  stallTimeoutMs?: number;
 }
+
+/** A half-open socket neither delivers bytes nor closes, so a read can block
+ *  forever while the stream still reports connected. Cut it loose after this
+ *  long without a byte and let the normal retry path reconnect. */
+const DEFAULT_STREAM_STALL_MS = 35_000;
 
 export class RoomStream {
   private controller: AbortControllerLike | null = null;
@@ -462,30 +469,52 @@ export class RoomStream {
       // browser ReadableStream is not async-iterable everywhere.
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let buf = '';
-      let eventName = '';
-      let dataLines: string[] = [];
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let nl: number;
-        while ((nl = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, nl).replace(/\r$/, '');
-          buf = buf.slice(nl + 1);
-          if (line === '') {
-            this.dispatchFrame(eventName, dataLines.join('\n'));
-            eventName = '';
-            dataLines = [];
-            if (this.stopped) return;
-          } else if (line.startsWith(':')) {
-            continue;
-          } else if (line.startsWith('event:')) {
-            eventName = line.slice(6).trim();
-          } else if (line.startsWith('data:')) {
-            dataLines.push(line.slice(5).trimStart());
+      // Read-stall watchdog: a half-open socket (sleep, NAT reap, network
+      // switch) neither delivers bytes nor closes, so `reader.read()` would
+      // block forever while the stream still reports connected. Abort it when
+      // the byte flow stops; the normal retry path reconnects. The relay's
+      // heartbeat comments keep this from firing on an idle-but-healthy stream.
+      let lastReadAt = Date.now();
+      const stallMs = this.opts.stallTimeoutMs ?? DEFAULT_STREAM_STALL_MS;
+      let stallTimer: ReturnType<typeof setInterval> | null = null;
+      if (stallMs > 0) {
+        const streamController = this.controller;
+        stallTimer = setInterval(
+          () => {
+            if (Date.now() - lastReadAt > stallMs) streamController?.abort();
+          },
+          Math.max(250, Math.min(stallMs / 3, 15_000)),
+        );
+      }
+      try {
+        let buf = '';
+        let eventName = '';
+        let dataLines: string[] = [];
+        for (;;) {
+          const { done, value } = await reader.read();
+          lastReadAt = Date.now();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let nl: number;
+          while ((nl = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, nl).replace(/\r$/, '');
+            buf = buf.slice(nl + 1);
+            if (line === '') {
+              this.dispatchFrame(eventName, dataLines.join('\n'));
+              eventName = '';
+              dataLines = [];
+              if (this.stopped) return;
+            } else if (line.startsWith(':')) {
+              continue;
+            } else if (line.startsWith('event:')) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+              dataLines.push(line.slice(5).trimStart());
+            }
           }
         }
+      } finally {
+        if (stallTimer !== null) clearInterval(stallTimer);
       }
       // Server closed (deploy, idle reap) — reconnect.
       this.scheduleRetry();

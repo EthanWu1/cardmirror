@@ -72,6 +72,12 @@ globalThis.__CM_MOVABLE_LIST__ = compareAppVersions(appVersion, MOVABLE_ROOMS_MI
  *  relay still serves REST in that state, so polling keeps the document
  *  syncing (a few seconds behind) instead of waiting for the slow
  *  belt-and-suspenders catch-up. */
+/** Outbound debounce: keystrokes inside this window coalesce into one wire
+ *  update. Low enough that a partner sees typing as typing rather than as
+ *  paragraphs landing at once; the coalescing still keeps a fast typist to a
+ *  handful of posts a second. */
+export const DEFAULT_COLLAB_FLUSH_MS = 120;
+
 export const DEGRADED_POLL_MS = 4_000;
 
 /** How often to catch up while the push stream reports CONNECTED.
@@ -288,7 +294,7 @@ export class CollabSession {
     this.client = opts.client;
     this.key = opts.key;
     this.callbacks = opts.callbacks ?? {};
-    this.flushMs = opts.flushMs ?? 500;
+    this.flushMs = opts.flushMs ?? DEFAULT_COLLAB_FLUSH_MS;
     this.catchUpMs = opts.catchUpMs ?? 300_000;
     this.backlogNoticeMinBlindMs = opts.backlogNoticeMinBlindMs ?? 60_000;
     this.receiveBatchMs = opts.receiveBatchMs ?? 120;
@@ -606,6 +612,44 @@ export class CollabSession {
       /* already gone */
     }
     this.handleEnded();
+  }
+
+  /** Synchronously drop the relay stream and timers for window teardown.
+   *
+   *  `stop()` awaits a flush/drain first, and an unload handler never gets to
+   *  run its continuation — so the SSE connection was left for the OS to reap
+   *  and the relay kept counting it against the room's participant cap. After
+   *  enough quits (or crashes) a room answers 409 "full" to its own owner
+   *  forever, which is what leaves shared files stuck on "reconnecting".
+   *  Persistence has its own pagehide flush, so this only has to free the
+   *  socket. */
+  releaseForUnload(): void {
+    if (this.inboundTimer) {
+      clearTimeout(this.inboundTimer);
+      this.inboundTimer = null;
+    }
+    if (this.flushTimer) clearInterval(this.flushTimer);
+    if (this.catchUpTimer) clearInterval(this.catchUpTimer);
+    if (this.auditTimer) clearInterval(this.auditTimer);
+    if (this.auditKickoff) clearTimeout(this.auditKickoff);
+    if (this.sendRetryTimer) clearTimeout(this.sendRetryTimer);
+    this.flushTimer = this.catchUpTimer = this.auditTimer = null;
+    this.auditKickoff = null;
+    this.sendRetryTimer = null;
+    this.stream?.stop();
+    this.stream = null;
+    this.connected = false;
+  }
+
+  /** Cheap liveness check for focus/visibility events. Unlike restart(), a
+   *  healthy connected stream is left alone (no abort, no traffic); only a
+   *  down stream reconnects — plus a catch-up and queue drain so edits made
+   *  while backgrounded flow immediately rather than on the next timer tick. */
+  ensureLive(): void {
+    if (!this.stream || this.stream.connected) return;
+    this.stream.restart();
+    void this.catchUp();
+    void this.drainQueue();
   }
 
   /** Wake-from-sleep hook. */

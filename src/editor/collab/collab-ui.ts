@@ -376,8 +376,21 @@ function installWakeHooks(session: CollabSession): () => void {
   const onOnline = (): void => session.restart();
   window.addEventListener('online', onOnline);
   const offResume = getElectronHost()?.onPowerResumed?.(() => session.restart()) ?? null;
+  // Returning to the window is the moment a user notices a dead session —
+  // check liveness right then instead of waiting for the stall watchdog.
+  // ensureLive() is a no-op while the stream is healthy, so this stays cheap.
+  const onVisible = (): void => {
+    if (document.visibilityState === 'visible') session.ensureLive();
+  };
+  document.addEventListener('visibilitychange', onVisible);
+  // Free the relay's stream slot synchronously; an unload handler never gets
+  // to run an awaited teardown (see releaseForUnload).
+  const onPageHide = (): void => session.releaseForUnload();
+  window.addEventListener('pagehide', onPageHide);
   return () => {
     window.removeEventListener('online', onOnline);
+    document.removeEventListener('visibilitychange', onVisible);
+    window.removeEventListener('pagehide', onPageHide);
     offResume?.();
   };
 }

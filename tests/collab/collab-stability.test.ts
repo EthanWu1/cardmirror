@@ -277,3 +277,30 @@ describe('receive-only peer on a zombie stream (no echo to watch)', () => {
     await teardown(peers);
   }, 60_000);
 });
+
+describe('unload frees the relay stream slot (the ghost-slot 409)', () => {
+  it('releaseForUnload drops the stream synchronously, unlike stop()', async () => {
+    // stop() awaits a flush and drain first, and an unload handler never gets
+    // to run its continuation — so every quit or crash leaked a stream the
+    // relay kept counting against the room's participant cap, until the room
+    // answered 409 "full" to its own OWNER and the file stuck on
+    // "reconnecting" forever.
+    const peers = await makeRoom(1);
+    const [host, joiner] = peers as [Peer, Peer];
+    const roomId = host.session.roomId;
+
+    await sleep(200);
+    const before = mock.streamCount(roomId);
+    expect(before, 'both peers should hold a stream').toBeGreaterThanOrEqual(2);
+
+    // Synchronous: no await between the call and the assertion.
+    joiner.session.releaseForUnload();
+    await sleep(150); // socket close crosses the process boundary
+    expect(
+      mock.streamCount(roomId),
+      'the leaving peer must give its slot straight back',
+    ).toBeLessThan(before);
+
+    await host.session.stop();
+  }, 60_000);
+});
