@@ -114,19 +114,40 @@ function endPos(flat: Flat, idx: number): number {
   return (flat.pos[flat.pos.length - 1] ?? 0) + 1;
 }
 
+/** First index whose position is >= target. Binary search, not findIndex: the
+ *  bulk evidence indexer builds thousands of descriptors against one document,
+ *  and a linear scan per descriptor makes that O(doc x rows). */
+function firstIndexAtOrAfter(pos: readonly number[], target: number): number {
+  let lo = 0;
+  let hi = pos.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (pos[mid]! >= target) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
+}
+
 /** Flatten `doc` once and return a builder that maps any `[from, to)` to a
  *  descriptor. Callers building many descriptors against the same doc (e.g.
  *  extraction over a selection) MUST use this so the O(doc) flatten happens
  *  once, not per descriptor. */
 export function createDescriptorBuilder(
   doc: PMNode,
+  /** Cap the stored quote at this many characters. The bulk evidence indexer
+   *  passes one: a card body can run thousands of chars, and uncapped the
+   *  quote duplicates the row's full text a second time in memory. The stored
+   *  prefix/suffix context still relocates the passage uniquely, so a capped
+   *  row simply re-selects its first `maxQuoteLen` chars. */
+  maxQuoteLen = Number.POSITIVE_INFINITY,
 ): (from: number, to: number) => AnchorDescriptor {
   const flat = flatten(doc);
   return (from, to) => {
-    let start = flat.pos.findIndex((p) => p >= from);
-    if (start < 0) start = flat.text.length;
-    let end = flat.pos.findIndex((p) => p >= to);
-    if (end < 0) end = flat.text.length;
+    let start = firstIndexAtOrAfter(flat.pos, from);
+    if (start >= flat.pos.length) start = flat.text.length;
+    let end = firstIndexAtOrAfter(flat.pos, to);
+    if (end >= flat.pos.length) end = flat.text.length;
+    if (end - start > maxQuoteLen) end = start + maxQuoteLen;
     return {
       quote: flat.text.slice(start, end),
       prefix: flat.text.slice(Math.max(0, start - CONTEXT), start),
