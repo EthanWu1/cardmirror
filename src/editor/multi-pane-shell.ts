@@ -26,6 +26,34 @@
  * declares its view, the controller treats it as cross-view.
  */
 
+import { cloudSyncFolderLabel, cloudSyncCoEditWarning } from './cloud-sync-folder.js';
+import type { SharedDocMetadata } from '../native/index.js';
+import { showPaneRouteOverlay, type PaneRouteSlot } from './pane-route-overlay.js';
+import { createRound } from './flow/flow-model.js';
+import type { FlowFormat, FlowRound, FlowSide } from './flow/flow-model.js';
+import { parseFlowFile, parseFlowlineJson, serializeFlowFile } from './flow/flow-file.js';
+import { createFlowWorkspace, defaultFlowName, type FlowWorkspace } from './flow/flow-workspace.js';
+import {
+  canOpenFlowSeparate,
+  canAdoptFlowSaveAsHandle as canAdoptFlowSaveAsHandleDecision,
+  flowSaveCleanCommit,
+  flowRouteSlotId,
+  isMultiPaneFlowRouteFile,
+  type FlowRouteChoiceId,
+} from './flow/flow-routing.js';
+import {
+  flowDirtyEquals,
+  flowBaselineForRound,
+  suggestedFlowSaveName,
+  type OpenedFlowFormat,
+} from './flow/flow-single-pane.js';
+import {
+  WorkspaceTabStrip,
+  computeSplitLayout,
+  type TabModel,
+  type PaneLayout,
+  type DropSide,
+} from './workspace-tabs.js';
 import { EditorState, Selection, TextSelection } from 'prosemirror-state';
 import { EditorView } from 'prosemirror-view';
 import { setViewDocPath } from './transclusion-doc-path.js';
@@ -86,6 +114,7 @@ import {
   installModalKeys,
   armDialogFocus,
   captureFocusForDialog,
+  promptForChoice,
 } from './text-prompt.js';
 import { showToast } from './toast.js';
 import { recordRecent } from './recents-store.js';
@@ -315,6 +344,7 @@ function scheduleAutosaveForRecord(record: DocRecord): void {
  * via `savedScrollTop` across detach / mount instead.
  */
 interface DocRecord {
+  kind: 'doc';
   uid: string;
   filename: string;
   /** Opaque host handle (Electron: absolute path; browser: a
@@ -415,7 +445,7 @@ class DocSwitcherOverlay {
   /** Active slot at open() time. Stays bound for the cycle. */
   private slot: Slot | null = null;
   /** Snapshot of the slot's stack at open time, in display order. */
-  private candidates: DocRecord[] = [];
+  private candidates: PaneRecord[] = [];
   /** Index into `candidates` that's currently highlighted. */
   private index = 0;
 
@@ -483,7 +513,7 @@ class DocSwitcherOverlay {
     const target = this.candidates[this.index];
     if (target) {
       this.slot.showRecord(target);
-      this.slot.visible?.view.focus();
+      focusPaneRecord(this.slot.visible);
     }
     this.reset();
   }
@@ -522,6 +552,86 @@ class DocSwitcherOverlay {
       this.listEl.appendChild(item);
     }
   }
+}
+
+
+/** Two pane arrangements are identical (same panes, order, tabs, visible tab)?
+ *  Used to skip a no-op drag-to-split reflow. */
+function paneLayoutsEqual(a: readonly PaneLayout[], b: readonly PaneLayout[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const pa = a[i]!;
+    const pb = b[i]!;
+    if (pa.visibleUid !== pb.visibleUid) return false;
+    if (pa.uids.length !== pb.uids.length) return false;
+    for (let j = 0; j < pa.uids.length; j++) if (pa.uids[j] !== pb.uids[j]) return false;
+  }
+  return true;
+}
+
+interface FlowRecord {
+  kind: 'flow';
+  uid: string;
+  filename: string;
+  handle: unknown | null;
+  format: OpenedFlowFormat | null;
+  workspace: FlowWorkspace;
+  editorEl: HTMLElement;
+  navEl: HTMLElement;
+  owner: Slot;
+  dirty: boolean;
+  baselineJson: string | null;
+  createdAt: string | null;
+  editGen: number;
+  zoomPct: number;
+  save(): Promise<boolean>;
+  saveAs(): Promise<boolean>;
+  destroy(): void;
+  focus(): void;
+}
+
+type PaneRecord = DocRecord | FlowRecord;
+
+function isDocRecord(record: PaneRecord | null | undefined): record is DocRecord {
+  return record?.kind === 'doc';
+}
+
+function isFlowRecord(record: PaneRecord | null | undefined): record is FlowRecord {
+  return record?.kind === 'flow';
+}
+
+function destroyPaneRecord(record: PaneRecord): void {
+  if (isFlowRecord(record)) {
+    record.destroy();
+    return;
+  }
+  record.view.destroy();
+  record.dragSurface.detach();
+  record.navPanel.destroy();
+}
+
+function focusPaneRecord(record: PaneRecord | null | undefined): void {
+  if (!record) return;
+  if (isFlowRecord(record)) record.focus();
+  else record.view.focus();
+}
+
+
+
+const cloudFolderWarned = new Set<string>();
+
+/** Warn when a CO-EDITED document is opened from a cloud-sync folder. The room
+ *  pointer lives inside the `.cmir`, so a sync client replacing the file can
+ *  split the collaborators into different rooms, break the session outright, or
+ *  spawn "conflicted copy" files — the confirmed cause of the field reports on
+ *  2026-07-27. Warn rather than block: a private (unshared) Dropbox folder is
+ *  harmless, and only the user knows whether the folder is shared. */
+function warnIfCoEditedInCloudFolder(handle: unknown, filename: string): void {
+  if (typeof handle !== 'string' || handle === '') return;
+  const label = cloudSyncFolderLabel(handle);
+  if (!label || cloudFolderWarned.has(handle)) return;
+  cloudFolderWarned.add(handle);
+  showToast(cloudSyncCoEditWarning(label, filename), { durationMs: 15_000 });
 }
 
 class Slot {
@@ -575,7 +685,7 @@ class Slot {
 
   /** Live stack. Index 0 = bottom (least recently active);
    *  `visibleIndex` is the doc currently shown. */
-  stack: DocRecord[] = [];
+  stack: PaneRecord[] = [];
   visibleIndex = -1;
 
   /** Owning shell for routing focus / re-render events. */
@@ -681,7 +791,7 @@ class Slot {
       const rec = this.visible;
       if (!rec) return;
       this.shell.focusSlot(this);
-      openWordCount(rec.view);
+      if (isDocRecord(rec)) openWordCount(rec.view);
     });
     footer.appendChild(wcBtn);
     this.wcEl = document.createElement('span');
@@ -799,7 +909,7 @@ class Slot {
   syncCardIntrinsicWidth(): void {
     if (this.paneEl.hidden) return;
     const rec = this.visible;
-    if (!rec) return;
+    if (!isDocRecord(rec)) return;
     const pmEl = rec.view.dom as HTMLElement;
     const cs = getComputedStyle(pmEl);
     const padL = parseFloat(cs.paddingLeft) || 0;
@@ -820,7 +930,7 @@ class Slot {
   }
 
   /** The currently-visible doc record (or null when stack is empty). */
-  get visible(): DocRecord | null {
+  get visible(): PaneRecord | null {
     if (this.visibleIndex < 0 || this.visibleIndex >= this.stack.length) return null;
     return this.stack[this.visibleIndex]!;
   }
@@ -828,7 +938,7 @@ class Slot {
   /** Adopt a freshly-built DocRecord into this slot's stack. New doc
    *  becomes the visible one; previously-visible (if any) drops into
    *  the stack but its EditorView stays live (memory-resident). */
-  push(record: DocRecord): void {
+  push(record: PaneRecord): void {
     // Detach the OLD visible record first — `detachVisible` reads
     // `this.visible`, which derives from `visibleIndex`, so it must
     // run before we push the new record and shift the index.
@@ -849,7 +959,7 @@ class Slot {
   }
 
   /** Switch the visible doc to the given record. */
-  showRecord(record: DocRecord): void {
+  showRecord(record: PaneRecord): void {
     const idx = this.stack.indexOf(record);
     if (idx < 0) return;
     if (idx === this.visibleIndex) return;
@@ -878,7 +988,32 @@ class Slot {
    *  slot. Mirrors `closeVisible` minus the destroy / journal-drop
    *  steps (the doc keeps living; only its host slot changes).
    *  Returns the released record, or null if nothing was visible. */
-  releaseVisible(): DocRecord | null {
+  /** Detach EVERY record without destroying their views, leaving the slot
+   *  empty and hidden. Used by the tab drag/split path, which releases all
+   *  slots first so records can move freely between them. */
+  releaseAll(): PaneRecord[] {
+    if (this.visibleIndex >= 0) this.detachVisible();
+    const records = this.stack;
+    this.stack = [];
+    this.visibleIndex = -1;
+    this.paneEl.hidden = true;
+    this.navHidden = false;
+    return records;
+  }
+
+  /** Detach ONE record without destroying its view. The visible record defers
+   *  to `releaseVisible`, which re-mounts the next one and fires the usual
+   *  empty/layout hooks; a background record just leaves the stack. */
+  releaseRecord(record: PaneRecord): PaneRecord | null {
+    const idx = this.stack.indexOf(record);
+    if (idx < 0) return null;
+    if (idx === this.visibleIndex) return this.releaseVisible();
+    this.stack.splice(idx, 1);
+    if (this.visibleIndex > idx) this.visibleIndex -= 1;
+    return record;
+  }
+
+  releaseVisible(): PaneRecord | null {
     const idx = this.visibleIndex;
     if (idx < 0) return null;
     const record = this.stack[idx]!;
@@ -953,36 +1088,36 @@ class Slot {
       return false;
     }
     this.detachVisible();
-    if (closing.heavyUpdateTimer !== null) {
+    if (isDocRecord(closing) && closing.heavyUpdateTimer !== null) {
       cancelIdle(closing.heavyUpdateTimer);
       closing.heavyUpdateTimer = null;
     }
-    if (closing.journalTimer !== null) {
+    if (isDocRecord(closing) && closing.journalTimer !== null) {
       window.clearTimeout(closing.journalTimer);
       closing.journalTimer = null;
     }
-    if (closing.autosaveTimer !== null) {
+    if (isDocRecord(closing) && closing.autosaveTimer !== null) {
       window.clearTimeout(closing.autosaveTimer);
       closing.autosaveTimer = null;
     }
     // Explicit close → drop the journal. Recovery is for crashes,
     // not "I changed my mind." If the user wanted to keep this
     // doc, they should have saved.
-    void clearJournalForRecord(closing);
+    if (isDocRecord(closing)) void clearJournalForRecord(closing);
     // Clear speech-doc designation if the closing doc was it —
     // matches Verbatim's `AutoClose` which clears
     // `Globals.ActiveSpeechDoc` when the speech doc is closed.
-    const speechResolver = getSpeechDocResolver();
-    if (speechResolver.isSpeechByUid(closing.uid)) {
-      speechResolver.setSpeechByUid(null);
+    if (isDocRecord(closing)) {
+      const speechResolver = getSpeechDocResolver();
+      if (speechResolver.isSpeechByUid(closing.uid)) {
+        speechResolver.setSpeechByUid(null);
+      }
+      speechResolver.unregisterView(closing.uid);
+      // Release the cross-window path claim before destroying the
+      // view — re-opening this file in any window should succeed.
+      syncDocPathClaim(closing.handle, null);
     }
-    speechResolver.unregisterView(closing.uid);
-    // Release the cross-window path claim before destroying the
-    // view — re-opening this file in any window should succeed.
-    syncDocPathClaim(closing.handle, null);
-    closing.view.destroy();
-    closing.dragSurface.detach();
-    closing.navPanel.destroy();
+    destroyPaneRecord(closing);
     this.stack.splice(idx, 1);
     if (this.stack.length === 0) {
       this.visibleIndex = -1;
@@ -1011,7 +1146,7 @@ class Slot {
    *  the user cancels a prompt (leaving the remaining docs open), true
    *  when the slot is reduced to `keep` (or empty). Used by the web
    *  mode-switch to collapse three-pane down to the focused doc. */
-  async closeAllExcept(keep: DocRecord | null, opts?: { modeSwitch?: boolean }): Promise<boolean> {
+  async closeAllExcept(keep: PaneRecord | null, opts?: { modeSwitch?: boolean }): Promise<boolean> {
     // Snapshot: closeVisible mutates the stack + visibleIndex as it goes.
     for (const rec of this.stack.filter((r) => r !== keep)) {
       if (!this.stack.includes(rec)) continue; // already closed (defensive)
@@ -1038,7 +1173,7 @@ class Slot {
       } else if (choice === 'saveAs') {
         if (!(await runSaveAsFlow())) return false;
       } else if (choice === 'discard') {
-        void clearJournalForRecord(rec);
+        if (isDocRecord(rec)) void clearJournalForRecord(rec);
       }
     }
     return true;
@@ -1052,7 +1187,7 @@ class Slot {
     if (rec.editorEl.parentElement === this.bodyEl) {
       // Capture BEFORE removeChild — detaching collapses the
       // scroller's content and the browser clamps scrollTop to 0.
-      rec.savedScrollTop = this.bodyEl.scrollTop;
+      if (isDocRecord(rec)) rec.savedScrollTop = this.bodyEl.scrollTop;
       this.bodyEl.removeChild(rec.editorEl);
     }
     if (rec.navEl.parentElement === this.navBodyEl) {
@@ -1070,10 +1205,11 @@ class Slot {
   private mountVisible(): void {
     const rec = this.visible;
     if (!rec) return;
+    this.paneEl.classList.toggle('pmd-pane-flow', isFlowRecord(rec));
     this.bodyEl.appendChild(rec.editorEl);
     // After the append, so the restored content height is what the
     // browser clamps against.
-    this.bodyEl.scrollTop = rec.savedScrollTop;
+    if (isDocRecord(rec)) this.bodyEl.scrollTop = rec.savedScrollTop;
     this.navBodyEl.appendChild(rec.navEl);
     this.chipNameEl.textContent = rec.filename;
     this.refreshChip();
@@ -1158,7 +1294,7 @@ class Slot {
    *  for the first two configured readers. */
   refreshWordCount(): void {
     const rec = this.visible;
-    if (!rec) {
+    if (!isDocRecord(rec)) {
       this.wcEl.textContent = '—';
       return;
     }
@@ -1198,6 +1334,10 @@ class Slot {
       remainingReadSegment(rec.view.state),
     ].filter((s): s is string => s !== null);
     this.wcEl.textContent = segments.join(' | ');
+    // The debounced per-pane chrome refresh (heavy-update tick, mount, focus,
+    // settings) is the natural point to keep the tab strip's dirty dots and
+    // active state current without a per-keystroke rebuild.
+    this.shell.scheduleTabsRefresh();
   }
 
   /** Open a small dropdown over the chip listing every doc in this
@@ -1250,7 +1390,7 @@ class Slot {
 
   /** Close a specific record (not necessarily the visible one).
    *  Prompts if the record has unsaved changes. */
-  async closeRecord(rec: DocRecord): Promise<void> {
+  async closeRecord(rec: PaneRecord): Promise<void> {
     const idx = this.stack.indexOf(rec);
     if (idx < 0) return;
     if (idx === this.visibleIndex) {
@@ -1275,11 +1415,11 @@ class Slot {
       await this.closeVisible();
       return;
     }
-    if (rec.heavyUpdateTimer !== null) {
+    if (isDocRecord(rec) && rec.heavyUpdateTimer !== null) {
       cancelIdle(rec.heavyUpdateTimer);
       rec.heavyUpdateTimer = null;
     }
-    if (rec.autosaveTimer !== null) {
+    if (isDocRecord(rec) && rec.autosaveTimer !== null) {
       window.clearTimeout(rec.autosaveTimer);
       rec.autosaveTimer = null;
     }
@@ -1290,9 +1430,7 @@ class Slot {
     }
     speechResolver.unregisterView(rec.uid);
     syncDocPathClaim(rec.handle, null);
-    rec.view.destroy();
-    rec.dragSurface.detach();
-    rec.navPanel.destroy();
+    destroyPaneRecord(rec);
     this.stack.splice(idx, 1);
     if (idx < this.visibleIndex) this.visibleIndex--;
     this.refreshChip();
@@ -1332,6 +1470,11 @@ let shellLastNumberingSig = numberingDisplaySig();
 
 class MultiPaneShell {
   private slots: Record<SlotId, Slot>;
+  private lastTabbedSetting = settings.get('tabbedWorkspace');
+  private tabStrip: WorkspaceTabStrip | null = null;
+  private tabsRafId = 0;
+  private tabDropOverlay: HTMLElement | null = null;
+  private pendingTabDrop: { desired: PaneLayout[]; focusUid: string } | null = null;
   private shellEl: HTMLElement;
   private navRailEl: HTMLElement;
   private rowEl: HTMLElement;
@@ -1455,6 +1598,7 @@ class MultiPaneShell {
       const readParagraphIntegrity = s.readModeParagraphIntegrity;
       for (const id of SLOT_IDS) {
         for (const rec of this.slots[id].stack) {
+          if (!isDocRecord(rec)) continue;
           if (rec.readMode) {
             rec.editorEl.classList.toggle(
               'pmd-rm-no-emphasis-borders',
@@ -1474,6 +1618,7 @@ class MultiPaneShell {
         shellLastMarkUnread = s.markUnreadAfterMarker;
         for (const id of SLOT_IDS) {
           for (const rec of this.slots[id].stack) {
+            if (!isDocRecord(rec)) continue;
             rec.view.dispatch(rec.view.state.tr.setMeta(MARK_UNREAD_TOGGLE, true));
           }
         }
@@ -1489,6 +1634,7 @@ class MultiPaneShell {
         shellLastNumberingSig = numberingSig;
         for (const id of SLOT_IDS) {
           for (const rec of this.slots[id].stack) {
+            if (!isDocRecord(rec)) continue;
             rec.view.dispatch(rec.view.state.tr.setMeta(NUMBERING_REFRESH, true));
           }
         }
@@ -1500,17 +1646,26 @@ class MultiPaneShell {
     // Tell the single-doc index.ts how to query "what should the
     // read-mode button show?" — in multi-doc that's the focused
     // pane's per-doc state, not the global setting.
-    setReadModeStateResolver(() => this.focusedSlot?.visible?.readMode ?? false);
+    setReadModeStateResolver(() => {
+      const rec = this.focusedSlot?.visible;
+      return isDocRecord(rec) ? rec.readMode : false;
+    });
     // Same story for the status-bar zoom readout — it reflects the focused
     // pane's per-pane zoom (the shell refreshes it on focus change).
     setZoomStateResolver(
       () => this.focusedSlot?.visible?.zoomPct ?? settings.get('defaultZoomPct'),
     );
     // Same story for the autosave button — per-pane in multi-doc.
-    setAutosaveStateResolver(() => this.focusedSlot?.visible?.autosaveEnabled ?? false);
+    setAutosaveStateResolver(() => {
+      const rec = this.focusedSlot?.visible;
+      return isDocRecord(rec) ? rec.autosaveEnabled : false;
+    });
     // Find-bar nav highlights land on the focused pane's own nav
     // panel; other panes don't share the find-bar's state.
-    setActiveNavPanelResolver(() => this.focusedSlot?.visible?.navPanel ?? null);
+    setActiveNavPanelResolver(() => {
+      const rec = this.focusedSlot?.visible;
+      return isDocRecord(rec) ? rec.navPanel : null;
+    });
 
     // Keep the speech chip / button state in sync with the
     // registry — the registry fires on every set/clear, including
@@ -1584,8 +1739,10 @@ class MultiPaneShell {
             // view.state.doc directly and re-renders itself; the flush
             // afterwards still pays the caret resync + word count the
             // debounced timer owes.
-            rec.navPanel.applyMaxLevelToNewHeadings();
-            flushHeavyUpdateNow(rec);
+            if (isDocRecord(rec)) {
+              rec.navPanel.applyMaxLevelToNewHeadings();
+              flushHeavyUpdateNow(rec);
+            }
           }
         }
         lastSourceView = null;
@@ -1593,12 +1750,714 @@ class MultiPaneShell {
       }
     });
 
+    // Mount the Chrome-style tab strip if the setting is on, and live-toggle
+    // it as the setting changes (no reload needed — it is a pure overlay on
+    // the slot/record model).
+    this.applyTabbedMode();
+    settings.subscribe((st) => this.syncTabbedModeFromSettings(st.tabbedWorkspace));
+
     // First active slot gets focus by default once a doc lands.
+  }
+
+  private syncTabbedModeFromSettings(next: boolean): void {
+    if (next === this.lastTabbedSetting) return;
+    this.lastTabbedSetting = next;
+    this.applyTabbedMode();
+  }
+
+  /** Create or tear down the tab strip to match the `tabbedWorkspace`
+   *  setting. Idempotent. */
+  private applyTabbedMode(): void {
+    const want = settings.get('tabbedWorkspace');
+    if (want && !this.tabStrip) {
+      const strip = new WorkspaceTabStrip({
+        onSelect: (slotId, uid) => this.selectTab(slotId, uid),
+        onClose: (slotId, uid) => void this.closeTab(slotId, uid),
+        onReorderSegment: (slotId, order) => this.reorderSegment(slotId, order),
+        onDragOutOfStrip: (uid, _src, x, y) => this.updateTabDropZone(uid, x, y),
+        onDragBackIntoStrip: () => this.hideTabDropZone(),
+        onDropOutsideStrip: (uid, _src, x, y) => this.dropTabOutsideStrip(uid, x, y),
+        onMoveTabToSegment: (uid, from, to, order) => this.moveTabToSegment(uid, from, to, order),
+        onTabContextMenu: (slotId, uid, x, y) => this.openTabContextMenu(slotId, uid, x, y),
+      });
+      this.tabStrip = strip;
+      // Full-width band pinned below the ribbon (position:fixed in CSS).
+      // Placing it right after the ribbon keeps DOM + tab order sensible.
+      const ribbon = document.getElementById('ribbon');
+      if (ribbon && ribbon.parentElement) {
+        ribbon.parentElement.insertBefore(strip.el, ribbon.nextSibling);
+      } else {
+        document.body.appendChild(strip.el);
+      }
+      document.body.classList.add('pmd-tabbed');
+      this.refreshTabsNow();
+    } else if (!want && this.tabStrip) {
+      this.tabStrip.destroy();
+      this.tabStrip = null;
+      document.body.classList.remove('pmd-tabbed');
+    }
+  }
+
+  /** True when the tab strip is mounted (the `tabbedWorkspace` setting is on).
+   *  In tabbed mode, opening / creating a document adds a TAB to a default
+   *  pane rather than prompting "which pane?" — the Chrome behaviour. */
+  private tabbedActive(): boolean {
+    return this.tabStrip !== null;
+  }
+
+  /** The pane a new tab lands in when the user didn't pick one (tabbed mode).
+   *  Mirrors Chrome: the focused pane if it already holds a doc, else the
+   *  first pane with docs, else pane 1. */
+  private defaultTabSlot(): SlotId {
+    if (this.focusedSlot && this.focusedSlot.stack.length > 0) return this.focusedSlot.id;
+    return SLOT_IDS.find((id) => this.slots[id].stack.length > 0) ?? 'slot1';
+  }
+
+  /** Build the tab model from live slot state. One segment per non-empty
+   *  slot (a pane), in slot order; each segment's tabs are its stack. */
+  private buildTabModel(): TabModel {
+    const segments = SLOT_IDS.filter((id) => this.slots[id].stack.length > 0).map((id) => {
+      const slot = this.slots[id];
+      return {
+        slotId: id,
+        focused: this.focusedSlot === slot,
+        tabs: slot.stack.map((rec, i) => ({
+          uid: rec.uid,
+          filename: rec.filename || '(untitled)',
+          dirty: rec.dirty,
+          active: i === slot.visibleIndex,
+          kind: 'doc' as const,
+        })),
+      };
+    });
+    return { segments };
+  }
+
+  /** Re-render the tab strip now (no coalescing). */
+  private refreshTabsNow(): void {
+    if (!this.tabStrip) return;
+    this.tabStrip.render(this.buildTabModel());
+  }
+
+  /** Request a tab-strip refresh, coalesced to once per tick so a burst of
+   *  shell mutations rebuilds the strip a single time. Uses a timer, not
+   *  requestAnimationFrame — rAF is throttled indefinitely in a minimized /
+   *  backgrounded window, which would leave the strip stale after a
+   *  background open or co-edit update. */
+  scheduleTabsRefresh(): void {
+    if (!this.tabStrip || this.tabsRafId) return;
+    this.tabsRafId = setTimeout(() => {
+      this.tabsRafId = 0;
+      this.refreshTabsNow();
+    }, 0) as unknown as number;
+  }
+
+  /** Tab clicked: show that record in its slot and focus the slot. */
+  private selectTab(slotId: string, uid: string): void {
+    const slot = this.slots[slotId as SlotId];
+    if (!slot) return;
+    const rec = slot.stack.find((r) => r.uid === uid);
+    if (!rec) return;
+    slot.showRecord(rec);
+    this.focusSlot(slot);
+    focusPaneRecord(rec);
+  }
+
+  /** Tab ✕ clicked: close that record (prompts if dirty / co-edited). */
+  private async closeTab(slotId: string, uid: string): Promise<void> {
+    const slot = this.slots[slotId as SlotId];
+    if (!slot) return;
+    const rec = slot.stack.find((r) => r.uid === uid);
+    if (!rec) return;
+    await slot.closeRecord(rec);
+    this.refreshTabsNow();
+  }
+
+  /** A within-segment tab drag settled: reorder that slot's stack to match
+   *  the dragged order, keeping the same record visible. */
+  private reorderSegment(slotId: string, orderedUids: string[]): void {
+    const slot = this.slots[slotId as SlotId];
+    if (!slot) return;
+    const visibleRec = slot.visible;
+    const byUid = new Map(slot.stack.map((r) => [r.uid, r]));
+    const next = orderedUids.map((u) => byUid.get(u)).filter((r): r is PaneRecord => !!r);
+    // Guard: only apply a true permutation of the existing stack.
+    if (next.length !== slot.stack.length) {
+      this.refreshTabsNow();
+      return;
+    }
+    slot.stack = next;
+    slot.visibleIndex = visibleRec ? next.indexOf(visibleRec) : slot.visibleIndex;
+    this.refreshTabsNow();
+  }
+
+  /** A tab was dragged across to another pane's segment within the strip:
+   *  move the record from `fromSlotId` to `toSlotId`, order the destination
+   *  segment as `orderedUids`, and keep the moved doc visible + focused. */
+  private moveTabToSegment(uid: string, fromSlotId: string, toSlotId: string, orderedUids: string[]): void {
+    const from = this.slots[fromSlotId as SlotId];
+    const to = this.slots[toSlotId as SlotId];
+    if (!from || !to || from === to) {
+      this.refreshTabsNow();
+      return;
+    }
+    const rec = from.stack.find((r) => r.uid === uid);
+    if (!rec) {
+      this.refreshTabsNow();
+      return;
+    }
+    from.releaseRecord(rec); // may empty + hide the source pane (hooks fire)
+    to.push(rec); // appends, makes visible, focuses `to`
+    // Apply the drag's intended order within the destination segment.
+    const byUid = new Map(to.stack.map((r) => [r.uid, r]));
+    const ordered = orderedUids.map((u) => byUid.get(u)).filter((r): r is PaneRecord => !!r);
+    if (ordered.length === to.stack.length) {
+      to.stack = ordered;
+      to.visibleIndex = ordered.indexOf(rec);
+    }
+    this.reconcileNavRail();
+    this.refreshLayout();
+    this.refreshTabsNow();
+    focusPaneRecord(rec);
+  }
+
+  /** Right-click a tab → a small context menu (Close, Close others, Close to
+   *  the right, Split to a new pane). Positioned at the pointer; dismissed on
+   *  the next outside pointerdown / Escape. */
+  private openTabContextMenu(slotId: string, uid: string, x: number, y: number): void {
+    const slot = this.slots[slotId as SlotId];
+    if (!slot) return;
+    const idx = slot.stack.findIndex((r) => r.uid === uid);
+    if (idx < 0) return;
+
+    const menu = document.createElement('div');
+    menu.className = 'pmd-tab-menu';
+    const close = (): void => {
+      document.removeEventListener('pointerdown', onDoc, true);
+      document.removeEventListener('keydown', onKey, true);
+      menu.remove();
+    };
+    const onDoc = (e: Event): void => {
+      if (!menu.contains(e.target as Node)) close();
+    };
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') close();
+    };
+    const item = (label: string, enabled: boolean, run: () => void): void => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'pmd-tab-menu-item';
+      btn.textContent = label;
+      btn.disabled = !enabled;
+      btn.addEventListener('click', () => {
+        close();
+        run();
+      });
+      menu.appendChild(btn);
+    };
+    const others = slot.stack.filter((r) => r.uid !== uid);
+    const toRight = slot.stack.slice(idx + 1);
+    item('Close', true, () => void this.closeTab(slotId, uid));
+    item('Close others', others.length > 0, () => void this.closeRecords(slotId, others.slice()));
+    item('Close to the right', toRight.length > 0, () => void this.closeRecords(slotId, toRight.slice()));
+    item('Split to new pane', SLOT_IDS.some((id) => this.slots[id].stack.length === 0), () => {
+      this.splitTabToSide(uid, slotId as SlotId, 'right');
+    });
+
+    menu.style.left = `${Math.round(x)}px`;
+    menu.style.top = `${Math.round(y)}px`;
+    document.body.appendChild(menu);
+    // Nudge back on-screen if it overflows the right / bottom edge.
+    const r = menu.getBoundingClientRect();
+    if (r.right > window.innerWidth) menu.style.left = `${Math.round(window.innerWidth - r.width - 8)}px`;
+    if (r.bottom > window.innerHeight) menu.style.top = `${Math.round(window.innerHeight - r.height - 8)}px`;
+    setTimeout(() => {
+      document.addEventListener('pointerdown', onDoc, true);
+      document.addEventListener('keydown', onKey, true);
+    }, 0);
+  }
+
+  /** Close a set of records in one slot, in order, prompting per dirty doc.
+   *  Stops if the user cancels a save prompt. */
+  private async closeRecords(slotId: string, records: PaneRecord[]): Promise<void> {
+    const slot = this.slots[slotId as SlotId];
+    if (!slot) return;
+    for (const rec of records) {
+      if (!slot.stack.includes(rec)) continue; // already gone
+      await slot.closeRecord(rec);
+    }
+    this.refreshTabsNow();
+  }
+
+  // ── Drag-a-tab-into-the-canvas to split (Phase 3) ──────────────────
+
+  /** Non-empty slots left→right, as the pure `PaneLayout` shape. */
+  private currentPaneLayout(): { ids: SlotId[]; panes: PaneLayout[] } {
+    const ids = SLOT_IDS.filter((id) => this.slots[id].stack.length > 0);
+    const panes = ids.map((id) => {
+      const slot = this.slots[id];
+      return { uids: slot.stack.map((r) => r.uid), visibleUid: slot.visible?.uid ?? '' };
+    });
+    return { ids, panes };
+  }
+
+  /** The visible panes' rects (non-empty slots, left→right). */
+  private activePaneRects(): { ids: SlotId[]; rects: DOMRect[] } {
+    const ids = SLOT_IDS.filter((id) => this.slots[id].stack.length > 0 && !this.slots[id].paneEl.hidden);
+    return { ids, rects: ids.map((id) => this.slots[id].paneEl.getBoundingClientRect()) };
+  }
+
+  /** Resolve the pointer to a drop target: the CENTER of a pane means "merge
+   *  into that pane"; the outer edges mean "open a new pane at that boundary".
+   *  Boundaries are shared between neighbouring panes (the gap between pane 1
+   *  and pane 2 is ONE target, not "right of 1" + "left of 2"), so N panes
+   *  offer N merge targets + N+1 boundaries rather than 3 overlapping zones
+   *  each. Returns geometry for the preview, or null when off the pane row. */
+  private resolvePaneDropTarget(
+    x: number,
+    y: number,
+  ):
+    | { kind: 'into'; paneIndex: number; rect: DOMRect }
+    | { kind: 'split'; boundary: number; edgeX: number; top: number; height: number }
+    | null {
+    const { ids, rects } = this.activePaneRects();
+    if (ids.length === 0) return null;
+    const top = Math.min(...rects.map((r) => r.top));
+    const bottom = Math.max(...rects.map((r) => r.bottom));
+    if (y < top || y > bottom) return null;
+    const height = bottom - top;
+
+    let p = -1;
+    for (let i = 0; i < rects.length; i++) {
+      if (x >= rects[i]!.left && x <= rects[i]!.right) {
+        p = i;
+        break;
+      }
+    }
+    if (p === -1) {
+      // Between/beyond panes → nearest end boundary.
+      const boundary = x < rects[0]!.left ? 0 : ids.length;
+      const edgeX = boundary === 0 ? rects[0]!.left : rects[rects.length - 1]!.right;
+      return { kind: 'split', boundary, edgeX, top, height };
+    }
+    const r = rects[p]!;
+    const frac = (x - r.left) / Math.max(1, r.width);
+    if (frac < 0.28) return { kind: 'split', boundary: p, edgeX: r.left, top, height };
+    if (frac > 0.72) return { kind: 'split', boundary: p + 1, edgeX: r.right, top, height };
+    return { kind: 'into', paneIndex: p, rect: r };
+  }
+
+  /** The pane arrangement a target would produce, or null if it changes
+   *  nothing (dropping a tab where it already is) or exceeds the pane cap.
+   *  This single check is what makes no-op targets un-droppable — you can't
+   *  "add a tab onto the pane it's already in". */
+  private resolveTabDropLayout(
+    uid: string,
+    target: NonNullable<ReturnType<MultiPaneShell['resolvePaneDropTarget']>>,
+  ): PaneLayout[] | null {
+    const { panes } = this.currentPaneLayout();
+    let desired: PaneLayout[] | null;
+    if (target.kind === 'into') {
+      // Dropping a tab into the pane it already lives in does nothing the user
+      // asked for (it's already there) — reject it so its own pane never lights
+      // up as a merge target.
+      if (panes[target.paneIndex]?.uids.includes(uid)) return null;
+      desired = computeSplitLayout(panes, uid, target.paneIndex, 'into', SLOT_IDS.length);
+    } else if (target.boundary < panes.length) {
+      desired = computeSplitLayout(panes, uid, target.boundary, 'left', SLOT_IDS.length);
+    } else {
+      desired = computeSplitLayout(panes, uid, panes.length - 1, 'right', SLOT_IDS.length);
+    }
+    if (!desired || paneLayoutsEqual(panes, desired)) return null;
+    return desired;
+  }
+
+  private ensureTabDropOverlay(): HTMLElement {
+    if (this.tabDropOverlay) return this.tabDropOverlay;
+    const el = document.createElement('div');
+    el.className = 'pmd-tab-drop-zone';
+    el.hidden = true;
+    document.body.appendChild(el);
+    this.tabDropOverlay = el;
+    return el;
+  }
+
+  /** Live drop preview as a dragged tab moves over the canvas. Highlights the
+   *  whole pane for a merge, or a thin bar at the boundary for a new pane —
+   *  and shows NOTHING (drop cancels) over a no-op target. */
+  updateTabDropZone(uid: string, x: number, y: number): void {
+    const target = this.resolvePaneDropTarget(x, y);
+    if (!target) {
+      this.hideTabDropZone();
+      return;
+    }
+    const desired = this.resolveTabDropLayout(uid, target);
+    if (!desired) {
+      this.hideTabDropZone();
+      return;
+    }
+    this.pendingTabDrop = { desired, focusUid: uid };
+    const overlay = this.ensureTabDropOverlay();
+    if (target.kind === 'into') {
+      const r = target.rect;
+      overlay.dataset['mode'] = 'into';
+      overlay.style.left = `${Math.round(r.left)}px`;
+      overlay.style.top = `${Math.round(r.top)}px`;
+      overlay.style.width = `${Math.round(r.width)}px`;
+      overlay.style.height = `${Math.round(r.height)}px`;
+    } else {
+      overlay.dataset['mode'] = 'split';
+      overlay.style.left = `${Math.round(target.edgeX - 3)}px`;
+      overlay.style.top = `${Math.round(target.top)}px`;
+      overlay.style.width = '6px';
+      overlay.style.height = `${Math.round(target.height)}px`;
+    }
+    overlay.hidden = false;
+  }
+
+  hideTabDropZone(): void {
+    this.pendingTabDrop = null;
+    if (this.tabDropOverlay) this.tabDropOverlay.hidden = true;
+  }
+
+  /** A tab was dropped in the canvas: apply the resolved arrangement under the
+   *  pointer (recomputed fresh), or cancel if it's off-row or a no-op. */
+  private dropTabOutsideStrip(uid: string, x: number, y: number): void {
+    const target = this.resolvePaneDropTarget(x, y);
+    this.hideTabDropZone();
+    if (!target) return;
+    const desired = this.resolveTabDropLayout(uid, target);
+    if (!desired) return; // no-op / over cap → cancel.
+    this.applyPaneLayout(desired, uid);
+  }
+
+  /** Reflow panes so `draggedUid` lands on `side` of `refSlotId`. */
+  private splitTabToSide(draggedUid: string, refSlotId: SlotId, side: DropSide): void {
+    const { ids, panes } = this.currentPaneLayout();
+    const refIndex = ids.indexOf(refSlotId);
+    if (refIndex < 0) return;
+    const desired = computeSplitLayout(panes, draggedUid, refIndex, side, SLOT_IDS.length);
+    if (!desired) {
+      showToast('Up to 3 panes.');
+      return;
+    }
+    if (paneLayoutsEqual(panes, desired)) return; // no-op drop — don't churn.
+    this.applyPaneLayout(desired, draggedUid);
+  }
+
+  /** Re-assign every record to slots slot1..slotN so the panes match
+   *  `desired` (left→right). Views are preserved (released, re-pushed), never
+   *  rebuilt. Focuses the pane holding `focusUid` at the end. */
+  private applyPaneLayout(desired: PaneLayout[], focusUid: string): void {
+    const byUid = new Map<string, PaneRecord>();
+    for (const id of SLOT_IDS) for (const r of this.slots[id].stack) byUid.set(r.uid, r);
+    // Release all slots first (no hooks fire) so records can move freely.
+    for (const id of SLOT_IDS) this.slots[id].releaseAll();
+    desired.slice(0, SLOT_IDS.length).forEach((pane, i) => {
+      const slot = this.slots[SLOT_IDS[i]!];
+      for (const u of pane.uids) {
+        const rec = byUid.get(u);
+        if (rec) slot.push(rec);
+      }
+      const vis = byUid.get(pane.visibleUid);
+      if (vis && slot.stack.includes(vis)) slot.showRecord(vis);
+    });
+    const focusRec = byUid.get(focusUid);
+    const focusSlot = focusRec
+      ? SLOT_IDS.map((id) => this.slots[id]).find((s) => s.stack.includes(focusRec))
+      : null;
+    if (focusSlot) {
+      this.focusSlot(focusSlot);
+      focusPaneRecord(focusSlot.visible);
+    }
+    this.reconcileNavRail();
+    this.refreshLayout();
+    this.refreshTabsNow();
+  }
+
+  async createNewFlow(format: FlowFormat): Promise<boolean> {
+    const round = createRound({ format });
+    return this.routeFlowRound({
+      round,
+      filename: defaultFlowName(format),
+      handle: null,
+      format: 'cmflow',
+      baselineJson: flowBaselineForRound(round),
+      createdAt: round.createdAt,
+    });
+  }
+
+  async routeOpenedFlowFile(opened: OpenedFile): Promise<boolean> {
+    try {
+      if (opened.name.toLowerCase().endsWith('.cmflow')) {
+        if (opened.handle != null && (await isFileOpenInAnotherWindow(opened.handle))) {
+          showToast(`"${opened.name}" is already open in another window.`);
+          return false;
+        }
+        if (await this.surfaceDuplicateIfOpen(opened)) return true;
+        const parsed = parseFlowFile(opened.bytes);
+        return this.routeFlowRound({
+          round: parsed.round,
+          filename: opened.name,
+          handle: opened.handle ?? null,
+          format: 'cmflow',
+          baselineJson: flowBaselineForRound(parsed.round),
+          createdAt: parsed.createdAt,
+        });
+      }
+      if (opened.name.toLowerCase().endsWith('.flowline.json') || opened.name.toLowerCase().endsWith('.json')) {
+        const round = parseFlowlineJson(opened.bytes);
+        return this.routeFlowRound({
+          round,
+          filename: suggestedFlowSaveName(opened.name),
+          handle: null,
+          format: 'flowline-json',
+          baselineJson: flowBaselineForRound(round),
+          createdAt: round.createdAt,
+        });
+      }
+      return false;
+    } catch (err) {
+      console.error('Failed to load Flow:', err);
+      void alertDialog(`Failed to load Flow: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
+
+  private async loadOpenedFlowIntoSlot(opened: OpenedFile, target: SlotId): Promise<boolean> {
+    try {
+      if (opened.name.toLowerCase().endsWith('.cmflow')) {
+        const parsed = parseFlowFile(opened.bytes);
+        this.mountFlowIntoSlot(
+          {
+            round: parsed.round,
+            filename: opened.name,
+            handle: opened.handle ?? null,
+            format: 'cmflow',
+            baselineJson: flowBaselineForRound(parsed.round),
+            createdAt: parsed.createdAt,
+          },
+          target,
+        );
+        return true;
+      }
+      if (opened.name.toLowerCase().endsWith('.flowline.json')) {
+        const round = parseFlowlineJson(opened.bytes);
+        this.mountFlowIntoSlot(
+          {
+            round,
+            filename: suggestedFlowSaveName(opened.name),
+            handle: null,
+            format: 'flowline-json',
+            baselineJson: flowBaselineForRound(round),
+            createdAt: round.createdAt,
+          },
+          target,
+        );
+        return true;
+      }
+      return false;
+    } catch (err) {
+      console.error('Failed to load Flow:', err);
+      void alertDialog(`Failed to load Flow: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
+
+  async saveFocusedFlow(): Promise<boolean | null> {
+    const rec = this.focusedSlot?.visible;
+    if (!isFlowRecord(rec)) return null;
+    return rec.save();
+  }
+
+  async saveFocusedFlowAs(): Promise<boolean | null> {
+    const rec = this.focusedSlot?.visible;
+    if (!isFlowRecord(rec)) return null;
+    return rec.saveAs();
+  }
+
+  addFlowToFocused(side: FlowSide): boolean | null {
+    const rec = this.focusedSlot?.visible;
+    if (!isFlowRecord(rec)) return null;
+    rec.workspace.addFlow(side);
+    return true;
+  }
+
+  private async routeFlowRound(opts: {
+    round: FlowRound;
+    filename: string;
+    handle: unknown | null;
+    format: OpenedFlowFormat | null;
+    baselineJson: string | null;
+    createdAt?: string | null;
+  }): Promise<boolean> {
+    const choice = await this.promptForFlowRoute(opts.filename);
+    if (!choice) return false;
+    const slotId = flowRouteSlotId(choice);
+    if (slotId) {
+      this.mountFlowIntoSlot(opts, slotId);
+      return true;
+    }
+    return this.spawnFlowSeparateOrFallback(opts);
+  }
+
+  private mountFlowIntoSlot(
+    opts: {
+      round: FlowRound;
+      filename: string;
+      handle: unknown | null;
+      format: OpenedFlowFormat | null;
+      baselineJson: string | null;
+      createdAt?: string | null;
+    },
+    target: SlotId,
+  ): void {
+    const slot = this.slots[target];
+    const record = buildFlowRecord(opts.filename, opts.round, slot, {
+      handle: opts.handle,
+      format: opts.format,
+      baselineJson: opts.baselineJson,
+      createdAt: opts.createdAt,
+    });
+    slot.push(record);
+    record.focus();
+    if (record.format === 'cmflow') {
+      recordRecent({
+        handle: typeof record.handle === 'string' ? record.handle : null,
+        filename: record.filename,
+        format: 'cmflow',
+      });
+    }
+  }
+
+  private async spawnFlowSeparateOrFallback(opts: {
+    round: FlowRound;
+    filename: string;
+    handle: unknown | null;
+    format: OpenedFlowFormat | null;
+    baselineJson: string | null;
+    createdAt?: string | null;
+  }): Promise<boolean> {
+    const host = getHost();
+    if (canOpenFlowSeparate(host)) {
+      try {
+        await host.spawnWindow({
+          filename: suggestedFlowSaveName(opts.filename),
+          bytes: serializeFlowFile({ round: opts.round, createdAt: opts.createdAt ?? undefined }),
+          handle: typeof opts.handle === 'string' && opts.format === 'cmflow' ? opts.handle : null,
+          format: 'cmflow',
+          uid: null,
+        });
+        return true;
+      } catch (err) {
+        console.error('Spawn Flow window failed:', err);
+        showToast('Could not open Flow separately; opening it in this workspace instead.');
+      }
+    } else {
+      showToast('Open Separate is not available here; opening Flow in this workspace instead.');
+    }
+    const target =
+      SLOT_IDS.find((id) => this.slots[id].stack.length === 0) ?? this.focusedSlot?.id ?? 'slot1';
+    this.mountFlowIntoSlot(opts, target);
+    return true;
+  }
+
+  private async spawnOpenedDocSeparateOrFallback(opened: OpenedFile): Promise<boolean> {
+    const host = getHost();
+    const format = formatFromFilename(opened.name) ?? 'docx';
+    if (host.canSpawnWindow) {
+      try {
+        await host.spawnWindow({
+          filename: opened.name,
+          bytes: opened.bytes,
+          handle: typeof opened.handle === 'string' ? opened.handle : null,
+          format,
+          uid: null,
+        });
+        return true;
+      } catch (err) {
+        console.error('Spawn document window failed:', err);
+        showToast('Could not open separately; opening it in this workspace instead.');
+      }
+    } else {
+      showToast('Open Separate is not available here; opening it in this workspace instead.');
+    }
+    const target =
+      SLOT_IDS.find((id) => this.slots[id].stack.length === 0) ?? this.focusedSlot?.id ?? 'slot1';
+    await this.loadOpenedIntoSlot(opened, target);
+    return true;
+  }
+
+  private promptForFlowRoute(filename: string): Promise<FlowRouteChoiceId | null> {
+    return showPaneRouteOverlay({
+      filename,
+      slots: this.routeSlots(),
+      activeSlotId: this.focusedSlot?.id ?? null,
+      allowSeparate: true,
+      separateLabel: 'Open separate',
+      ariaLabel: `Open ${filename} into workspace`,
+    }) as Promise<FlowRouteChoiceId | null>;
+  }
+
+  /** Parse + import + mount the host-provided OpenedFile into the
+   *  given slot. Detects format from the filename extension and
+   *  routes to the right parser. */
+
+  async canAdoptFlowSaveAsHandle(record: FlowRecord, handle: unknown | null): Promise<boolean> {
+    if (handle == null) return true;
+    const [existing, openInAnotherWindow] = await Promise.all([
+      this.findOpenPaneByHandle(handle),
+      isFileOpenInAnotherWindow(handle),
+    ]);
+    const owner = existing
+      ? existing.record === record
+        ? 'self'
+        : 'other'
+      : 'none';
+    if (canAdoptFlowSaveAsHandleDecision({ owner, openInAnotherWindow })) return true;
+    const message =
+      owner === 'other'
+        ? 'That Flow file is already open in this workspace. The Save As file was written, but this pane will keep its current file identity.'
+        : 'That Flow file is already open in another window. The Save As file was written, but this pane will keep its current file identity.';
+    void alertDialog(message);
+    return false;
+  }
+
+  /** Create an empty doc; prompt for slot. Used by the ribbon's
+   *  "New doc" button. */
+
+  private async findOpenPaneByHandle(
+    handle: unknown,
+  ): Promise<{ slot: Slot; record: PaneRecord } | null> {
+    if (handle == null) return null;
+    for (const id of SLOT_IDS) {
+      const slot = this.slots[id];
+      for (const record of slot.stack) {
+        if (await isSameOpenHandle(record.handle, handle)) return { slot, record };
+      }
+    }
+    return null;
+  }
+
+  private routeSlots(): PaneRouteSlot<SlotId>[] {
+    return SLOT_IDS.map((id, index) => {
+      const slot = this.slots[id];
+      const hiddenCount = Math.max(0, slot.stack.length - 1);
+      return {
+        id,
+        label: String(index + 1),
+        filename: slot.visible
+          ? `${slot.visible.filename}${hiddenCount > 0 ? ` (+${hiddenCount})` : ''}`
+          : '',
+        stackCount: slot.stack.length,
+      };
+    });
   }
 
   private findSlotByView(view: EditorView): Slot | null {
     for (const id of SLOT_IDS) {
-      if (this.slots[id].visible?.view === view) return this.slots[id];
+      const visible = this.slots[id].visible;
+      if (isDocRecord(visible) && visible.view === view) return this.slots[id];
     }
     return null;
   }
@@ -1614,7 +2473,7 @@ class MultiPaneShell {
     for (const id of SLOT_IDS) {
       const slot = this.slots[id];
       for (const rec of slot.stack) {
-        if (rec.view === view) return { slot, record: rec };
+        if (isDocRecord(rec) && rec.view === view) return { slot, record: rec };
       }
     }
     return null;
@@ -1632,6 +2491,9 @@ class MultiPaneShell {
       : SLOT_IDS.filter((id) => this.slots[id].stack.length > 0).length;
     this.rowEl.dataset['active'] = String(active);
     this.navRailEl.dataset['active'] = String(active);
+    // Structural change (open / close / move / expand) → the strip's segments
+    // changed.
+    this.scheduleTabsRefresh();
     // Active-count change → pane widths change → re-sync.
     this.scheduleSyncAllCardIntrinsicWidths();
   }
@@ -1900,7 +2762,7 @@ class MultiPaneShell {
     } else {
       this.focusSlot(slot);
     }
-    slot.visible?.view.focus();
+    focusPaneRecord(slot.visible);
   }
 
   /** Cycle the focused slot's visible doc to the next (+1) or previous (-1) doc
@@ -1916,7 +2778,7 @@ class MultiPaneShell {
     const next = slot.stack[(start + direction + len) % len];
     if (next && next !== slot.visible) {
       slot.showRecord(next);
-      slot.visible?.view.focus();
+      focusPaneRecord(slot.visible);
     }
   }
 
@@ -1928,7 +2790,7 @@ class MultiPaneShell {
     const record = this.focusedSlot.releaseVisible();
     if (!record) return;
     targetSlot.push(record);
-    targetSlot.visible?.view.focus();
+    focusPaneRecord(targetSlot.visible);
   }
 
   /** Toggle expand-mode on the focused slot. Used by the
@@ -2001,7 +2863,9 @@ class MultiPaneShell {
     // command routing (active view), which reads as "styling does
     // nothing". The slot takes focus normally when it becomes visible.
     if (slot.paneEl.hidden) return;
-    const wasSame = this.focusedSlot === slot && getActiveView() === slot.visible?.view;
+    const visible = slot.visible;
+    const visibleView = isDocRecord(visible) ? visible.view : null;
+    const wasSame = this.focusedSlot === slot && getActiveView() === visibleView;
     // The focused highlight is DERIVED: stamped across all panes on
     // every focus change, never incrementally transferred. The old
     // remove-from-previous-only bookkeeping leaked a stale class
@@ -2018,7 +2882,7 @@ class MultiPaneShell {
     }
     this.focusedSlot = slot;
     if (!wasSame) {
-      setActiveView(slot.visible?.view ?? null);
+      setActiveView(visibleView);
       // The shared comments column lives at the shell-row level, not
       // inside any single pane — so re-resolve this doc's flashcard
       // anchors (the focused doc changed) and re-render its cards, and
@@ -2112,7 +2976,7 @@ class MultiPaneShell {
    *  `toggleReadMode` hook). No-op if no pane is focused. */
   toggleFocusedReadMode(): void {
     const rec = this.focusedSlot?.visible;
-    if (!rec) return;
+    if (!isDocRecord(rec)) return;
     rec.readMode = !rec.readMode;
     applyReadModeToTarget(
       rec.editorEl,
@@ -2151,7 +3015,7 @@ class MultiPaneShell {
    *  the ribbon's autosave button re-reads the resolver. */
   toggleFocusedAutosave(): void {
     const rec = this.focusedSlot?.visible;
-    if (!rec) return;
+    if (!isDocRecord(rec)) return;
     rec.autosaveEnabled = !rec.autosaveEnabled;
     // Remember the choice per-file so it survives close + reopen.
     setAutosaveForPath(rec.handle, rec.autosaveEnabled);
@@ -2176,7 +3040,7 @@ class MultiPaneShell {
         rec.dirty = false;
       },
       clearJournal: () => {
-        void clearJournalForRecord(rec);
+        if (isDocRecord(rec)) void clearJournalForRecord(rec);
       },
     });
   }
@@ -2199,7 +3063,7 @@ class MultiPaneShell {
     uid: string;
   } | null {
     const rec = this.focusedSlot?.visible;
-    if (!rec) return null;
+    if (!isDocRecord(rec)) return null;
     return { filename: rec.filename, handle: rec.handle, format: rec.format, docId: rec.docId, uid: rec.uid };
   }
 
@@ -2209,7 +3073,7 @@ class MultiPaneShell {
    *  path-claim machinery. */
   setFocusedDocId(docId: string): void {
     const rec = this.focusedSlot?.visible;
-    if (rec) rec.docId = docId;
+    if (isDocRecord(rec)) rec.docId = docId;
   }
 
   /** View of any pane holding `docId` — every slot's full stack (visible
@@ -2225,7 +3089,7 @@ class MultiPaneShell {
     for (const id of SLOT_IDS) {
       const slot = this.slots[id];
       for (const rec of slot.stack) {
-        if (rec.docId === docId) {
+        if (isDocRecord(rec) && rec.docId === docId) {
           // Raised before resolution: if the jump then fails not-found, the
           // raised record stays visible anyway. Accepted - the doc was
           // explicitly requested, so surfacing it is reasonable regardless.
@@ -2254,7 +3118,7 @@ class MultiPaneShell {
   docIdForUid(uid: string): string | null {
     for (const id of SLOT_IDS) {
       for (const rec of this.slots[id].stack) {
-        if (rec.uid === uid) return rec.docId;
+        if (isDocRecord(rec) && rec.uid === uid) return rec.docId;
       }
     }
     return null;
@@ -2309,7 +3173,7 @@ class MultiPaneShell {
     // owned by us and the old one is released.
     syncDocPathClaim(rec.handle, file.handle);
     rec.handle = file.handle;
-    setViewDocPath(rec.view, typeof file.handle === 'string' ? file.handle : null);
+    if (isDocRecord(rec)) setViewDocPath(rec.view, typeof file.handle === 'string' ? file.handle : null);
     rec.format = file.format;
     slot.refreshChipFilename();
     pushPaneDocInfo(rec.uid, rec.filename);
@@ -2329,6 +3193,7 @@ class MultiPaneShell {
     const docs: Array<{ uid: string; dirty: boolean }> = [];
     for (const id of SLOT_IDS) {
       for (const rec of this.slots[id].stack) {
+        if (!isDocRecord(rec)) continue;
         if (rec.journalTimer !== null) {
           window.clearTimeout(rec.journalTimer);
           rec.journalTimer = null;
@@ -2522,7 +3387,7 @@ class MultiPaneShell {
       target,
     );
     const record = this.slots[target].visible;
-    if (record) {
+    if (isDocRecord(record)) {
       requestAnimationFrame(() => scrollRecordToDescriptor(record, req.descriptor, req.name));
     }
   }
@@ -2660,11 +3525,13 @@ class MultiPaneShell {
     // above stays the SAVE format.)
     const isDocxBytes =
       openBytes.length >= 2 && openBytes[0] === 0x50 && openBytes[1] === 0x4b;
+    let sharedDoc: SharedDocMetadata | null = null;
     if (!isDocxBytes) {
-      ({ doc, threads, docId } = parseNative(openBytes));
+      ({ doc, threads, docId, sharedDoc } = parseNative(openBytes));
     } else {
       ({ doc, threads, docId } = await fromDocxFull(openBytes));
     }
+    if (sharedDoc) warnIfCoEditedInCloudFolder(opened.handle, opened.name);
     const slot = this.slots[target];
     const record = buildDocRecord(opened.name, doc, slot, {
       handle: opened.handle ?? null,
@@ -2708,7 +3575,7 @@ class MultiPaneShell {
     for (const id of SLOT_IDS) {
       const slot = this.slots[id];
       for (const record of slot.stack) {
-        if (await isSameOpenHandle(record.handle, handle)) {
+        if (isDocRecord(record) && (await isSameOpenHandle(record.handle, handle))) {
           return { slot, record };
         }
       }
@@ -2853,7 +3720,7 @@ class MultiPaneShell {
    *  is focused. */
   markFocusedAsSpeech(): void {
     const rec = this.focusedSlot?.visible;
-    if (!rec) return;
+    if (!isDocRecord(rec)) return;
     const resolver = getSpeechDocResolver();
     const next = resolver.getSpeechView() === rec.view ? null : rec.view;
     resolver.setSpeech(next);
@@ -2866,7 +3733,7 @@ class MultiPaneShell {
    *  is the shelf, broadcast via `dropzoneStore`. */
   sendToDropzone(): void {
     const sourceRec = this.focusedSlot?.visible;
-    if (!sourceRec) return;
+    if (!isDocRecord(sourceRec)) return;
     void sendViewToDropzone(sourceRec.view);
   }
 
@@ -2874,7 +3741,7 @@ class MultiPaneShell {
    *  recipient/group. Mirrors `sendToDropzone`, routed to the relay. */
   sendToStarred(): void {
     const sourceRec = this.focusedSlot?.visible;
-    if (!sourceRec) return;
+    if (!isDocRecord(sourceRec)) return;
     void sendViewToStarred(sourceRec.view);
   }
 
@@ -2896,9 +3763,11 @@ class MultiPaneShell {
     // source pane.
     const speechView = speechUid ? resolver.viewForUid(speechUid) : null;
     const located = speechView ? this.findRecordForView(speechView) : null;
-    if (located && located.slot.visible?.view !== located.record.view) {
+    const locatedVisible = located?.slot.visible;
+    if (located && (!isDocRecord(locatedVisible) || locatedVisible.view !== located.record.view)) {
       located.slot.showRecord(located.record);
     }
+    if (!isDocRecord(sourceRec)) return;
     runSendToSpeech(sourceRec.view, atEnd, () => {
       // Post-insert: focus the destination slot and FLUSH its
       // debounced heavy update so the new headings and word count
@@ -2920,7 +3789,8 @@ class MultiPaneShell {
     const speechView = getSpeechDocResolver().getSpeechView();
     for (const id of SLOT_IDS) {
       const slot = this.slots[id];
-      const isSpeech = !!speechView && slot.visible?.view === speechView;
+      const vis = slot.visible;
+      const isSpeech = !!speechView && isDocRecord(vis) && vis.view === speechView;
       slot.paneEl.classList.toggle('pmd-pane-speech', isSpeech);
     }
   }
@@ -3022,6 +3892,219 @@ function scrollRecordToDescriptor(
 
 /** Build a fresh DocRecord — wraps the per-doc PM state, nav panel,
  *  editor drag surface, and DOM containers needed for slot mounting. */
+
+const CMFLOW_SAVE_FILTERS = [
+  { name: 'CardMirror Flow (.cmflow)', extensions: ['cmflow'] },
+];
+
+function buildFlowRecord(
+  filename: string,
+  round: FlowRound,
+  slot: Slot,
+  opts: {
+    handle: unknown | null;
+    format: OpenedFlowFormat | null;
+    baselineJson: string | null;
+    createdAt?: string | null;
+  },
+): FlowRecord {
+  const editorEl = document.createElement('div');
+  editorEl.className = 'pmd-pane-editor pmd-pane-flow-editor';
+  const navEl = document.createElement('div');
+  navEl.className = 'pmd-pane-nav-host pmd-pane-flow-nav-host';
+  navEl.hidden = true;
+
+  const uid = newDocUid();
+  let record!: FlowRecord;
+  let autosaveTimer: number | null = null;
+  let autosaveChain: Promise<void> = Promise.resolve();
+  const workspace = createFlowWorkspace({
+    mount: editorEl,
+    round,
+    onChange: (nextRound) => {
+      record.editGen++;
+      record.dirty = flowDirtyEquals(nextRound, record.baselineJson);
+      record.zoomPct = nextRound.settings.zoomPercent;
+      scheduleFlowAutosave();
+      record.owner.refreshWordCount();
+      refreshWindowTitle();
+    },
+    onRequestSave: () => {
+      void record.save();
+    },
+    onRequestClose: () => {
+      void record.owner.closeRecord(record);
+    },
+    onConfirmDeleteFlow: async (title) => {
+      const choice = await promptForChoice<'delete'>({
+        message: 'Delete this flow?',
+        detail: title,
+        // Upstream's choice dialog has no `danger` styling flag; `primary`
+        // still marks the default action, so the prompt reads the same minus
+        // the red accent.
+        choices: [{ label: 'Delete', value: 'delete', primary: true }],
+      });
+      return choice === 'delete';
+    },
+  });
+
+  function scheduleFlowAutosave(): void {
+    if (!record.dirty) return;
+    if (record.format !== 'cmflow') return;
+    if (!record.handle) return;
+    if (autosaveTimer !== null) window.clearTimeout(autosaveTimer);
+    autosaveTimer = window.setTimeout(() => {
+      autosaveTimer = null;
+      autosaveChain = autosaveChain
+        .then(() => runFlowAutosave())
+        .catch((err) => reportAutosaveFailure(record.filename, err));
+    }, AUTOSAVE_DELAY_MS);
+  }
+
+  async function runFlowAutosave(): Promise<void> {
+    if (!record.dirty) return;
+    if (record.format !== 'cmflow') return;
+    if (!record.handle) return;
+    const host = getHost();
+    if (!host.supportsInPlaceSave) return;
+    try {
+      if (!(await host.ensureWritable(record.handle))) return;
+      const beforeGen = record.editGen;
+      const bytes = serializeFlowFile({
+        round: workspace.getRound(),
+        createdAt: record.createdAt ?? undefined,
+      });
+      await host.saveExisting(record.handle, bytes, { force: true });
+      const clean = markClean(beforeGen);
+      recordRecent({
+        handle: typeof record.handle === 'string' ? record.handle : null,
+        filename: record.filename,
+        format: 'cmflow',
+      });
+      if (clean) {
+        reportAutosaveSuccess();
+        refreshWindowTitle();
+      }
+    } catch (err) {
+      reportAutosaveFailure(record.filename, err);
+    }
+  }
+
+  async function save(): Promise<boolean> {
+    const host = getHost();
+    try {
+      if (record.handle && record.format === 'cmflow' && host.supportsInPlaceSave) {
+        if (!(await host.ensureWritable(record.handle))) return saveAs();
+        const beforeGen = record.editGen;
+        const bytes = serializeFlowFile({
+          round: workspace.getRound(),
+          createdAt: record.createdAt ?? undefined,
+        });
+        await host.saveExisting(record.handle, bytes, { force: true });
+        const clean = markClean(beforeGen);
+        recordRecent({
+          handle: typeof record.handle === 'string' ? record.handle : null,
+          filename: record.filename,
+          format: 'cmflow',
+        });
+        if (!clean) {
+          showToast('Flow saved, but newer edits remain unsaved. Save again before closing.');
+          return false;
+        }
+        reportAutosaveSuccess();
+        return true;
+      }
+      return saveAs();
+    } catch (err) {
+      console.error('Flow save failed:', err);
+      void alertDialog(`Flow save failed: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
+
+  async function saveAs(): Promise<boolean> {
+    const beforeGen = record.editGen;
+    const bytes = serializeFlowFile({
+      round: workspace.getRound(),
+      createdAt: record.createdAt ?? undefined,
+    });
+    const result = await getHost().saveAs(suggestedFlowSaveName(record.filename), bytes, {
+      filters: CMFLOW_SAVE_FILTERS,
+      ...(typeof record.handle === 'string' && record.handle ? { nearPath: record.handle } : {}),
+    });
+    if (!result) return false;
+    const nextHandle = result.handle ?? null;
+    if (!(await record.owner.shell.canAdoptFlowSaveAsHandle(record, nextHandle))) {
+      return false;
+    }
+    syncDocPathClaim(record.handle, nextHandle);
+    record.filename = result.name;
+    record.handle = nextHandle;
+    record.format = 'cmflow';
+    record.owner.refreshChipFilename();
+    const clean = markClean(beforeGen);
+    recordRecent({
+      handle: typeof record.handle === 'string' ? record.handle : null,
+      filename: record.filename,
+      format: 'cmflow',
+    });
+    if (!clean) {
+      showToast('Flow saved, but newer edits remain unsaved. Save again before closing.');
+      refreshWindowTitle();
+      return false;
+    }
+    reportAutosaveSuccess();
+    refreshWindowTitle();
+    return true;
+  }
+
+  function markClean(savedGen: number): boolean {
+    const result = flowSaveCleanCommit({ savedGen, currentGen: record.editGen });
+    if (!result.clean) {
+      record.dirty = result.dirty;
+      record.owner.refreshWordCount();
+      refreshWindowTitle();
+      return false;
+    }
+    record.baselineJson = flowBaselineForRound(workspace.getRound());
+    record.dirty = false;
+    return true;
+  }
+
+  record = {
+    kind: 'flow',
+    uid,
+    filename,
+    handle: opts.handle,
+    format: opts.format,
+    workspace,
+    editorEl,
+    navEl,
+    owner: slot,
+    dirty: flowDirtyEquals(workspace.getRound(), opts.baselineJson),
+    baselineJson: opts.baselineJson,
+    createdAt: opts.createdAt ?? round.createdAt ?? null,
+    editGen: 0,
+    zoomPct: workspace.getRound().settings.zoomPercent,
+    save,
+    saveAs,
+    destroy() {
+      if (autosaveTimer !== null) {
+        window.clearTimeout(autosaveTimer);
+        autosaveTimer = null;
+      }
+      workspace.destroy();
+      editorEl.replaceChildren();
+    },
+    focus() {
+      workspace.focus();
+    },
+  };
+
+  syncDocPathClaim(null, record.handle);
+  return record;
+}
+
 function buildDocRecord(
   filename: string,
   doc: PMNode,
@@ -3247,6 +4330,7 @@ function buildDocRecord(
   setViewDocPath(view, typeof opts.handle === 'string' ? opts.handle : null);
 
   const record: DocRecord = {
+    kind: 'doc',
     uid,
     filename,
     handle: opts.handle,

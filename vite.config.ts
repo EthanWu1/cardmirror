@@ -194,6 +194,15 @@ export default defineConfig(({ command }) => {
     // Excluding the pair serves them as native ESM in dev — modern dev
     // browsers handle TLA fine, and production goes through rollup,
     // which already builds them (into their own lazy chunks).
+    // Workers must be CLASSIC (iife) in production: the Electron renderer
+    // loads over file://, where Chromium refuses to start MODULE workers
+    // (module scripts need CORS, which file:// cannot grant). With the
+    // default ES-module worker output a packaged app silently loses its
+    // worker and falls back to doing the work on the main thread — the
+    // field "Search Evidence freezes/crashes" report (2026-07-19) in the
+    // fork. Dev still uses a module worker (unbundled TS needs it); the
+    // build rewrites the constructor.
+    worker: { format: 'iife' },
     optimizeDeps: { exclude: ['loro-crdt', 'loro-prosemirror'] },
   };
 });

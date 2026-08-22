@@ -23,12 +23,15 @@
 const STORAGE_KEY = 'pmd-recent-files';
 const MAX_RECENTS = 10;
 
+/** Formats a recent entry can carry. `.cmflow` joins with the flow subsystem. */
+export type RecentFileFormat = 'cmir' | 'docx' | 'cmflow';
+
 export interface RecentFile {
   /** Absolute path on Electron; null on web (unserializable
    *  FileSystemFileHandle). */
   handle: string | null;
   filename: string;
-  format: 'cmir' | 'docx' | null;
+  format: RecentFileFormat | null;
   lastOpenedAt: number;
 }
 
@@ -76,7 +79,7 @@ export function listRecents(): RecentFile[] {
 export function recordRecent(file: {
   handle: string | null;
   filename: string | null;
-  format: 'cmir' | 'docx' | null;
+  format: RecentFileFormat | null;
 }): void {
   if (!file.filename) return;
   const entry: RecentFile = {

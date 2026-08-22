@@ -44,6 +44,37 @@ export interface RoomUpdate {
   blob: Uint8Array;
 }
 
+interface AbortControllerLike {
+  signal: AbortSignal;
+  abort(): void;
+}
+
+const NODE_UTIL_MODULE = 'node:util';
+
+/** jsdom's AbortSignal is not Node's, and Node's fetch (undici) rejects a
+ *  foreign signal with "Expected signal to be an instance of AbortSignal" —
+ *  which silently kills every streamed request under vitest+jsdom, so the
+ *  whole collab suite fails to converge for a reason that has nothing to do
+ *  with the sync logic. Browsers never take this path. */
+function isJsdomRuntime(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return (navigator.userAgent ?? '').toLowerCase().includes('jsdom/');
+}
+
+async function makeFetchAbortController(): Promise<AbortControllerLike> {
+  if (isJsdomRuntime()) {
+    try {
+      const util = (await import(/* @vite-ignore */ NODE_UTIL_MODULE)) as typeof import('node:util');
+      if (typeof util.transferableAbortController === 'function') {
+        return util.transferableAbortController();
+      }
+    } catch {
+      /* Browser bundles never enter this path; fall back if node:util is absent. */
+    }
+  }
+  return new AbortController();
+}
+
 export interface FetchUpdatesResult {
   snapshot: { blob: Uint8Array; coversThroughSeq: number } | null;
   /** True when the server withheld the snapshot because the caller's
@@ -57,6 +88,13 @@ export interface FetchUpdatesResult {
    *  servers report 0), so a steady-state catch-up learns about a
    *  compaction without ever downloading the snapshot. */
   snapCovers: number;
+}
+
+/** A persistent shared document and the room carrying its live edits. In this
+ *  slice docId === roomId; kept separate so the relay can decouple them. */
+export interface PersistentDocRoom {
+  docId: string;
+  roomId: string;
 }
 
 export interface RoomsClientOptions {
@@ -224,6 +262,42 @@ export class RoomsClient {
     });
   }
 
+  /** Recent presence blobs for a peer that cannot hold a stream. Presence is
+   *  push-only over SSE, so a stream-less peer syncs edits but never learns
+   *  who else is in the room — no avatars, and it looks absent to everyone
+   *  while its own posts still land. Older relays have no GET here; treat
+   *  that as "no presence available" rather than an error. */
+  async fetchPresence(roomId: string): Promise<Uint8Array[]> {
+    const path = `/rooms/${roomId}/presence`;
+    let res: Response;
+    try {
+      res = await this.request(path, { headers: this.headers() });
+    } catch (err) {
+      if (err instanceof RoomsError && (err.status === 404 || err.status === 405)) return [];
+      throw err;
+    }
+    const body = await this.readJson<{ presence?: string[] }>(res, path);
+    if (!Array.isArray(body.presence)) return [];
+    return body.presence.map((b) => base64ToBytes(b));
+  }
+
+  /** Create a PERSISTENT document room — same transport as a temporary room,
+   *  but the relay's sweeper leaves it alone so a shared `.cmir` reopened days
+   *  later still finds its history. */
+  async createPersistentDoc(): Promise<PersistentDocRoom> {
+    const res = await this.request('/docs', { method: 'POST', headers: this.headers() });
+    const body = await this.readJson<{ docId?: string; roomId?: string }>(res, '/docs');
+    if (!body.docId || !body.roomId) {
+      throw new RoomsError(0, 'malformed createPersistentDoc response');
+    }
+    return { docId: body.docId, roomId: body.roomId };
+  }
+
+  /** End a shared document for everyone (tombstone + archive). */
+  async deletePersistentDoc(docId: string): Promise<void> {
+    await this.request(`/docs/${docId}`, { method: 'DELETE', headers: this.headers() });
+  }
+
   async deleteRoom(roomId: string): Promise<void> {
     await this.request(`/rooms/${roomId}`, { method: 'DELETE', headers: this.headers() });
   }
@@ -264,10 +338,24 @@ export interface RoomStreamOptions {
   /** Backoff bounds, injectable for tests. */
   minBackoffMs?: number;
   maxBackoffMs?: number;
+  /** Abort the stream when no bytes have arrived for this long. 0 disables. */
+  stallTimeoutMs?: number;
+  /** Keep retrying a 404/410 instead of ending. A PERSISTENT document outlives
+   *  its participants, so "no such room" is usually a relay restart or a
+   *  not-yet-visible write, not the end of the document. */
+  retryMissingRoom?: boolean;
+  /** Keep retrying a 409 even on a first join, for the same reason: a durable
+   *  room's slots may still hold ghosts from a previous session. */
+  retryFullRoom?: boolean;
 }
 
+/** A half-open socket neither delivers bytes nor closes, so a read can block
+ *  forever while the stream still reports connected. Cut it loose after this
+ *  long without a byte and let the normal retry path reconnect. */
+const DEFAULT_STREAM_STALL_MS = 35_000;
+
 export class RoomStream {
-  private controller: AbortController | null = null;
+  private controller: AbortControllerLike | null = null;
   private stopped = true;
   private backoffMs: number;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -387,7 +475,7 @@ export class RoomStream {
 
   private async connectLoop(): Promise<void> {
     if (this.stopped) return;
-    this.controller = new AbortController();
+    this.controller = await makeFetchAbortController();
     const fetchImpl = this.opts.fetchImpl ?? boundFetch;
     try {
       const sidQ = this.opts.sid ? `?sid=${encodeURIComponent(this.opts.sid)}` : '';
@@ -403,6 +491,12 @@ export class RoomStream {
         signal: this.controller.signal,
       });
       if (res.status === 410 || res.status === 404) {
+        if (this.opts.retryMissingRoom) {
+          // A persistent document outlives its participants: treat a missing
+          // room as transient (relay restart / replica lag) and keep trying.
+          this.scheduleRetry();
+          return;
+        }
         // Tombstoned (or GC'd all the way to gone): the session is over.
         this.stopped = true;
         this.opts.callbacks.onEnded();
@@ -413,7 +507,7 @@ export class RoomStream {
         // the count may include our own not-yet-reaped ghost connection
         // from the drop; the server clears those within a heartbeat
         // cycle, so retry instead of ending an established session.
-        if (!this.everHelloed) {
+        if (!this.everHelloed && !this.opts.retryFullRoom) {
           this.stopped = true;
           this.opts.callbacks.onFull();
           return;
@@ -431,30 +525,52 @@ export class RoomStream {
       // browser ReadableStream is not async-iterable everywhere.
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let buf = '';
-      let eventName = '';
-      let dataLines: string[] = [];
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let nl: number;
-        while ((nl = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, nl).replace(/\r$/, '');
-          buf = buf.slice(nl + 1);
-          if (line === '') {
-            this.dispatchFrame(eventName, dataLines.join('\n'));
-            eventName = '';
-            dataLines = [];
-            if (this.stopped) return;
-          } else if (line.startsWith(':')) {
-            continue;
-          } else if (line.startsWith('event:')) {
-            eventName = line.slice(6).trim();
-          } else if (line.startsWith('data:')) {
-            dataLines.push(line.slice(5).trimStart());
+      // Read-stall watchdog: a half-open socket (sleep, NAT reap, network
+      // switch) neither delivers bytes nor closes, so `reader.read()` would
+      // block forever while the stream still reports connected. Abort it when
+      // the byte flow stops; the normal retry path reconnects. The relay's
+      // heartbeat comments keep this from firing on an idle-but-healthy stream.
+      let lastReadAt = Date.now();
+      const stallMs = this.opts.stallTimeoutMs ?? DEFAULT_STREAM_STALL_MS;
+      let stallTimer: ReturnType<typeof setInterval> | null = null;
+      if (stallMs > 0) {
+        const streamController = this.controller;
+        stallTimer = setInterval(
+          () => {
+            if (Date.now() - lastReadAt > stallMs) streamController?.abort();
+          },
+          Math.max(250, Math.min(stallMs / 3, 15_000)),
+        );
+      }
+      try {
+        let buf = '';
+        let eventName = '';
+        let dataLines: string[] = [];
+        for (;;) {
+          const { done, value } = await reader.read();
+          lastReadAt = Date.now();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let nl: number;
+          while ((nl = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, nl).replace(/\r$/, '');
+            buf = buf.slice(nl + 1);
+            if (line === '') {
+              this.dispatchFrame(eventName, dataLines.join('\n'));
+              eventName = '';
+              dataLines = [];
+              if (this.stopped) return;
+            } else if (line.startsWith(':')) {
+              continue;
+            } else if (line.startsWith('event:')) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+              dataLines.push(line.slice(5).trimStart());
+            }
           }
         }
+      } finally {
+        if (stallTimer !== null) clearInterval(stallTimer);
       }
       // Server closed (deploy, idle reap) — reconnect.
       this.scheduleRetry();

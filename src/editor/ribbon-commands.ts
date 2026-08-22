@@ -4329,6 +4329,9 @@ export type RibbonCommandId =
   | 'sendHeadingsToFlowCell'
   | 'pullFromFlow'
   | 'createFlow'
+  | 'createLegacyExcelFlow'
+  | 'addAffFlow'
+  | 'addNegFlow'
   | 'startFlowHost'
   | 'toggleVoice'
   | 'openCardCutter'
@@ -4393,6 +4396,7 @@ export type RibbonCommandId =
   | 'addQuickCard'
   | 'manageQuickCards'
   | 'openQuickCardSearch'
+  | 'openEvidenceSearch'
   | 'collabStartSession'
   | 'collabJoinSession'
   | 'collabCopyShareCode'
@@ -4559,6 +4563,9 @@ export const RIBBON_COMMAND_IDS: RibbonCommandId[] = [
   'sendHeadingsToFlowCell',
   'pullFromFlow',
   'createFlow',
+  'createLegacyExcelFlow',
+  'addAffFlow',
+  'addNegFlow',
   'startFlowHost',
   'toggleVoice',
   'openCardCutter',
@@ -4615,6 +4622,7 @@ export const RIBBON_COMMAND_IDS: RibbonCommandId[] = [
   'addQuickCard',
   'manageQuickCards',
   'openQuickCardSearch',
+  'openEvidenceSearch',
   'collabStartSession',
   'collabJoinSession',
   'collabCopyShareCode',
@@ -4740,7 +4748,10 @@ export const RIBBON_COMMAND_LABELS: Record<RibbonCommandId, string> = {
   sendHeadingsToFlowColumn: 'Send Headings to Flow (one cell per line)',
   sendHeadingsToFlowCell: 'Send Headings to Flow (single cell)',
   pullFromFlow: 'Pull Selection from Flow',
-  createFlow: 'Create New Flow',
+  createFlow: 'Create Flow',
+  createLegacyExcelFlow: 'Create Excel Flow (Legacy)',
+  addAffFlow: 'Add Aff Flow',
+  addNegFlow: 'Add Neg Flow',
   startFlowHost: 'Start Flow Connection',
   toggleVoice: 'Toggle voice control',
   openCardCutter: 'Cut card with AI…',
@@ -4797,6 +4808,7 @@ export const RIBBON_COMMAND_LABELS: Record<RibbonCommandId, string> = {
   addQuickCard: 'Add Quick Card',
   manageQuickCards: 'Manage Quick Cards',
   openQuickCardSearch: 'Search Everything',
+  openEvidenceSearch: 'Search Evidence',
   collabStartSession: 'Start Collaboration Session',
   collabJoinSession: 'Join Collaboration Session',
   collabCopyShareCode: 'Copy Session Share Code',
@@ -5085,6 +5097,9 @@ export const DEFAULT_RIBBON_KEYS: Record<RibbonCommandId, string | string[]> = {
   sendHeadingsToFlowCell: '',
   pullFromFlow: '',
   createFlow: '',
+  createLegacyExcelFlow: '',
+  addAffFlow: '',
+  addNegFlow: '',
   startFlowHost: '',
   toggleVoice: 'Mod-Shift-V',
   openCardCutter: 'Mod-Alt-c',
@@ -5152,6 +5167,7 @@ export const DEFAULT_RIBBON_KEYS: Record<RibbonCommandId, string | string[]> = {
   addQuickCard: '',
   manageQuickCards: '',
   openQuickCardSearch: 'Mod-Shift-Space',
+  openEvidenceSearch: 'Mod-Shift-E',
   collabStartSession: '',
   collabJoinSession: '',
   collabCopyShareCode: '',
@@ -5329,6 +5345,9 @@ export interface RibbonContext {
   sendHeadingsToFlowCell: () => void;
   pullFromFlow: () => void;
   createFlow: () => void;
+  createLegacyExcelFlow: () => void;
+  addAffFlow: () => void;
+  addNegFlow: () => void;
   /** Pre-warm the persistent Flow PowerShell host (Windows only). */
   startFlowHost: () => void;
   /** Toggle the voice-control session on/off (desktop only). */
@@ -5396,6 +5415,7 @@ export interface RibbonContext {
   /** Open the floating quick-card search palette. Works with no
    *  active doc (browse-only; insert no-ops). */
   openQuickCardSearch: () => void;
+  openEvidenceSearch: () => void;
   collabStartSession: () => void;
   collabJoinSession: () => void;
   collabCopyShareCode: () => void;
@@ -5510,6 +5530,9 @@ const DEFAULT_RIBBON_CONTEXT: RibbonContext = {
   sendHeadingsToFlowCell: () => {},
   pullFromFlow: () => {},
   createFlow: () => {},
+  createLegacyExcelFlow: () => {},
+  addAffFlow: () => {},
+  addNegFlow: () => {},
   startFlowHost: () => {},
   toggleVoice: () => {},
   openCardCutter: () => {},
@@ -5542,6 +5565,7 @@ const DEFAULT_RIBBON_CONTEXT: RibbonContext = {
   addQuickCard: () => {},
   manageQuickCards: () => {},
   openQuickCardSearch: () => {},
+  openEvidenceSearch: () => {},
   collabStartSession: () => {},
   collabJoinSession: () => {},
   collabCopyShareCode: () => {},
@@ -5835,6 +5859,24 @@ function commandFor(id: RibbonCommandId, ctx: RibbonContext): Command {
       return (_state, dispatch) => {
         if (!dispatch) return true;
         ctx.pullFromFlow();
+        return true;
+      };
+    case 'createLegacyExcelFlow':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.createLegacyExcelFlow();
+        return true;
+      };
+    case 'addAffFlow':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.addAffFlow();
+        return true;
+      };
+    case 'addNegFlow':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.addNegFlow();
         return true;
       };
     case 'createFlow':
@@ -6162,6 +6204,12 @@ function commandFor(id: RibbonCommandId, ctx: RibbonContext): Command {
       return (_state, dispatch) => {
         if (!dispatch) return true;
         ctx.openQuickCardSearch();
+        return true;
+      };
+    case 'openEvidenceSearch':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.openEvidenceSearch();
         return true;
       };
     case 'collabStartSession':

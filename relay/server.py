@@ -149,6 +149,24 @@ class RelayRoom(Base):
     tombstoned = Column(Boolean, default=False, nullable=False)
 
 
+class RelayDocument(Base):
+    """A persistent shared document.
+
+    Unlike a temporary session room, a document room outlives its
+    participants: the sweeper skips it while it is un-archived, so a shared
+    `.cmir` can be reopened days later and still find its history.
+    """
+
+    __tablename__ = "relay_documents"
+
+    # Opaque server-side id. In this slice it equals room_id, so the existing
+    # rooms transport is reused unchanged.
+    id = Column(String, primary_key=True)
+    room_id = Column(String, nullable=False, unique=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    archived = Column(Boolean, default=False, nullable=False, index=True)
+
+
 class RelayRoomUpdate(Base):
     __tablename__ = "relay_room_updates"
 
@@ -257,7 +275,17 @@ def _sweep(db: Session) -> int:
         .filter(RelayRoom.last_activity < idle_cutoff)
         .all()
     )
+    # A live persistent document is never idle-collected — its whole point is
+    # to outlive the session that created it.
+    persistent_room_ids = {
+        row[0]
+        for row in db.query(RelayDocument.room_id)
+        .filter(RelayDocument.archived == False)  # noqa: E712
+        .all()
+    }
     for room in idle:
+        if room.id in persistent_room_ids and not room.tombstoned:
+            continue
         db.query(RelayRoomUpdate).filter(RelayRoomUpdate.room_id == room.id).delete(
             synchronize_session=False
         )
@@ -613,6 +641,90 @@ def create_room(db: Session = Depends(get_db)) -> JSONResponse:
     return JSONResponse({"roomId": room_id}, status_code=201)
 
 
+def _iso(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() + "Z" if value is not None else None
+
+
+def _document_info(db: Session, doc: RelayDocument) -> dict:
+    room = db.get(RelayRoom, doc.room_id)
+    return {
+        "docId": doc.id,
+        "roomId": doc.room_id,
+        "createdAt": _iso(doc.created_at),
+        "archived": bool(doc.archived),
+        "ended": bool(room is None or room.tombstoned),
+        "bytesUsed": int(room.bytes_used) if room is not None else 0,
+        "lastActivity": _iso(room.last_activity) if room is not None else None,
+    }
+
+
+@app.post("/relay/docs", status_code=201, dependencies=[Depends(require_relay_token)])
+def create_document_room(db: Session = Depends(get_db)) -> JSONResponse:
+    """Create a PERSISTENT document room.
+
+    Same update/snapshot/stream contract as a temporary room; the difference is
+    lifetime — the sweeper skips it until it is archived or tombstoned, so a
+    shared `.cmir` reopened days later still finds its history.
+    """
+    doc_id = uuid.uuid4().hex
+    db.add(RelayRoom(id=doc_id))
+    db.add(RelayDocument(id=doc_id, room_id=doc_id))
+    db.commit()
+    logger.info("[relay] document room created %s…", doc_id[:8])
+    return JSONResponse({"docId": doc_id, "roomId": doc_id}, status_code=201)
+
+
+@app.get("/relay/docs", dependencies=[Depends(require_relay_token)])
+def list_document_rooms(
+    include_archived: bool = Query(False, alias="includeArchived"),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> dict:
+    q = db.query(RelayDocument)
+    if not include_archived:
+        q = q.filter(RelayDocument.archived == False)  # noqa: E712
+    docs = q.order_by(RelayDocument.created_at.desc()).limit(limit).all()
+    return {"docs": [_document_info(db, doc) for doc in docs]}
+
+
+@app.get("/relay/docs/{doc_id}", dependencies=[Depends(require_relay_token)])
+def get_document_room(doc_id: str, db: Session = Depends(get_db)) -> dict:
+    doc = db.get(RelayDocument, doc_id)
+    if doc is None:
+        raise HTTPException(404, "no such document")
+    return _document_info(db, doc)
+
+
+@app.delete(
+    "/relay/docs/{doc_id}",
+    status_code=204,
+    dependencies=[Depends(require_relay_token)],
+)
+def delete_document_room(doc_id: str, db: Session = Depends(get_db)) -> Response:
+    """End a shared document for everyone: tombstone the room and archive it."""
+    doc = db.get(RelayDocument, doc_id)
+    if doc is None:
+        raise HTTPException(404, "no such document")
+    room = db.get(RelayRoom, doc.room_id)
+    doc.archived = True
+    pushed = False
+    if room is not None and not room.tombstoned:
+        room.tombstoned = True
+        room.bytes_used = 0
+        room.last_activity = datetime.utcnow()
+        db.query(RelayRoomUpdate).filter(RelayRoomUpdate.room_id == room.id).delete(
+            synchronize_session=False
+        )
+        db.query(RelayRoomSnapshot).filter(RelayRoomSnapshot.room_id == room.id).delete(
+            synchronize_session=False
+        )
+        pushed = True
+    db.commit()
+    if pushed and _loop is not None:
+        _loop.call_soon_threadsafe(_push_to_room, doc.room_id, {"t": "end"})
+    return Response(status_code=204)
+
+
 @app.post(
     "/relay/rooms/{room_id}/updates",
     status_code=202,
@@ -730,6 +842,33 @@ def post_room_snapshot(
     return Response(status_code=204)
 
 
+# room id -> recent presence frames [(monotonic_ts, base64_blob), ...], newest
+# last. Presence is ephemeral by design (never persisted, never in the DB), but
+# a stream-less peer has no other way to learn who is in the room, so keep a
+# short in-memory tail that `GET /rooms/{id}/presence` can serve. Bounded by
+# both age and count so a busy room cannot grow this without limit.
+PRESENCE_TTL_SECONDS = 20
+PRESENCE_MAX_PER_ROOM = 40
+_room_presence: dict[str, list[tuple[float, str]]] = {}
+
+
+def _remember_presence(room_id: str, b64: str) -> None:
+    now = time.monotonic()
+    tail = [e for e in _room_presence.get(room_id, []) if now - e[0] < PRESENCE_TTL_SECONDS]
+    tail.append((now, b64))
+    _room_presence[room_id] = tail[-PRESENCE_MAX_PER_ROOM:]
+
+
+def _recent_presence(room_id: str) -> list[str]:
+    now = time.monotonic()
+    tail = [e for e in _room_presence.get(room_id, []) if now - e[0] < PRESENCE_TTL_SECONDS]
+    if tail:
+        _room_presence[room_id] = tail
+    else:
+        _room_presence.pop(room_id, None)
+    return [b64 for _ts, b64 in tail]
+
+
 @app.post(
     "/relay/rooms/{room_id}/presence",
     status_code=202,
@@ -749,8 +888,25 @@ async def post_room_presence(
     if len(raw) > 64 * 1024:
         raise HTTPException(413, "presence too large")
     b64 = base64.b64encode(raw).decode("ascii")
+    _remember_presence(room_id, b64)
     _push_to_room(room_id, {"t": "p", "blob": b64}, skip_sid=sender)
     return JSONResponse({}, status_code=202)
+
+
+@app.get(
+    "/relay/rooms/{room_id}/presence",
+    dependencies=[Depends(require_relay_token)],
+)
+async def get_room_presence(room_id: str) -> JSONResponse:
+    """Recent presence blobs for peers that cannot hold a stream.
+
+    Presence is push-only over the stream, so a client whose stream was
+    refused (room at the slot cap) or silently half-open receives document
+    updates by polling but NEVER learns who else is in the room: no
+    collaborator avatars, and each side can see the other as absent while
+    edits still flow. The blobs stay opaque ciphertext; the relay only
+    timestamps them."""
+    return JSONResponse({"presence": _recent_presence(room_id)})
 
 
 @app.get("/relay/rooms/{room_id}/stream", dependencies=[Depends(require_relay_token)])

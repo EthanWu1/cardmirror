@@ -30,6 +30,7 @@
  * truncate the log and joins stay fast on long sessions.
  */
 
+import type { SharedDocMetadata } from '../../native/index.js';
 import { LoroDoc, VersionVector, decodeImportBlobMeta } from 'loro-crdt';
 import type { Node as PMNode } from 'prosemirror-model';
 import type { Plugin } from 'prosemirror-state';
@@ -47,6 +48,7 @@ import {
   importRoomKey,
 } from './collab-crypto.js';
 import { RoomsClient, RoomsError, RoomStream, type RoomUpdate } from './room-client.js';
+import { seedLoroDoc } from './collab-seed.js';
 
 type SyncDoc = Parameters<typeof LoroSyncPlugin>[0]['doc'];
 
@@ -66,6 +68,39 @@ type SyncDoc = Parameters<typeof LoroSyncPlugin>[0]['doc'];
  * a per-build constant can't race anything.
  */
 globalThis.__CM_MOVABLE_LIST__ = compareAppVersions(appVersion, MOVABLE_ROOMS_MIN_VERSION) >= 0;
+
+/** How often to poll for remote updates while the push stream is DOWN. The
+ *  relay still serves REST in that state, so polling keeps the document
+ *  syncing (a few seconds behind) instead of waiting for the slow
+ *  belt-and-suspenders catch-up. */
+/** Outbound debounce: keystrokes inside this window coalesce into one wire
+ *  update. Low enough that a partner sees typing as typing rather than as
+ *  paragraphs landing at once; the coalescing still keeps a fast typist to a
+ *  handful of posts a second. */
+export const DEFAULT_COLLAB_FLUSH_MS = 120;
+
+export const DEGRADED_POLL_MS = 4_000;
+
+/** How often to catch up while the push stream reports CONNECTED.
+ *
+ *  A stream can be "connected" and yet silently deliver nothing — a half-open
+ *  socket (sleep, Wi-Fi handoff, NAT rebind, a proxy that dropped the
+ *  upstream) looks alive to the client indefinitely. Catch-up used to run on
+ *  `catchUpMs` (5 MINUTES) in that state, so a silently-dead stream meant the
+ *  doc simply stopped receiving for minutes mid-round. A catch-up with
+ *  nothing new is one cheap GET returning an empty page, so polling this
+ *  often is affordable insurance. */
+export const HEALTHY_POLL_MS = 5_000;
+
+/** Granularity of the catch-up scheduler. Must DIVIDE both poll intervals
+ *  above, not equal them: the scheduler fires on this period and each branch
+ *  decides whether its own interval has elapsed. A tick equal to one interval
+ *  beats against the other and silently stretches it — a 4s tick gating on a
+ *  5s threshold could only pass every OTHER tick, measured at 8.06s to
+ *  reconverge against a zombie relay. A bare timer callback that decides to
+ *  do nothing costs nothing measurable; the flush timer already runs an order
+ *  of magnitude more often. */
+export const POLL_TICK_MS = 1_000;
 
 export function configTextStyle(doc: LoroDoc): void {
   doc.configTextStyle(
@@ -124,6 +159,10 @@ export interface CollabSessionOptions {
   /** Host compaction cadence: upload an encrypted snapshot every N
    *  posted updates. */
   snapshotEvery?: number;
+  /** Persistent `.cmir` document rooms are DURABLE: they outlive their
+   *  participants, so missing-room responses during reconnect keep retrying
+   *  instead of tearing the editor down. */
+  durableRoom?: boolean;
   /** Self-echo watchdog deadline (see field docs); injectable for tests. */
   echoTimeoutMs?: number;
   /** Delay before the first room-history audit; injectable for tests. */
@@ -144,6 +183,7 @@ export class CollabSession {
   readonly loroDoc: LoroDoc;
   readonly roomId: string;
   readonly role: 'host' | 'participant';
+  readonly durableRoom: boolean;
 
   private readonly client: RoomsClient;
   private readonly key: CryptoKey;
@@ -199,6 +239,12 @@ export class CollabSession {
   private sending = false;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private catchUpTimer: ReturnType<typeof setInterval> | null = null;
+  /** When a catch-up last SUCCEEDED. */
+  private lastCatchUpAt = 0;
+  /** When the scheduler last STARTED a catch-up, success or not. Scheduling
+   *  gates on the ATTEMPT: gating on success would retry at tick rate for as
+   *  long as the relay keeps erroring. */
+  private lastCatchUpTickAt = 0;
   private auditTimer: ReturnType<typeof setInterval> | null = null;
   private auditKickoff: ReturnType<typeof setTimeout> | null = null;
   private sendRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -218,6 +264,10 @@ export class CollabSession {
    *  ?from= on presence posts so the server skips echoing our own
    *  cursor frames back (pure egress savings — the cursor layer drops
    *  own-peer frames anyway). */
+  /** Presence self-echo nonce, per SESSION and deliberately random. It is NOT
+   *  a client identity: the relay uses it only to skip echoing a presence
+   *  frame back to its sender, so two sessions on one machine must not share
+   *  it or each would suppress the other's presence. */
   private readonly streamSid: string = Math.random().toString(36).slice(2, 14);
   /** ROOM-HOLDINGS bookkeeping for the incremental history audit.
    *  The room's content is (verified snapshot) + (update rows above its
@@ -251,10 +301,11 @@ export class CollabSession {
     this.loroDoc = opts.loroDoc;
     this.roomId = opts.roomId;
     this.role = opts.role;
+    this.durableRoom = opts.durableRoom === true;
     this.client = opts.client;
     this.key = opts.key;
     this.callbacks = opts.callbacks ?? {};
-    this.flushMs = opts.flushMs ?? 500;
+    this.flushMs = opts.flushMs ?? DEFAULT_COLLAB_FLUSH_MS;
     this.catchUpMs = opts.catchUpMs ?? 300_000;
     this.backlogNoticeMinBlindMs = opts.backlogNoticeMinBlindMs ?? 60_000;
     this.receiveBatchMs = opts.receiveBatchMs ?? 120;
@@ -274,6 +325,43 @@ export class CollabSession {
 
   /** Start a session on the current document. Uploads the seed state as
    *  update #1 and returns the share code alongside the session. */
+  /** Host a PERSISTENT shared document: a durable room plus the pointer that
+   *  gets written into the `.cmir`, so the file can rejoin the room later from
+   *  any machine that can read it. */
+  static async hostPersistent(opts: {
+    pmDoc: PMNode;
+    client: RoomsClient;
+    callbacks?: CollabSessionCallbacks;
+    flushMs?: number;
+    catchUpMs?: number;
+    minBackoffMs?: number;
+    maxBackoffMs?: number;
+    stallTimeoutMs?: number;
+    snapshotEvery?: number;
+    updateByteLimit?: number;
+  }): Promise<{
+    session: CollabSession;
+    shareCode: string;
+    guestPass: string | null;
+    sharedDoc: SharedDocMetadata;
+  }> {
+    let docId = '';
+    const hosted = await this.hostWithRoom({ ...opts, durableRoom: true }, async () => {
+      const doc = await opts.client.createPersistentDoc();
+      docId = doc.docId;
+      return { roomId: doc.roomId, guestPass: null };
+    });
+    return {
+      ...hosted,
+      sharedDoc: {
+        docId,
+        roomId: hosted.session.roomId,
+        shareCode: hosted.shareCode,
+        createdAt: new Date().toISOString(),
+      },
+    };
+  }
+
   static async host(opts: {
     pmDoc: PMNode;
     client: RoomsClient;
@@ -287,14 +375,45 @@ export class CollabSession {
     snapshotEvery?: number;
     updateByteLimit?: number;
   }): Promise<{ session: CollabSession; shareCode: string; guestPass: string | null }> {
+    return CollabSession.hostWithRoom(opts, () => opts.client.createRoom());
+  }
+
+  /** Shared body of `host` and `hostPersistent`: everything except HOW the
+   *  room is created (a temporary session room vs a durable document room). */
+  private static async hostWithRoom(
+    opts: {
+      pmDoc: PMNode;
+      client: RoomsClient;
+      callbacks?: CollabSessionCallbacks;
+      flushMs?: number;
+      catchUpMs?: number;
+      backlogNoticeMinBlindMs?: number;
+      receiveBatchMs?: number;
+      minBackoffMs?: number;
+      maxBackoffMs?: number;
+      stallTimeoutMs?: number;
+      snapshotEvery?: number;
+      updateByteLimit?: number;
+      durableRoom?: boolean;
+    },
+    createRoom: () => Promise<{ roomId: string; guestPass: string | null }>,
+  ): Promise<{ session: CollabSession; shareCode: string; guestPass: string | null }> {
     const keyBytes = generateRoomKeyBytes();
     const key = await importRoomKey(keyBytes);
-    const { roomId, guestPass } = await opts.client.createRoom();
+    const { roomId, guestPass } = await createRoom();
 
     const loroDoc = new LoroDoc();
     configTextStyle(loroDoc);
-    updateLoroToPmState(loroDoc as SyncDoc, new Map(), EditorState.create({ doc: opts.pmDoc }));
-    loroDoc.commit();
+    // Seeding is the expensive half of starting a session on an already-open
+    // document and its cost is super-linear: measured on a synthetic debate
+    // file, 2000 cards 0.5s / 4000 1.6s / 8000 5.7s, while parsing the same
+    // .cmir stays linear (99ms at 8000) and importing the resulting snapshot
+    // costs ~49ms. Run inline it froze the editor for seconds on a big master
+    // file — indistinguishable from a crash. `seedLoroDoc` moves it to a
+    // worker for documents big enough to be worth the hop, caches the result
+    // by content digest, and imports the snapshot here. Small docs and
+    // worker-less runtimes seed inline, identically.
+    await seedLoroDoc(loroDoc, opts.pmDoc);
 
     const session = new CollabSession({ ...opts, roomId, key, role: 'host', loroDoc });
     const seed = loroDoc.export({ mode: 'snapshot' });
@@ -340,6 +459,8 @@ export class CollabSession {
     minBackoffMs?: number;
     maxBackoffMs?: number;
     updateByteLimit?: number;
+    /** Persistent document rooms are durable; see the constructor option. */
+    durableRoom?: boolean;
   }): Promise<CollabSession> {
     const key = await importRoomKey(opts.keyBytes);
     const loroDoc = new LoroDoc();
@@ -384,6 +505,8 @@ export class CollabSession {
     minBackoffMs?: number;
     maxBackoffMs?: number;
     snapshotEvery?: number;
+    /** Persistent document rooms are durable; see the constructor option. */
+    durableRoom?: boolean;
   }): Promise<CollabSession> {
     const key = await importRoomKey(opts.keyBytes);
     const loroDoc = new LoroDoc();
@@ -457,6 +580,8 @@ export class CollabSession {
       fetchImpl: this.client.opts.fetchImpl,
       roomId: this.roomId,
       sid: this.streamSid,
+      retryMissingRoom: this.durableRoom,
+      retryFullRoom: this.durableRoom,
       minBackoffMs: this.streamOpts.minBackoffMs,
       maxBackoffMs: this.streamOpts.maxBackoffMs,
       callbacks: {
@@ -503,7 +628,30 @@ export class CollabSession {
       this.flush();
       this.checkEcho();
     }, this.flushMs);
-    this.catchUpTimer = setInterval(() => void this.catchUp(), this.catchUpMs);
+    // Adaptive catch-up. With live push working this is only a
+    // belt-and-suspenders heal; with the stream DOWN — most importantly when
+    // the room's stream slots are exhausted and it answers 409 forever — REST
+    // still works, so poll fast and keep the document syncing both ways.
+    this.lastCatchUpTickAt = Date.now();
+    const tick = Math.max(250, Math.min(this.catchUpMs, POLL_TICK_MS));
+    this.catchUpTimer = setInterval(() => {
+      const since = Date.now() - this.lastCatchUpTickAt;
+      if (this.stream?.connected) {
+        // Connected is NOT proof of delivery (see HEALTHY_POLL_MS).
+        if (since >= Math.min(this.catchUpMs, HEALTHY_POLL_MS)) {
+          this.lastCatchUpTickAt = Date.now();
+          void this.catchUp();
+        }
+        return;
+      }
+      if (since < Math.min(this.catchUpMs, DEGRADED_POLL_MS)) return;
+      this.lastCatchUpTickAt = Date.now();
+      void this.catchUp();
+      void this.drainQueue();
+      // Presence is push-only over the stream, so without this a stream-less
+      // peer syncs edits but never sees anyone's avatar.
+      void this.pollPresence();
+    }, tick);
     this.auditKickoff = setTimeout(() => void this.auditRoomHistory(), this.auditDelayMs);
     this.auditTimer = setInterval(() => void this.auditRoomHistory(), 30 * 60_000);
   }
@@ -544,6 +692,44 @@ export class CollabSession {
       /* already gone */
     }
     this.handleEnded();
+  }
+
+  /** Synchronously drop the relay stream and timers for window teardown.
+   *
+   *  `stop()` awaits a flush/drain first, and an unload handler never gets to
+   *  run its continuation — so the SSE connection was left for the OS to reap
+   *  and the relay kept counting it against the room's participant cap. After
+   *  enough quits (or crashes) a room answers 409 "full" to its own owner
+   *  forever, which is what leaves shared files stuck on "reconnecting".
+   *  Persistence has its own pagehide flush, so this only has to free the
+   *  socket. */
+  releaseForUnload(): void {
+    if (this.inboundTimer) {
+      clearTimeout(this.inboundTimer);
+      this.inboundTimer = null;
+    }
+    if (this.flushTimer) clearInterval(this.flushTimer);
+    if (this.catchUpTimer) clearInterval(this.catchUpTimer);
+    if (this.auditTimer) clearInterval(this.auditTimer);
+    if (this.auditKickoff) clearTimeout(this.auditKickoff);
+    if (this.sendRetryTimer) clearTimeout(this.sendRetryTimer);
+    this.flushTimer = this.catchUpTimer = this.auditTimer = null;
+    this.auditKickoff = null;
+    this.sendRetryTimer = null;
+    this.stream?.stop();
+    this.stream = null;
+    this.connected = false;
+  }
+
+  /** Cheap liveness check for focus/visibility events. Unlike restart(), a
+   *  healthy connected stream is left alone (no abort, no traffic); only a
+   *  down stream reconnects — plus a catch-up and queue drain so edits made
+   *  while backgrounded flow immediately rather than on the next timer tick. */
+  ensureLive(): void {
+    if (!this.stream || this.stream.connected) return;
+    this.stream.restart();
+    void this.catchUp();
+    void this.drainQueue();
   }
 
   /** Wake-from-sleep hook. */
@@ -675,6 +861,16 @@ export class CollabSession {
           }
         } catch (err) {
           if (err instanceof RoomsError && (err.status === 410 || err.status === 404)) {
+            if (this.durableRoom) {
+              // A durable document is not over just because the relay says
+              // "no such room" — reconnect and keep the queue.
+              this.connected = false;
+              this.awaitingEcho = null;
+              this.emitStatus();
+              this.stream?.restart();
+              this.scheduleSendRetry();
+              return;
+            }
             // 410 = tombstoned (host ended); 404 = the room itself is gone
             // (relay idle-GC). Both terminal — the stream already treats
             // them identically.
@@ -968,9 +1164,19 @@ export class CollabSession {
       // successful catch-up over plain HTTP must not paint the chip
       // synced while push delivery is still down.
       this.connected = this.stream ? this.stream.connected : true;
+      this.lastCatchUpAt = Date.now();
       this.emitStatus();
     } catch (err) {
       if (err instanceof RoomsError && (err.status === 410 || err.status === 404)) {
+        if (this.durableRoom && !rethrow) {
+          // Same reasoning as the send path: a durable document survives a
+          // missing room. A STRICT initial sync still fails loudly.
+          this.connected = false;
+          this.awaitingEcho = null;
+          this.emitStatus();
+          this.stream?.restart();
+          return;
+        }
         this.handleEnded();
         // A STRICT initial sync (join/first resume tick) must NOT silently
         // succeed on an ended/expired room — otherwise the caller mounts a
@@ -1140,6 +1346,24 @@ export class CollabSession {
   }
 
   // --- compaction ---
+
+  /** Pull presence over REST while the push stream is down. Without this a
+   *  stream-less peer syncs edits but shows no collaborators, and appears
+   *  absent to them — even though its own presence POSTs still land. */
+  private async pollPresence(): Promise<void> {
+    if (this.ended || !this.callbacks.onPresence) return;
+    try {
+      for (const sealed of await this.client.fetchPresence(this.roomId)) {
+        try {
+          this.callbacks.onPresence(await decryptBlob(this.key, sealed));
+        } catch {
+          /* wrong-key or corrupt frame - drop, same as the stream path */
+        }
+      }
+    } catch {
+      /* offline or an older relay - the next tick retries */
+    }
+  }
 
   private async uploadSnapshot(): Promise<void> {
     // NEVER compact over ops that haven't integrated: coversThroughSeq

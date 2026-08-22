@@ -29,6 +29,15 @@
  * dropdown — which edits the same global active-tags filter.
  */
 
+import { type AnchorDescriptor } from './learn-anchor.js';
+import { collectSearchFiles } from './evidence-corpus.js';
+import { indexEvidenceFiles, EVIDENCE_DEFAULT_MAX_ROWS } from './evidence-index.js';
+import {
+  extractEvidenceRows,
+  evidenceSearchText,
+  searchEvidenceRowsAsync,
+  type EvidenceSearchRow,
+} from './file-search.js';
 import type { EditorView } from 'prosemirror-view';
 import { Slice, type Node as PMNode } from 'prosemirror-model';
 import { undo, redo } from 'prosemirror-history';
@@ -403,6 +412,11 @@ export function prewarmQuickCardFiles(): void {
 }
 
 export interface QuickCardSearchOptions {
+  /** 'evidence' opens straight into in-file search across the corpus. */
+  mode?: 'everything' | 'evidence';
+  /** Open `path` and select/scroll to `descriptor`. Supplied by index.ts,
+   *  which owns the active view. */
+  openFileAtDescriptor?: (path: string, name: string, descriptor: AnchorDescriptor) => void;
   view: EditorView | null;
   paneEl: HTMLElement | null;
   /** Trigger a ribbon command by id (the palette's command source). */
@@ -425,6 +439,7 @@ export interface QuickCardSearchOptions {
  *  settings shortcut, a file, or an object within a file. */
 interface PaletteResult {
   source:
+    | 'evidence'
     | 'quickcard'
     | 'dropzone'
     | 'command'
@@ -449,6 +464,10 @@ interface PaletteResult {
   cycleSettingKey?: keyof Settings;
   /** Settings deep-link (settings source). */
   settingsTarget?: SettingsTarget;
+  /** Where in the file this evidence row lives, for open-at-position. */
+  evidenceAnchor?: AnchorDescriptor;
+  evidenceKind?: EvidenceSearchRow['kind'];
+  evidenceFileName?: string;
   /** Absolute path to open (file source). */
   filePath?: string;
   /** File's mtime — the warm-cache freshness key (file source). */
@@ -847,6 +866,82 @@ function fileObjectResult(o: FileObject): PaletteResult {
  *  from 100): the rebuild runs on every keystroke, and nobody scans
  *  past ~50 rows without narrowing the query instead. */
 const RESULT_PAGE_SIZE = 50;
+/** Evidence result window, and the async-scan chunk size. */
+export const EVIDENCE_RESULT_LIMIT = 220;
+/** Rows scanned per event-loop yield during an async evidence search. Each
+ *  yield is a deferred idle callback, so a small chunk over a 200k-row index
+ *  meant thousands of idle hops — seconds of latency — per query. */
+export const EVIDENCE_QUERY_CHUNK_SIZE = 10_000;
+/** Stop indexing past this many rows (memory bound). Mirrors the indexer. */
+export const EVIDENCE_MAX_TOTAL_ROWS = EVIDENCE_DEFAULT_MAX_ROWS;
+
+
+function evidenceKindLabel(kind: EvidenceSearchRow['kind']): string {
+  switch (kind) {
+    case 'pocket': return 'Pocket';
+    case 'hat': return 'Hat';
+    case 'block': return 'Block';
+    case 'tag': return 'Tag';
+    case 'cite': return 'Cite';
+    case 'analytic': return 'Analytic';
+    case 'undertag': return 'Undertag';
+    case 'paragraph':
+    case 'body':
+      return 'Body';
+  }
+}
+
+/** Exported for tests: the headline/meta mapping is the thing that made the
+
+/** Exported for tests: the headline/meta mapping is the thing that made the
+ *  result list look duplicated, so it is worth asserting directly. */
+export function evidenceResult(row: EvidenceSearchRow): PaletteResult {
+  // The row's OWN text is the headline, with the structural label as context
+  // in the meta line. Leading with `label` made every row under one tag render
+  // an identical headline — a card's tag, cite and body rows are three
+  // separate hits, so the tag's text appeared three times and the list looked
+  // full of duplicates. They are distinct rows; they just have to look it.
+  const context = row.label && row.label !== row.text ? ` - ${row.label}` : '';
+  return {
+    source: 'evidence',
+    name: row.text || row.label,
+    meta: `${row.fileName} - ${evidenceKindLabel(row.kind)}${context}`,
+    matchedName: false,
+    snippet: row.snippet,
+    filePath: row.filePath,
+    fileMtimeMs: row.mtimeMs,
+    evidenceAnchor: row.anchor,
+    evidenceKind: row.kind,
+    evidenceFileName: row.fileName,
+  };
+}
+
+/** Yield to idle between scan chunks so typing stays responsive. */
+function idleYield(timeout = 500): Promise<void> {
+  return new Promise((resolve) => scheduleIdle(() => resolve(), timeout));
+}
+
+/** Empty-state text: a null corpus means the scan has not run yet. */
+function emptyCorpusText(fileCount: number | null): string {
+  return fileCount === 0
+    ? 'Scanning your evidence folders — results appear when the first scan finishes.'
+    : 'No evidence files found.';
+}
+
+function evidenceScanBudget(query: string): number {
+  // Always scan the whole indexed set. The OLD behaviour capped a single
+  // short token (<=5 chars) to the first EVIDENCE_SEARCH_SCAN_BUDGET rows —
+  // fine at 50k rows, but after the cap rose to 200k that was ~1% of the
+  // index, and it's the FIRST 1% by file order, so short searches ("cp",
+  // "war", "econ") found almost nothing ("rarely seems to work", field
+  // 2026-07-20). The ranked-bucket search already bounds OUTPUT via the
+  // per-tier result caps, and the async scan yields between chunks, so a
+  // full scan stays responsive without truncating coverage. An empty query
+  // never reaches here (the palette shows a prompt below 2 chars).
+  void query;
+  return Number.POSITIVE_INFINITY;
+}
+
 
 /** Short left-aligned badge for a result row. */
 function badgeText(r: PaletteResult): string {
@@ -868,6 +963,12 @@ function badgeText(r: PaletteResult): string {
       return fileFormat(r.filePath ?? r.name).toUpperCase();
     case 'fileobject':
       return r.fileObjectKind ? FILE_OBJECT_KIND_BADGES[r.fileObjectKind] : 'OBJ';
+    case 'evidence':
+      if (r.evidenceKind === 'tag') return 'TAG';
+      if (r.evidenceKind === 'cite') return 'CITE';
+      if (r.evidenceKind === 'analytic') return 'ANL';
+      if (r.evidenceKind === 'block') return 'BLK';
+      return 'EVD';
   }
 }
 
@@ -897,6 +998,8 @@ function enterVerb(source: PaletteResult['source']): string {
       return 'open';
     case 'file':
       return 'open';
+    case 'evidence':
+      return 'open';
     default:
       return 'insert';
   }
@@ -914,6 +1017,16 @@ class QuickCardSearchUI {
   private view: EditorView | null = null;
   private paneEl: HTMLElement | null = null;
   private runCommand: (id: AnyCommandId) => void = () => {};
+  private openFileAtDescriptor: (path: string, name: string, descriptor: AnchorDescriptor) => void =
+    () => {};
+  private mode: 'everything' | 'evidence' = 'everything';
+  private evidenceRows: EvidenceSearchRow[] | null = null;
+  private evidenceLoading = false;
+  private evidenceIndexProgress: { done: number; total: number } | null = null;
+  private evidenceIndexTruncated = false;
+  private evidenceAsyncToken = 0;
+  private evidenceSearchToken = 0;
+  private evidenceSearchAbort: AbortController | null = null;
   private openFilePath: (path: string, name: string) => void = () => {};
   private transcludeMode = false;
   private docPath: string | null = null;
@@ -1001,6 +1114,18 @@ class QuickCardSearchUI {
     this.paneEl = opts.paneEl;
     this.runCommand = opts.runCommand;
     this.openFilePath = opts.openFilePath;
+    this.openFileAtDescriptor = opts.openFileAtDescriptor ?? (() => {});
+    this.mode = opts.mode ?? 'everything';
+    if (this.mode !== 'evidence') {
+      // Evidence state is per-open; a normal open must not inherit a previous
+      // evidence run's rows or its in-flight tokens.
+      this.evidenceRows = null;
+      this.evidenceLoading = false;
+      this.evidenceIndexProgress = null;
+      this.evidenceIndexTruncated = false;
+      this.evidenceSearchAbort?.abort();
+      this.evidenceSearchAbort = null;
+    }
     this.rePickTarget = opts.rePickTarget ?? null;
     this.transcludeMode = (opts.transcludeMode ?? false) || this.rePickTarget != null;
     this.docPath = opts.docPath ?? null;
@@ -1198,7 +1323,176 @@ class QuickCardSearchUI {
 
   // ── Search + results ──────────────────────────────────────────────
 
+  private runEvidenceSearch(query: string): void {
+    const trimmed = query.trim();
+    const electron = getElectronHost();
+    if (!electron) {
+      this.results = [];
+      this.emptyText = 'Evidence search needs the desktop app.';
+      this.finishSearch();
+      return;
+    }
+    const roots = settings.get('fileSearchRoots');
+    if (!roots.length) {
+      this.results = [];
+      this.emptyText = 'Add a file-search folder in Settings -> General.';
+      this.finishSearch();
+      return;
+    }
+    if (trimmed === '') {
+      this.results = [];
+      this.emptyText = 'Type to search evidence in your file-search folders.';
+      this.finishSearch();
+      return;
+    }
+    if (trimmed.length < 2) {
+      this.results = [];
+      this.emptyText = 'Type at least 2 letters to search evidence.';
+      this.finishSearch();
+      return;
+    }
+    if (this.evidenceRows === null && !this.evidenceLoading) {
+      void this.loadEvidenceRows(electron);
+      this.results = [];
+      this.emptyText = 'Scanning evidence folders...';
+      this.finishSearch();
+      return;
+    }
+    if (this.evidenceRows === null) {
+      if (!this.evidenceLoading) this.loadEvidenceRows(electron);
+      this.results = [];
+      this.emptyText = this.evidenceIndexingText();
+      this.finishSearch();
+      return;
+    }
+    const rows = this.evidenceRows;
+    const searchToken = ++this.evidenceSearchToken;
+    this.evidenceSearchAbort?.abort();
+    const controller = new AbortController();
+    this.evidenceSearchAbort = controller;
+    this.results = [];
+    this.emptyText = this.evidenceLoading
+      ? this.evidenceIndexingText(rows.length > 0)
+      : rows.length
+        ? 'Searching evidence...'
+        : emptyCorpusText(this.evidenceIndexProgress?.total ?? null);
+    this.finishSearch();
+    void searchEvidenceRowsAsync(rows, trimmed, {
+      limit: EVIDENCE_RESULT_LIMIT,
+      maxScannedRows: evidenceScanBudget(trimmed),
+      chunkSize: EVIDENCE_QUERY_CHUNK_SIZE,
+      signal: controller.signal,
+      yieldNow: () => idleYield(0),
+    })
+      .then((matches) => {
+        if (searchToken !== this.evidenceSearchToken || this.evidenceSearchAbort !== controller || !this.root) {
+          return;
+        }
+        this.evidenceSearchAbort = null;
+        this.results = matches.map(evidenceResult);
+        this.emptyText = this.evidenceLoading
+          ? this.evidenceIndexingText(rows.length > 0)
+          : rows.length
+            ? this.evidenceIndexTruncated
+              ? 'No matching evidence. (Very large library — only part of it is indexed.)'
+              : 'No matching evidence.'
+            : emptyCorpusText(this.evidenceIndexProgress?.total ?? null);
+        this.finishSearch();
+      })
+      .catch((err: unknown) => {
+        if (err instanceof Error && err.name === 'AbortError') return;
+        if (searchToken !== this.evidenceSearchToken || this.evidenceSearchAbort !== controller || !this.root) {
+          return;
+        }
+        this.evidenceSearchAbort = null;
+        this.results = [];
+        this.emptyText = rows.length
+          ? 'Could not search evidence.'
+          : emptyCorpusText(this.evidenceIndexProgress?.total ?? null);
+        this.finishSearch();
+      });
+  }
+
+  private evidenceIndexingText(still = false): string {
+    const progress = this.evidenceIndexProgress;
+    const base = still ? 'Still indexing evidence' : 'Indexing evidence';
+    return progress && progress.total > 0
+      ? `${base}... ${Math.min(progress.done, progress.total)}/${progress.total} files`
+      : `${base}...`;
+  }
+
+  private refreshEvidenceEmptyText(): void {
+    if (!this.root || !this.evidenceLoading || this.results.length > 0) return;
+    this.emptyText = this.evidenceIndexingText((this.evidenceRows?.length ?? 0) > 0);
+    const empty = this.resultsEl.querySelector('.pmd-qcs-empty');
+    if (empty) empty.textContent = this.emptyText;
+  }
+
+  private async loadEvidenceRows(
+    electron: NonNullable<ReturnType<typeof getElectronHost>>,
+  ): Promise<void> {
+    this.evidenceLoading = true;
+    this.evidenceIndexTruncated = false;
+    this.evidenceRows = [];
+    const token = ++this.evidenceAsyncToken;
+    // Upstream's palette does not hold the corpus (the file index lives in a
+    // utilityProcess), so build the listing the same way the warmup does.
+    const files = (await collectSearchFiles(electron)).filter((f) => {
+      const format = fileFormat(f.path);
+      return format === 'cmir' || format === 'docx';
+    });
+    if (token !== this.evidenceAsyncToken || !this.root) return;
+    this.evidenceIndexProgress = { done: 0, total: files.length };
+    // Delegate to the shared PARALLEL indexer (worker pool + caches). The
+    // old serial loop — one worker, a 40 ms sleep between every file — was
+    // the "Search Evidence never finishes" bug: pure throttling dwarfed the
+    // parse cost on a real library.
+    void indexEvidenceFiles({
+      files,
+      host: electron,
+      maxTotalRows: EVIDENCE_MAX_TOTAL_ROWS,
+      // Main-thread fallback for environments without Web Workers (jsdom /
+      // tests, defensive). Production Electron uses the worker pool.
+      indexFileOnMain: async (entry, bytes, format, limits) => {
+        // Flows carry no searchable document object; the corpus filter above
+        // already excludes them, so this is a type-level guard.
+        if (format === 'cmflow') return [];
+        const doc = await parseFileDoc(bytes, format);
+        const extracted = extractEvidenceRows(doc, entry, limits);
+        for (const row of extracted) row.searchText ??= evidenceSearchText(row);
+        return extracted;
+      },
+      isAborted: () => token !== this.evidenceAsyncToken || !this.root,
+      onProgress: (rows, done, total) => {
+        if (token !== this.evidenceAsyncToken || !this.root) return;
+        this.evidenceIndexProgress = { done, total };
+        this.evidenceRows = rows;
+        this.refreshEvidenceEmptyText();
+        if (this.input.value.trim().length >= 2) this.runSearch();
+      },
+    })
+      .then((result) => {
+        if (token !== this.evidenceAsyncToken || !this.root) return;
+        this.evidenceRows = result.rows;
+        this.evidenceIndexTruncated = result.truncated;
+        this.evidenceLoading = false;
+        this.evidenceIndexProgress = null;
+        if (this.input.value.trim().length >= 2) this.runSearch();
+      })
+      .catch(() => {
+        if (token !== this.evidenceAsyncToken || !this.root) return;
+        this.evidenceRows = [];
+        this.evidenceLoading = false;
+        this.evidenceIndexProgress = null;
+        if (this.input.value.trim().length >= 2) this.runSearch();
+      });
+  }
+
   private runSearch(): void {
+    if (this.mode === 'evidence') {
+      this.runEvidenceSearch(this.input.value);
+      return;
+    }
     // In-file mode overrides prefix parsing — the raw query searches
     // the dived-into file's objects.
     if (this.inFile) {
@@ -1999,6 +2293,16 @@ class QuickCardSearchUI {
       return;
     }
     // File: close the palette, then open the document. atEnd irrelevant.
+    if (result.source === 'evidence') {
+      const path = result.filePath;
+      const descriptor = result.evidenceAnchor;
+      if (path) recordUsage(path);
+      this.close();
+      if (path && descriptor) {
+        this.openFileAtDescriptor(path, result.evidenceFileName ?? result.name, descriptor);
+      }
+      return;
+    }
     if (result.source === 'file') {
       const path = result.filePath;
       const name = result.name;

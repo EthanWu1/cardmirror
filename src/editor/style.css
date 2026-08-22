@@ -15475,3 +15475,285 @@ body.pmd-multi-doc #collab-chip {
   display: flex;
   gap: 0.4rem;
 }
+
+
+/* ── Tabbed workspace ─────────────────────────────────────────────────
+   Chrome-style tab strip over the three-pane shell's slots/stacks. Gated on
+   body.pmd-tabbed, which multi-pane-shell toggles from the setting. */
+
+body.pmd-tabbed {
+  --tab-strip-height: 2rem;
+}
+
+body.pmd-tabbed.pmd-multi-doc #app {
+  margin-top: calc(var(--ribbon-height) + var(--tab-strip-height));
+  height: calc(100vh - var(--ribbon-height) - var(--tab-strip-height) - var(--status-bar-height));
+}
+
+body.pmd-tabbed .pmd-multi-nav {
+  top: calc(var(--ribbon-height) + var(--tab-strip-height));
+}
+.pmd-tab-strip {
+  position: fixed;
+  top: var(--ribbon-height);
+  left: 0;
+  right: 0;
+  height: var(--tab-strip-height);
+  z-index: 55;
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  padding: 0 0.3rem;
+  /* Match the ribbon above it (same chrome tone + text), so in light mode
+   * it reads as a lighter continuation of the ribbon rather than a heavy
+   * dark bar (it used the darker nav-rail token before). */
+  background: var(--pmd-c-ribbon);
+  border-bottom: 1px solid var(--pmd-c-ribbon-border);
+  color: var(--pmd-c-ribbon-text);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  user-select: none;
+}
+
+.pmd-tab-strip::-webkit-scrollbar {
+  display: none;
+}
+.pmd-tab-seg {
+  display: flex;
+  align-items: stretch;
+  gap: 0.12rem;
+  padding: 0.2rem 0.12rem 0;
+  min-width: 0;
+}
+
+.pmd-tab-strip-split .pmd-tab-seg-focused {
+  background: color-mix(in srgb, var(--pmd-c-accent-soft) 45%, transparent);
+  border-radius: 6px 6px 0 0;
+}
+
+.pmd-tab-seg-badge {
+  align-self: center;
+  flex: 0 0 auto;
+  min-width: 1rem;
+  height: 1rem;
+  margin: 0 0.12rem;
+  border-radius: 3px;
+  font-size: 0.66rem;
+  font-weight: 600;
+  line-height: 1rem;
+  text-align: center;
+  color: var(--pmd-c-ribbon-text);
+  background: color-mix(in srgb, var(--pmd-c-ribbon-text) 14%, transparent);
+  opacity: 0.7;
+}
+
+.pmd-tab-seg-divider {
+  align-self: center;
+  width: 1px;
+  height: 55%;
+  margin: 0 0.25rem;
+  background: var(--pmd-c-ribbon-border);
+  flex: 0 0 auto;
+}
+.pmd-tab {
+  display: flex;
+  align-items: center;
+  gap: 0.28rem;
+  max-width: 12.5rem;
+  min-width: 4rem;
+  padding: 0 0.3rem 0 0.5rem;
+  border: 1px solid transparent;
+  border-bottom: none;
+  /* Top accent bar slot — transparent until active. Keeps the tab height
+   * stable between states (no layout shift on select). */
+  border-top: 2px solid transparent;
+  border-radius: 6px 6px 0 0;
+  font-size: 0.78rem;
+  line-height: 1;
+  /* Ribbon text token so the tab pairs with the (ribbon-toned) strip in BOTH
+   * themes. Deliberately NOT the paper color: the app can run dark chrome over
+   * a light (white paper) document, so a paper-colored tab would be invisible
+   * (verified 2026-07-20). */
+  color: var(--pmd-c-ribbon-text);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 0.1s ease;
+}
+
+.pmd-tab:hover {
+  background: color-mix(in srgb, var(--pmd-c-ribbon-text) 10%, transparent);
+}
+.pmd-tab-active {
+  background: color-mix(in srgb, var(--pmd-c-ribbon-text) 15%, transparent);
+  border-color: var(--pmd-c-ribbon-border);
+  border-top-color: var(--pmd-c-accent, #2563eb);
+  color: var(--pmd-c-ribbon-text);
+  font-weight: 600;
+}
+
+.pmd-tab-active:hover {
+  background: color-mix(in srgb, var(--pmd-c-ribbon-text) 21%, transparent);
+}
+
+.pmd-tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.pmd-tab-dirty {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--pmd-c-accent, #2563eb);
+}
+
+.pmd-tab-dirty[hidden] {
+  display: none;
+}
+
+.pmd-tab-close {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.15rem;
+  height: 1.15rem;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.55;
+}
+
+.pmd-tab-close:hover {
+  opacity: 1;
+  background: color-mix(in srgb, var(--pmd-c-ribbon-text) 18%, transparent);
+}
+
+.pmd-tab-flow .pmd-tab-name {
+  font-style: italic;
+}
+.pmd-tab-dragging {
+  opacity: 0.32;
+}
+
+.pmd-tab-strip-dragging {
+  cursor: grabbing;
+}
+.pmd-tab-drag-proxy {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 120;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  max-width: 13rem;
+  padding: 0.28rem 0.55rem;
+  border-radius: 7px;
+  font-size: 0.78rem;
+  line-height: 1;
+  white-space: nowrap;
+  color: var(--pmd-c-ribbon-text);
+  background: var(--pmd-c-ribbon);
+  border: 1px solid var(--pmd-c-ribbon-border);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(0, 0, 0, 0.06);
+  transform: rotate(-2.5deg) scale(1.03);
+  /* Smooth the pill's own lift-in; position is set imperatively per frame. */
+  transition: transform 0.09s ease, opacity 0.12s ease;
+}
+
+.pmd-tab-drag-proxy .pmd-tab-drag-proxy-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--pmd-c-accent, #2563eb);
+}
+
+.pmd-tab-drag-proxy-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pmd-tab-insert-caret {
+  position: fixed;
+  z-index: 60;
+  width: 2px;
+  border-radius: 2px;
+  pointer-events: none;
+  background: var(--pmd-c-accent, #2563eb);
+  box-shadow: 0 0 4px color-mix(in srgb, var(--pmd-c-accent, #2563eb) 60%, transparent);
+  transition: left 0.05s ease, height 0.05s ease, top 0.05s ease;
+}
+
+.pmd-tab-insert-caret[hidden] {
+  display: none;
+}
+.pmd-tab-drop-zone {
+  position: fixed;
+  z-index: 60;
+  pointer-events: none;
+  transition: left 0.06s ease, width 0.06s ease, top 0.06s ease, height 0.06s ease;
+}
+
+.pmd-tab-drop-zone[data-mode='into'] {
+  border: 2px solid var(--pmd-c-accent, #2563eb);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--pmd-c-accent, #2563eb) 16%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--pmd-c-accent, #2563eb) 40%, transparent) inset;
+}
+
+.pmd-tab-drop-zone[data-mode='split'] {
+  border-radius: 4px;
+  background: var(--pmd-c-accent, #2563eb);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--pmd-c-accent, #2563eb) 70%, transparent);
+}
+
+.pmd-tab-drop-zone[hidden] {
+  display: none;
+}
+.pmd-tab-menu {
+  position: fixed;
+  z-index: 100;
+  min-width: 12rem;
+  padding: 0.25rem;
+  background: var(--pmd-c-surface, #f3f3f3);
+  color: var(--pmd-c-text, #1f2329);
+  border: 1px solid var(--pmd-c-border, #c8c8c8);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.pmd-tab-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0.35rem 0.6rem;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.pmd-tab-menu-item:hover:not(:disabled) {
+  background: var(--pmd-c-accent-soft, #e6efff);
+}
+
+.pmd-tab-menu-item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}

@@ -1401,6 +1401,11 @@ export interface Settings {
    *  page reload to (re)build the editor shell. Comments are
    *  unavailable while this is on. See SPEC-multi-pane.md. */
   multiDocWorkspace: boolean;
+  /** Render the three-pane workspace's slots/stacks as a Chrome-style tab
+   *  strip. Requires `multiDocWorkspace`; off by default while it matures. */
+  tabbedWorkspace: boolean;
+  /** Preset used when Create Flow opens a new native CardMirror Flow doc. */
+  defaultFlowFormat: 'ld' | 'pf' | 'policy';
   /** Which UI shell the web edition uses on this device. `'auto'`
    *  picks the mobile shell on coarse-pointer screens narrower than
    *  1024px (resolved once per load — rotating mid-session doesn't
@@ -1796,6 +1801,8 @@ const DEFAULTS: Settings = {
   googleTranslateApiKey: '',
   prependTranslationMarker: true,
   multiDocWorkspace: false,
+  tabbedWorkspace: false,
+  defaultFlowFormat: 'ld',
   mobileLayout: 'auto',
   multiDocLayoutMode: 'compact',
   quickCardActiveTags: [],
@@ -2041,6 +2048,17 @@ export const SETTING_METADATA: SettingMeta[] = [
     category: 'general',
     section: 'Workspace',
     aliases: ['split view', 'split screen', 'multi pane', 'multi-doc'],
+  },
+  {
+    key: 'tabbedWorkspace',
+    label: 'Tabbed workspace (preview)',
+    description:
+      'Show your open documents as a Chrome-style tab strip below the ribbon. Requires the three-pane workspace. Preview: click a tab to switch, x to close, drag to reorder.',
+    kind: 'toggle',
+    category: 'general',
+    section: 'Workspace',
+    dependsOn: 'multiDocWorkspace',
+    aliases: ['tabs', 'tab bar', 'tab strip', 'chrome tabs'],
   },
   {
     key: 'multiDocLayoutMode',
@@ -4508,6 +4526,9 @@ function sanitize(s: Settings): Settings {
       typeof s.googleTranslateApiKey === 'string' ? s.googleTranslateApiKey.trim() : '',
     prependTranslationMarker: s.prependTranslationMarker === false ? false : true,
     multiDocWorkspace: !!s.multiDocWorkspace,
+    tabbedWorkspace: !!s.tabbedWorkspace,
+    defaultFlowFormat:
+      s.defaultFlowFormat === 'pf' || s.defaultFlowFormat === 'policy' ? s.defaultFlowFormat : 'ld',
     mobileLayout:
       s.mobileLayout === 'mobile' || s.mobileLayout === 'desktop'
         ? s.mobileLayout
