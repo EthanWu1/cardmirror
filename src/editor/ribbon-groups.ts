@@ -18,7 +18,9 @@ export interface RibbonGroup {
 export const RIBBON_GROUPS: RibbonGroup[] = [
   {
     title: 'File',
-    commands: ['newDocument', 'openFile', 'save', 'saveAs', 'saveSendDoc', 'saveMarkedCards', 'toggleAutosave', 'goHome'],
+    commands: ['newDocument', 'openFile', 'save', 'saveAs', 'saveSendDoc', 'saveMarkedCards', 'toggleAutosave', 'goHome',
+      'recoverPreviousVersion',
+    ],
   },
   {
     title: 'Speech',
@@ -45,10 +47,9 @@ export const RIBBON_GROUPS: RibbonGroup[] = [
       'collabStartSession',
       'collabJoinSession',
       'collabCopyShareCode',
-      'collabCopyInviteLink',
       'collabInviteStarred',
       'collabEndSession',
-      'recoverPreviousVersion',
+      'collabCopyInviteLink',
     ],
   },
   {
@@ -173,12 +174,12 @@ export const RIBBON_GROUPS: RibbonGroup[] = [
     commands: [
       'toggleReadMode',
       'toggleNavPane',
-      'toggleMorphMode',
       'wordCountSelection',
       'openSettings',
       'cycleTheme',
-      'minimizeWindow',
       'openShortcutsReference',
+      'toggleMorphMode',
+      'minimizeWindow',
       'startUiTour',
     ],
   },
@@ -209,7 +210,9 @@ export const RIBBON_GROUPS: RibbonGroup[] = [
   },
   {
     title: 'Diagnostics',
-    commands: ['openDevConsole', 'openJournalsFolder'],
+    commands: ['openDevConsole',
+      'openJournalsFolder',
+    ],
   },
   {
     title: 'Comments',
@@ -244,15 +247,25 @@ export const RIBBON_GROUPS: RibbonGroup[] = [
   {
     title: 'Flow',
     commands: [
+      'createFlow',
+      'addAffFlow',
+      'addNegFlow',
+      'openFlow',
+      'flowSaveNow',
+      'flowFind',
+      'importFlowlineJson',
+      'exportFlowlineJson',
+    ],
+  },
+  {
+    title: 'Legacy Excel Flow Bridge',
+    commands: [
       'sendToFlowColumn',
       'sendToFlowCell',
       'sendHeadingsToFlowColumn',
       'sendHeadingsToFlowCell',
       'pullFromFlow',
-      'createFlow',
       'createLegacyExcelFlow',
-      'addAffFlow',
-      'addNegFlow',
       'startFlowHost',
     ],
   },

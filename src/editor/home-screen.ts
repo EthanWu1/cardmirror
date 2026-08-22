@@ -3,10 +3,9 @@
  *
  * A full-window view shown when the app launches without a
  * document, when the last open doc is closed, or via the Home
- * affordance in the chrome. Offers the primary entry points —
- * New document, New speech document, Open — plus recently opened
- * files, utility groups (Clean / Convert / Compress / Quick
- * Cards), and the Learn section (spaced-repetition review).
+ * affordance in the chrome. Keeps the start surface close to Word:
+ * a small sidebar with primary actions, a file search box, recent
+ * files, and active collaboration sessions.
  *
  * Visibility is driven by the `pmd-home-active` class on
  * `documentElement`: CSS hides the ribbon / nav pane / editor /
@@ -24,11 +23,15 @@ import {
   clearRecents,
   type RecentFile,
 } from './recents-store.js';
-import { learnStore, localToday } from './learn-store-host.js';
-import { getElectronHost } from './host/index.js';
-import { openLearnSession } from './learn-session-ui.js';
-import { openLearnManage } from './learn-manage-ui.js';
-import type { Scope } from './learn-store.js';
+import {
+  baseName,
+  dirName,
+  fileFormat,
+  searchFiles,
+  stripFileExt,
+  makeFileEntry,
+  type FileEntry,
+} from './file-search.js';
 import { isAnyOverlayOpen } from './overlay-stack.js';
 import { isEditableTarget } from './editable-target.js';
 import { collabEnabled } from './collab/collab-gate.js';
@@ -42,15 +45,30 @@ import { endRoomOnRelay } from './collab/collab-relay.js';
 import { promptForRouteChoice } from './text-prompt.js';
 import { showToast } from './toast.js';
 
+export interface HomeSearchListing {
+  path: string;
+  relPath: string;
+  mtimeMs: number;
+  size?: number;
+}
+
 export interface HomeScreenCallbacks {
   newDoc: () => void;
+  /** Kept for older callers; no longer shown on the home screen. */
   newSpeechDoc: () => void;
+  /** Create a native Flow workspace. */
+  newFlow: () => void;
   open: () => void;
   /** Reopen a recent file in-place. The renderer reads the
    *  handle, mounts the doc, and prunes the entry on failure. */
   openRecent: (recent: RecentFile) => void;
   /** Open the Quick Cards manage overlay. */
   manageQuickCards: () => void;
+  /** Open a listed file by absolute path. */
+  openFilePath?: (path: string, name: string) => void;
+  /** List searchable `.docx` / `.cmir` files. Electron supplies the
+   *  cached recursive folder index; tests can inject a small list. */
+  listSearchFiles?: () => Promise<HomeSearchListing[]>;
   /** Open the .docx style cleaner. Electron-only (recursive folder I/O +
    *  write-to-path), like bulkConvert; omitted on the web edition. */
   clean?: () => void;
@@ -69,118 +87,114 @@ export interface HomeScreenCallbacks {
 class HomeScreen {
   private root!: HTMLDivElement;
   private recentsEl!: HTMLDivElement;
+  private flowsSection!: HTMLElement;
+  private flowsEl!: HTMLDivElement;
   private sessionsSection!: HTMLElement;
   private sessionsEl!: HTMLDivElement;
-  private learnEl!: HTMLDivElement;
   private backBtn!: HTMLButtonElement;
+  private searchInput!: HTMLInputElement;
+  private searchResultsEl!: HTMLDivElement;
+  private searchStatusEl!: HTMLDivElement;
   private callbacks: HomeScreenCallbacks | null = null;
   private unsubscribe: (() => void) | null = null;
   private visible = false;
+  private searchFiles: FileEntry[] | null = null;
+  private searchLoading = false;
+  private searchToken = 0;
   /** Whether the current showing was opened over a live document
    *  (Home button) vs. over a blank starter (launch / close-doc).
    *  Drives the "Back to document" affordance + Esc dismissal. */
   private canReturnToDoc = false;
-  /** Index-aligned action runners for the 1 / 2 / 3 shortcuts. */
+  /** Index-aligned action runners for the numbered home shortcuts. */
   private actionRunners: Array<() => void> = [];
-  private pillDockEl: HTMLDivElement | null = null;
-  private visibilityListeners: Array<(visible: boolean) => void> = [];
-
-  /** Bottom-centered strip on the home overlay that hosts the receive
-   *  pill while home is visible (the pill is re-parented in, so its
-   *  position is the hub's own layout — not wherever the editor layer
-   *  underneath happened to anchor the pill tray). Null before mount. */
-  pillDock(): HTMLElement | null {
-    return this.pillDockEl;
-  }
-
-  /** Notified on every show/hide TRANSITION (not on redundant calls).
-   *  Used to move the receive pill between the editor tray and the
-   *  home dock without home-screen knowing about pairing. */
-  onVisibilityChange(cb: (visible: boolean) => void): void {
-    this.visibilityListeners.push(cb);
-  }
-
-  private notifyVisibility(visible: boolean): void {
-    for (const cb of this.visibilityListeners) cb(visible);
-  }
 
   mount(parent: HTMLElement, callbacks: HomeScreenCallbacks): void {
     this.callbacks = callbacks;
+    this.resetSearch();
 
     this.root = document.createElement('div');
     this.root.className = 'pmd-home-screen';
     this.root.hidden = true;
 
-    this.pillDockEl = document.createElement('div');
-    this.pillDockEl.className = 'pmd-home-pill-dock';
-    this.root.appendChild(this.pillDockEl);
-
     const inner = document.createElement('div');
     inner.className = 'pmd-home-inner';
     this.root.appendChild(inner);
 
-    const header = document.createElement('header');
-    header.className = 'pmd-home-header';
-    // "Back to document" — only meaningful when home was opened
-    // over a live doc (Home button). Hidden otherwise.
+    const shell = document.createElement('div');
+    shell.className = 'pmd-home-shell';
+    inner.appendChild(shell);
+
+    const sidebar = document.createElement('aside');
+    sidebar.className = 'pmd-home-sidebar';
+    shell.appendChild(sidebar);
+
+    // "Back to document" is only meaningful when home opened over a live doc.
     this.backBtn = document.createElement('button');
     this.backBtn.type = 'button';
-    this.backBtn.className = 'pmd-home-back';
-    this.backBtn.textContent = '← Back to document';
+    this.backBtn.className = 'pmd-home-back pmd-home-back-small';
+    this.backBtn.setAttribute('aria-label', 'Back to document');
+    const backArrow = document.createElement('span');
+    backArrow.className = 'pmd-home-back-arrow';
+    backArrow.setAttribute('aria-hidden', 'true');
+    backArrow.textContent = '←';
+    this.backBtn.appendChild(backArrow);
+    const backLabel = document.createElement('span');
+    backLabel.className = 'pmd-home-back-label';
+    backLabel.textContent = 'Back to document';
+    this.backBtn.appendChild(backLabel);
     this.backBtn.hidden = true;
     this.backBtn.addEventListener('click', () => this.hide());
-    header.appendChild(this.backBtn);
-    const title = document.createElement('h1');
-    title.className = 'pmd-home-title';
-    title.textContent = 'CardMirror';
-    header.appendChild(title);
-    const tagline = document.createElement('p');
-    tagline.className = 'pmd-home-tagline';
-    tagline.textContent = 'Open a document to start, or pick up where you left off.';
-    header.appendChild(tagline);
-    inner.appendChild(header);
+    sidebar.appendChild(this.backBtn);
 
-    // Number-key actions: the 1..N shortcuts (see onKeyDown), in reading
-    // order down the page — 1-3 primary action cards, then the utilities
-    // that are actually present. The array is built to MATCH the rendered
-    // tiles below (same conditions), so the shortcuts REFLOW with them:
-    // e.g. with Bulk Compress gated off, Manage quick cards is 6 (not 7)
-    // and the tiles close the gap. The top three keep stable indices 0-2
-    // (referenced just below when building their cards).
-    const runners: Array<() => void> = [
-      () => this.callbacks?.newDoc(),
-      () => this.callbacks?.newSpeechDoc(),
+    this.actionRunners = [
       () => this.callbacks?.open(),
+      () => this.callbacks?.newDoc(),
+      () => this.callbacks?.manageQuickCards(),
+      () => this.callbacks?.newFlow(),
+      () => this.callbacks?.bulkConvert?.(),
     ];
-    if (callbacks.clean) runners.push(() => this.callbacks?.clean?.());
-    if (callbacks.bulkConvert) runners.push(() => this.callbacks?.bulkConvert?.());
-    if (callbacks.bulkCompress) runners.push(() => this.callbacks?.bulkCompress?.());
-    runners.push(() => this.callbacks?.manageQuickCards());
-    runners.push(() => {
-      if (learnStore.totalCount({ kind: 'all' }) > 0) {
-        openLearnSession({ kind: 'all' }, { title: 'Review — all' });
-      }
-    });
-    // Manage is always reachable — even with zero cards, the user may
-    // want to import flashcards from a file.
-    runners.push(() => openLearnManage());
-    this.actionRunners = runners;
-    const actions = document.createElement('div');
+    const actions = document.createElement('nav');
     actions.className = 'pmd-home-actions';
-    actions.appendChild(
-      this.actionCard('New document', 'Create a new document.', this.actionRunners[0]!),
-    );
-    actions.appendChild(
-      this.actionCard(
-        'New speech document',
-        'Create a new document and designate it as the speech doc.',
-        this.actionRunners[1]!,
-      ),
-    );
-    actions.appendChild(
-      this.actionCard('Open…', 'Browse for a .cmir or .docx file.', this.actionRunners[2]!),
-    );
-    inner.appendChild(actions);
+    actions.setAttribute('aria-label', 'Home actions');
+    actions.appendChild(this.actionCard('OPEN', '', this.actionRunners[0]!, { icon: 'pmd-icon-open' }));
+    actions.appendChild(this.actionCard('NEW', '', this.actionRunners[1]!, { icon: 'pmd-icon-new' }));
+    actions.appendChild(this.actionCard('CARDS', '', this.actionRunners[2]!, { icon: 'pmd-icon-bookmark' }));
+    actions.appendChild(this.actionCard('FLOW', '', this.actionRunners[3]!, { icon: 'pmd-icon-grid' }));
+    actions.appendChild(this.actionCard('CONVERT', '', this.actionRunners[4]!, { icon: 'pmd-icon-reset' }));
+    sidebar.appendChild(actions);
+
+    const main = document.createElement('main');
+    main.className = 'pmd-home-main';
+    shell.appendChild(main);
+
+    const searchSection = document.createElement('section');
+    searchSection.className = 'pmd-home-search-section';
+    const searchLabel = document.createElement('label');
+    searchLabel.className = 'pmd-home-file-search-label';
+    searchSection.appendChild(searchLabel);
+    const searchIcon = document.createElement('span');
+    searchIcon.className = 'pmd-icon pmd-icon-search pmd-home-file-search-icon';
+    searchIcon.setAttribute('aria-hidden', 'true');
+    searchLabel.appendChild(searchIcon);
+    this.searchInput = document.createElement('input');
+    this.searchInput.type = 'search';
+    this.searchInput.className = 'pmd-home-file-search-input';
+    this.searchInput.placeholder = 'Search everything';
+    this.searchInput.setAttribute('aria-label', 'Search everything');
+    this.searchInput.autocomplete = 'off';
+    searchLabel.appendChild(this.searchInput);
+    this.searchStatusEl = document.createElement('div');
+    this.searchStatusEl.className = 'pmd-home-search-status';
+    searchSection.appendChild(this.searchStatusEl);
+    this.searchResultsEl = document.createElement('div');
+    this.searchResultsEl.className = 'pmd-home-search-results';
+    searchSection.appendChild(this.searchResultsEl);
+    this.searchInput.addEventListener('focus', () => this.ensureSearchLoaded());
+    this.searchInput.addEventListener('input', () => {
+      this.ensureSearchLoaded();
+      this.renderSearch();
+    });
+    main.appendChild(searchSection);
 
     // Recent files.
     const recentsSection = document.createElement('section');
@@ -203,7 +217,7 @@ class HomeScreen {
     this.recentsEl = document.createElement('div');
     this.recentsEl.className = 'pmd-home-recents';
     recentsSection.appendChild(this.recentsEl);
-    inner.appendChild(recentsSection);
+    main.appendChild(recentsSection);
 
     // Collaboration sessions — a DEDICATED section right below Recent,
     // deliberately NOT merged into the recents list: normal doc churn
@@ -221,97 +235,31 @@ class HomeScreen {
     this.sessionsEl = document.createElement('div');
     this.sessionsEl.className = 'pmd-home-sessions';
     this.sessionsSection.appendChild(this.sessionsEl);
-    inner.appendChild(this.sessionsSection);
+    main.appendChild(this.sessionsSection);
 
-    // Utilities — below Recent. Each is its own labeled group (heading
-    // + button) sitting side by side in a card-width grid. Order:
-    // Clean, Convert, Compress (gated), Quick Cards, Learn — the same
-    // order as the number-key runners above, so the two stay in sync and
-    // reflow together: with Compress gated off, Quick Cards takes its
-    // slot and the shortcuts renumber.
-    const qcSection = document.createElement('section');
-    qcSection.className = 'pmd-home-qc-section';
-    const qcGrid = document.createElement('div');
-    qcGrid.className = 'pmd-home-qc-actions';
-    // Electron does folder-recursive batches; the web edition does one file at a
-    // time, so the copy differs. Both surfaces share the same card.
-    const desktop = getElectronHost() !== null;
-    // Clean — .docx style cleaner.
-    if (callbacks.clean) {
-      qcGrid.appendChild(
-        labeledGroup(
-          'Clean',
-          this.actionCard(
-            'Clean styles',
-            desktop
-              ? 'Clean a .docx file or folder’s styles to the Verbatim standard.'
-              : 'Clean a .docx file’s styles to the Verbatim standard.',
-            () => this.callbacks?.clean?.(),
-          ),
-        ),
-      );
-    }
-    // Bulk convert — its own labeled group.
-    if (callbacks.bulkConvert) {
-      qcGrid.appendChild(
-        labeledGroup(
-          'Convert',
-          this.actionCard(
-            desktop ? 'Bulk convert' : 'Convert',
-            desktop
-              ? 'Batch-convert a file or folder between .docx and .cmir.'
-              : 'Convert a file between .docx and .cmir.',
-            () => this.callbacks?.bulkConvert?.(),
-          ),
-        ),
-      );
-    }
-    // Bulk compress — retired early-alpha migration tool, present only
-    // when the console gate is open (callbacks.bulkCompress supplied).
-    if (callbacks.bulkCompress) {
-      qcGrid.appendChild(
-        labeledGroup(
-          'Compress',
-          this.actionCard(
-            desktop ? 'Bulk compress' : 'Compress',
-            desktop
-              ? 'Shrink every .cmir in a folder (~10× smaller), in place.'
-              : 'Shrink a .cmir file (~10× smaller).',
-            () => this.callbacks?.bulkCompress?.(),
-          ),
-        ),
-      );
-    }
-    qcGrid.appendChild(
-      labeledGroup(
-        'Quick Cards',
-        this.actionCard(
-          'Manage quick cards',
-          'Browse, edit, import, and export your reusable snippets.',
-          () => this.callbacks?.manageQuickCards(),
-        ),
-      ),
-    );
-    // Learn — spaced-repetition review, a two-column group to the right
-    // of Quick Cards so the utilities fill two rows: Clean / Convert /
-    // Compress, then Quick Cards / Learn. Content is rebuilt from the
-    // learn store (due counts per scope) on store changes + each show.
-    this.learnEl = document.createElement('div');
-    this.learnEl.className = 'pmd-home-learn';
-    const learnGroup = labeledGroup('Learn', this.learnEl);
-    learnGroup.classList.add('pmd-home-labeled-learn');
-    qcGrid.appendChild(learnGroup);
-    qcSection.appendChild(qcGrid);
-    inner.appendChild(qcSection);
+    this.flowsSection = document.createElement('section');
+    this.flowsSection.className = 'pmd-home-flows-section';
+    this.flowsSection.hidden = true;
+    const flowsTitle = document.createElement('h2');
+    flowsTitle.className = 'pmd-home-section-title';
+    flowsTitle.textContent = 'Flows';
+    this.flowsSection.appendChild(flowsTitle);
+    this.flowsEl = document.createElement('div');
+    this.flowsEl.className = 'pmd-home-recents pmd-home-flows';
+    this.flowsSection.appendChild(this.flowsEl);
+    main.appendChild(this.flowsSection);
 
     parent.appendChild(this.root);
 
-    this.unsubscribe = subscribeRecents(() => this.renderRecents());
-    learnStore.subscribe(() => this.renderLearn());
+    this.unsubscribe = subscribeRecents(() => {
+      this.renderRecents();
+      this.renderFlowRecents();
+    });
     subscribeSessionRecords(() => void this.renderSessions());
     this.renderRecents();
+    this.renderFlowRecents();
     void this.renderSessions();
-    this.renderLearn();
+    this.renderSearch();
   }
 
   /** Show the home screen. `canReturnToDoc` (default false) is set
@@ -331,13 +279,14 @@ class HomeScreen {
     this.root.hidden = false;
     document.documentElement.classList.add('pmd-home-active');
     document.addEventListener('keydown', this.onKeyDown);
+    this.resetSearch();
     // Recents may have changed since last shown (another window
     // opened a file); re-read. Same for the learn counts (cards may
     // have been created while a doc was open).
     this.renderRecents();
+    this.renderFlowRecents();
     void this.renderSessions();
-    this.renderLearn();
-    this.notifyVisibility(true);
+    this.renderSearch();
   }
 
   hide(): void {
@@ -346,7 +295,6 @@ class HomeScreen {
     this.root.hidden = true;
     document.documentElement.classList.remove('pmd-home-active');
     document.removeEventListener('keydown', this.onKeyDown);
-    this.notifyVisibility(false);
   }
 
   private onKeyDown = (e: KeyboardEvent): void => {
@@ -362,11 +310,8 @@ class HomeScreen {
       this.hide();
       return;
     }
-    // Number keys trigger the actions in `actionRunners`, in the order the
-    // tiles appear — so the mapping reflows when a gated tile (e.g. Bulk
-    // Compress) is absent. Bare keys only — the home screen has no text
-    // inputs to conflict with, but still ignore the chord variants so a
-    // stray modifier doesn't fire an action unexpectedly.
+    // Number keys trigger the sidebar actions: 1 Open, 2 New, 3 Quick Cards, 4 Convert.
+    // Bare keys only. Text fields are already filtered above.
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     const idx = { '1': 0, '2': 1, '3': 2, '4': 3, '5': 4, '6': 5, '7': 6, '8': 7, '9': 8 }[e.key];
     if (idx === undefined) return;
@@ -381,25 +326,44 @@ class HomeScreen {
     return this.visible;
   }
 
+  private resetSearch(): void {
+    this.searchToken++;
+    this.searchFiles = null;
+    this.searchLoading = false;
+    if (this.searchInput) this.searchInput.value = '';
+    this.renderSearch();
+  }
+
   // ---- Rendering ----------------------------------------------------
 
   private actionCard(
     title: string,
     sub: string,
     onClick: () => void,
-    opts?: { disabled?: boolean },
+    opts?: { disabled?: boolean; icon?: string },
   ): HTMLButtonElement {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'pmd-home-action';
+    if (opts?.icon) {
+      const icon = document.createElement('span');
+      icon.className = `pmd-icon ${opts.icon} pmd-home-action-icon`;
+      icon.setAttribute('aria-hidden', 'true');
+      btn.appendChild(icon);
+    }
+    const text = document.createElement('span');
+    text.className = 'pmd-home-action-text';
     const t = document.createElement('span');
     t.className = 'pmd-home-action-title';
     t.textContent = title;
-    btn.appendChild(t);
-    const s = document.createElement('span');
-    s.className = 'pmd-home-action-sub';
-    s.textContent = sub;
-    btn.appendChild(s);
+    text.appendChild(t);
+    if (sub) {
+      const s = document.createElement('span');
+      s.className = 'pmd-home-action-sub';
+      s.textContent = sub;
+      text.appendChild(s);
+    }
+    btn.appendChild(text);
     if (opts?.disabled) {
       btn.classList.add('pmd-home-action-disabled');
       btn.disabled = true;
@@ -409,8 +373,87 @@ class HomeScreen {
     return btn;
   }
 
+  private ensureSearchLoaded(): void {
+    if (this.searchFiles !== null || this.searchLoading) return;
+    if (!this.callbacks?.listSearchFiles) {
+      this.renderSearch();
+      return;
+    }
+    this.searchLoading = true;
+    const token = ++this.searchToken;
+    void this.callbacks
+      .listSearchFiles()
+      .then((list) => {
+        if (token !== this.searchToken) return;
+        this.searchFiles = toFileEntries(list);
+      })
+      .catch(() => {
+        if (token !== this.searchToken) return;
+        this.searchFiles = [];
+      })
+      .finally(() => {
+        if (token !== this.searchToken) return;
+        this.searchLoading = false;
+        this.renderSearch();
+      });
+  }
+
+  private renderSearch(): void {
+    if (!this.searchResultsEl || !this.searchStatusEl) return;
+    this.searchResultsEl.innerHTML = '';
+    const query = this.searchInput?.value.trim() ?? '';
+    if (!this.callbacks?.listSearchFiles || !this.callbacks?.openFilePath) {
+      this.searchStatusEl.textContent = '';
+      return;
+    }
+    if (this.searchLoading) {
+      this.searchStatusEl.textContent = 'Searching...';
+      return;
+    }
+    if (this.searchFiles === null) {
+      this.searchStatusEl.textContent = '';
+      return;
+    }
+    const matched = searchFiles(this.searchFiles, query, 'recency').slice(0, 12);
+    if (matched.length === 0) {
+      this.searchStatusEl.textContent = this.searchFiles.length === 0 ? 'No files found.' : 'No matches.';
+      return;
+    }
+    this.searchStatusEl.textContent = '';
+    for (const file of matched) {
+      this.searchResultsEl.appendChild(this.searchRow(file));
+    }
+  }
+
+  private searchRow(file: FileEntry): HTMLButtonElement {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'pmd-home-search-result';
+    row.title = file.path;
+
+    const fmt = document.createElement('span');
+    fmt.className = `pmd-home-recent-format pmd-home-recent-format-${fileFormat(file.path)}`;
+    fmt.textContent = fileFormat(file.path).toUpperCase();
+    row.appendChild(fmt);
+
+    const name = document.createElement('span');
+    name.className = 'pmd-home-search-name';
+    name.textContent = file.name;
+    row.appendChild(name);
+
+    const dir = document.createElement('span');
+    dir.className = 'pmd-home-search-dir';
+    dir.textContent = dirName(file.relPath);
+    row.appendChild(dir);
+
+    row.addEventListener('click', () => {
+      this.callbacks?.openFilePath?.(file.path, baseName(file.path));
+    });
+    return row;
+  }
+
   private renderRecents(): void {
-    const recents = listRecents();
+    const recents = listRecents().filter((r) => r.format !== 'cmflow');
     this.recentsEl.innerHTML = '';
     if (recents.length === 0) {
       const empty = document.createElement('p');
@@ -424,6 +467,16 @@ class HomeScreen {
     }
   }
 
+  private renderFlowRecents(): void {
+    if (!this.flowsSection || !this.flowsEl) return;
+    const recents = listRecents().filter((r) => r.format === 'cmflow');
+    this.flowsSection.hidden = recents.length === 0;
+    this.flowsEl.innerHTML = '';
+    for (const r of recents) {
+      this.flowsEl.appendChild(this.recentRow(r));
+    }
+  }
+
   /** Rebuild the Sessions section from the collab store. Hidden when
    *  the gate is closed or no records exist; otherwise one row per
    *  persisted session, newest first (the list scrolls via CSS). */
@@ -433,7 +486,7 @@ class HomeScreen {
       this.sessionsSection.hidden = true;
       return;
     }
-    const records = await listSessionRecords();
+    const records = (await listSessionRecords()).filter((r) => r.durableRoom !== true);
     this.sessionsSection.hidden = records.length === 0;
     this.sessionsEl.innerHTML = '';
     for (const r of records) {
@@ -503,6 +556,7 @@ class HomeScreen {
             {
               value: 'end',
               label: 'End Session',
+              tone: 'danger',
               description:
                 'Ends it for every participant — they keep their current copies but can no longer sync or rejoin.',
             },
@@ -536,95 +590,6 @@ class HomeScreen {
     return wrap;
   }
 
-  /** Rebuild the Learn section from the local store: an "all due"
-   *  action card plus a per-file / per-deck breakdown of anything with
-   *  cards due today. Empty when no flashcards exist yet. */
-  private renderLearn(): void {
-    if (!this.learnEl) return;
-    const today = localToday();
-    this.learnEl.innerHTML = '';
-
-    const totalAll = learnStore.totalCount({ kind: 'all' });
-    if (totalAll === 0) {
-      // No cards yet: there's nothing to review, but Manage is still
-      // reachable so the user can import flashcards from a file. Grey
-      // out Review all only — keep Manage live.
-      const actions = document.createElement('div');
-      actions.className = 'pmd-home-learn-actions';
-      actions.appendChild(
-        this.actionCard(
-          'Review all',
-          'No flashcards yet — select text in a document and choose Create Flashcard.',
-          () => {},
-          { disabled: true },
-        ),
-      );
-      actions.appendChild(
-        this.actionCard(
-          'Manage flashcards',
-          'Import flashcards from a file, or browse once you have some.',
-          () => openLearnManage(),
-        ),
-      );
-      this.learnEl.appendChild(actions);
-      return;
-    }
-
-    const dueAll = learnStore.dueCount({ kind: 'all' }, today);
-    const actions = document.createElement('div');
-    actions.className = 'pmd-home-learn-actions';
-    actions.appendChild(
-      this.actionCard(
-        dueAll > 0 ? `Review all due (${dueAll})` : 'Review all',
-        dueAll > 0
-          ? `${dueAll} due · ${totalAll} total`
-          : `All caught up · ${totalAll} total`,
-        () => openLearnSession({ kind: 'all' }, { title: 'Review — all' }),
-      ),
-    );
-    actions.appendChild(
-      this.actionCard(
-        'Manage flashcards',
-        'Browse, edit, suspend, and delete your flashcards by file.',
-        () => openLearnManage(),
-      ),
-    );
-    this.learnEl.appendChild(actions);
-
-    // Per-scope breakdown — only scopes with something due today, to
-    // keep the list short and actionable.
-    const rows: Array<{ label: string; due: number; scope: Scope }> = [];
-    for (const doc of learnStore.listDocs()) {
-      const due = learnStore.dueCount({ kind: 'file', docId: doc.docId }, today);
-      if (due > 0) rows.push({ label: doc.lastName, due, scope: { kind: 'file', docId: doc.docId } });
-    }
-    for (const deck of learnStore.listDecks()) {
-      const due = learnStore.dueCount({ kind: 'deck', deckId: deck.deckId }, today);
-      if (due > 0) rows.push({ label: deck.name, due, scope: { kind: 'deck', deckId: deck.deckId } });
-    }
-    if (rows.length > 0) {
-      rows.sort((a, b) => b.due - a.due);
-      const list = document.createElement('div');
-      list.className = 'pmd-home-learn-rows';
-      for (const r of rows) {
-        const row = document.createElement('button');
-        row.type = 'button';
-        row.className = 'pmd-home-learn-row';
-        const badge = document.createElement('span');
-        badge.className = 'pmd-home-learn-badge';
-        badge.textContent = String(r.due);
-        const name = document.createElement('span');
-        name.className = 'pmd-home-learn-name';
-        name.textContent = stripKnownExt(r.label);
-        name.title = r.label;
-        row.append(badge, name);
-        row.addEventListener('click', () => openLearnSession(r.scope, { title: `Review — ${stripKnownExt(r.label)}` }));
-        list.appendChild(row);
-      }
-      this.learnEl.appendChild(list);
-    }
-  }
-
   private recentRow(recent: RecentFile): HTMLButtonElement {
     const row = document.createElement('button');
     row.type = 'button';
@@ -655,11 +620,7 @@ class HomeScreen {
 
     const path = document.createElement('span');
     path.className = 'pmd-home-recent-path';
-    // The cell truncates on the LEFT (CSS direction: rtl) so the tail —
-    // the folders that actually distinguish the file — stays visible;
-    // LRM guards pin the leading separator, which bidi would otherwise
-    // float to the visual right end. Full path in the row tooltip above.
-    path.textContent = recent.handle ? `\u{200e}${recent.handle}\u{200e}` : '';
+    path.textContent = recent.handle ?? '';
     row.appendChild(path);
 
     if (reopenable) {
@@ -678,22 +639,24 @@ function relativeTime(ts: number): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
-/** A heading stacked above a single action card — used for the
- *  side-by-side Quick Cards / Convert groups so each gets its own
- *  label (like the Quick Cards heading above its button). */
-function labeledGroup(title: string, card: HTMLElement): HTMLDivElement {
-  const group = document.createElement('div');
-  group.className = 'pmd-home-labeled';
-  const h = document.createElement('h2');
-  h.className = 'pmd-home-section-title';
-  h.textContent = title;
-  group.append(h, card);
-  return group;
+function toFileEntries(list: readonly HomeSearchListing[]): FileEntry[] {
+  const byPath = new Map<string, FileEntry>();
+  for (const it of list) {
+    if (!it.path || !it.relPath) continue;
+    if (byPath.has(it.path)) continue;
+    // makeFileEntry also precomputes the lowercased name/dir this tree's
+    // matcher relies on (it lowercased per keystroke before).
+    byPath.set(
+      it.path,
+      makeFileEntry(it.path, it.relPath, Number.isFinite(it.mtimeMs) ? it.mtimeMs : 0),
+    );
+  }
+  return [...byPath.values()];
 }
 
-/** Drop a trailing `.cmir` / `.docx` extension for display. */
+/** Drop a trailing openable extension for display. */
 function stripKnownExt(name: string): string {
-  return name.replace(/\.(cmir|docx)$/i, '');
+  return name.replace(/\.(cmir|docx|cmflow)$/i, '');
 }
 
 export const homeScreen = new HomeScreen();

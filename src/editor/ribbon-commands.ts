@@ -4329,6 +4329,11 @@ export type RibbonCommandId =
   | 'sendHeadingsToFlowCell'
   | 'pullFromFlow'
   | 'createFlow'
+  | 'openFlow'
+  | 'flowSaveNow'
+  | 'flowFind'
+  | 'importFlowlineJson'
+  | 'exportFlowlineJson'
   | 'createLegacyExcelFlow'
   | 'addAffFlow'
   | 'addNegFlow'
@@ -4563,6 +4568,11 @@ export const RIBBON_COMMAND_IDS: RibbonCommandId[] = [
   'sendHeadingsToFlowCell',
   'pullFromFlow',
   'createFlow',
+  'openFlow',
+  'flowSaveNow',
+  'flowFind',
+  'importFlowlineJson',
+  'exportFlowlineJson',
   'createLegacyExcelFlow',
   'addAffFlow',
   'addNegFlow',
@@ -4749,6 +4759,11 @@ export const RIBBON_COMMAND_LABELS: Record<RibbonCommandId, string> = {
   sendHeadingsToFlowCell: 'Send Headings to Flow (single cell)',
   pullFromFlow: 'Pull Selection from Flow',
   createFlow: 'Create Flow',
+  openFlow: 'Open Flow',
+  flowSaveNow: 'Save Flow Now',
+  flowFind: 'Find in Flow',
+  importFlowlineJson: 'Import Flowline JSON',
+  exportFlowlineJson: 'Export Flowline JSON',
   createLegacyExcelFlow: 'Create Excel Flow (Legacy)',
   addAffFlow: 'Add Aff Flow',
   addNegFlow: 'Add Neg Flow',
@@ -5097,6 +5112,11 @@ export const DEFAULT_RIBBON_KEYS: Record<RibbonCommandId, string | string[]> = {
   sendHeadingsToFlowCell: '',
   pullFromFlow: '',
   createFlow: '',
+  openFlow: '',
+  flowSaveNow: '',
+  flowFind: '',
+  importFlowlineJson: '',
+  exportFlowlineJson: '',
   createLegacyExcelFlow: '',
   addAffFlow: '',
   addNegFlow: '',
@@ -5345,6 +5365,11 @@ export interface RibbonContext {
   sendHeadingsToFlowCell: () => void;
   pullFromFlow: () => void;
   createFlow: () => void;
+  openFlow: () => void;
+  flowSaveNow: () => void;
+  flowFind: () => void;
+  importFlowlineJson: () => void;
+  exportFlowlineJson: () => void;
   createLegacyExcelFlow: () => void;
   addAffFlow: () => void;
   addNegFlow: () => void;
@@ -5530,6 +5555,11 @@ const DEFAULT_RIBBON_CONTEXT: RibbonContext = {
   sendHeadingsToFlowCell: () => {},
   pullFromFlow: () => {},
   createFlow: () => {},
+  openFlow: () => {},
+  flowSaveNow: () => {},
+  flowFind: () => {},
+  importFlowlineJson: () => {},
+  exportFlowlineJson: () => {},
   createLegacyExcelFlow: () => {},
   addAffFlow: () => {},
   addNegFlow: () => {},
@@ -5877,6 +5907,36 @@ function commandFor(id: RibbonCommandId, ctx: RibbonContext): Command {
       return (_state, dispatch) => {
         if (!dispatch) return true;
         ctx.addNegFlow();
+        return true;
+      };
+    case 'openFlow':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.openFlow();
+        return true;
+      };
+    case 'flowSaveNow':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.flowSaveNow();
+        return true;
+      };
+    case 'flowFind':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.flowFind();
+        return true;
+      };
+    case 'importFlowlineJson':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.importFlowlineJson();
+        return true;
+      };
+    case 'exportFlowlineJson':
+      return (_state, dispatch) => {
+        if (!dispatch) return true;
+        ctx.exportFlowlineJson();
         return true;
       };
     case 'createFlow':

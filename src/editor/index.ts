@@ -8,7 +8,12 @@
  */
 
 import { createRound, type FlowRound, type FlowSide } from './flow/flow-model.js';
-import { parseFlowFile, parseFlowlineJson, serializeFlowFile } from './flow/flow-file.js';
+import {
+  parseFlowFile,
+  parseFlowlineJson,
+  serializeFlowFile,
+  exportFlowlineJson as serializeFlowlineJson,
+} from './flow/flow-file.js';
 import { createFlowWorkspace, defaultFlowName, type FlowWorkspace } from './flow/flow-workspace.js';
 import {
   flowFormatForFilename,
@@ -1795,6 +1800,21 @@ const ribbonContext: RibbonContext = {
   },
   pullFromFlow: () => {
     if (view) void runPullFromFlow(view);
+  },
+  openFlow: () => {
+    void runOpenNativeFlow();
+  },
+  importFlowlineJson: () => {
+    void runImportFlowlineJson();
+  },
+  exportFlowlineJson: () => {
+    void runExportActiveFlowlineJson();
+  },
+  flowFind: () => {
+    void runFindInActiveFlow();
+  },
+  flowSaveNow: () => {
+    void runSaveFlow();
   },
   createFlow: () => {
     // Native CardMirror Flow. The Excel/Verbatim exporter keeps its own
@@ -6644,6 +6664,9 @@ async function loadFileInPlace(file: {
 }
 
 const homeCallbacks: HomeScreenCallbacks = {
+  newFlow: () => {
+    void runCreateNativeFlow();
+  },
   // Single-doc: load in-place in this window. Multi-pane: hide
   // home and route through the shell flows, which present the
   // slot-routing UI over the now-visible workspace.
@@ -8920,15 +8943,8 @@ if (!BOOT_MOBILE) {
   // the hub's layout, not wherever the editor layer underneath anchored
   // the tray. Re-parenting moves the live node (listeners ride along);
   // the send pill + dropzone stay tray-only, covered by the overlay.
-  if (receivePillEl) {
-    const placeReceivePill = (homeVisible: boolean): void => {
-      const dock = homeScreen.pillDock();
-      if (homeVisible && dock) dock.appendChild(receivePillEl);
-      else if (receivePillEl.parentElement !== pillTray) pillTray.appendChild(receivePillEl);
-    };
-    homeScreen.onVisibilityChange(placeReceivePill);
-    placeReceivePill(homeScreen.isVisible());
-  }
+  // The fork's home screen has no pill dock — the receive pill stays in the
+  // tray, where its own layout puts it.
 }
 
 // Fast Debate Paste integration — subscribe to `external:insert-text`
@@ -10474,6 +10490,105 @@ async function routeOpenedFlowFile(opened: OpenedFile, opts: { forceInPlace?: bo
   return mountOpenedFlowInPlace(opened);
 }
 
+
+const FLOW_OPEN_FILTERS = [
+  { name: 'CardMirror Flow or Flowline JSON', extensions: ['cmflow', 'flowline.json'] },
+  { name: 'CardMirror Flow (.cmflow)', extensions: ['cmflow'] },
+  { name: 'Flowline JSON (.flowline.json)', extensions: ['flowline.json'] },
+];
+
+const FLOWLINE_JSON_SAVE_FILTERS = [
+  { name: 'Flowline JSON (.flowline.json)', extensions: ['flowline.json'] },
+];
+
+async function runOpenNativeFlow(): Promise<boolean> {
+  let opened: OpenedFile | null;
+  try {
+    opened = await getHost().openFile({ filters: FLOW_OPEN_FILTERS });
+  } catch (err) {
+    console.error('Open Flow failed:', err);
+    void alertDialog(`Failed to open Flow: ${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+  if (!opened) return false;
+  return routeOpenedFlowFile(opened);
+}
+
+async function runImportFlowlineJson(): Promise<boolean> {
+  let opened: OpenedFile | null;
+  try {
+    opened = await getHost().openFile({
+      filters: [{ name: 'Flowline JSON (.flowline.json)', extensions: ['flowline.json', 'json'] }],
+    });
+  } catch (err) {
+    console.error('Import Flowline JSON failed:', err);
+    void alertDialog(`Failed to import Flowline JSON: ${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+  if (!opened) return false;
+  if (multiDocActive) {
+    return (await multiDocOnFlowOpen?.(opened)) ?? false;
+  }
+  try {
+    const round = parseFlowlineJson(opened.bytes);
+    if (!(await confirmFlowInPlaceReplacement())) return false;
+    mountActiveFlowWorkspace({
+      round,
+      filename: suggestedFlowSaveName(opened.name),
+      handle: null,
+      format: 'flowline-json',
+      baselineJson: flowBaselineForRound(round),
+      createdAt: round.createdAt,
+    });
+    return true;
+  } catch (err) {
+    console.error('Import Flowline JSON failed:', err);
+    void alertDialog(`Failed to import Flowline JSON: ${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+}
+
+async function runExportActiveFlowlineJson(): Promise<boolean> {
+  const round = activeFlowRound();
+  if (!round) {
+    showToast('Open a Flow before exporting Flowline JSON.');
+    return false;
+  }
+  const filename = (activeFlowFilename ?? defaultFlowName(round.format)).replace(/\.cmflow$/i, '.flowline.json');
+  try {
+    const bytes = new TextEncoder().encode(serializeFlowlineJson(round));
+    const result = await getHost().saveAs(filename, bytes, {
+      filters: FLOWLINE_JSON_SAVE_FILTERS,
+      ...(typeof activeFlowHandle === 'string' && activeFlowHandle ? { nearPath: activeFlowHandle } : {}),
+    });
+    if (!result) return false;
+    flashSaveSuccess();
+    return true;
+  } catch (err) {
+    console.error('Export Flowline JSON failed:', err);
+    void alertDialog(`Flowline JSON export failed: ${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+}
+
+async function runFindInActiveFlow(): Promise<void> {
+  if (!activeFlowWorkspace) {
+    showToast('Open a Flow before searching.');
+    return;
+  }
+  const query = await promptForText({
+    message: 'Find in Flow',
+    placeholder: 'Search text',
+    okLabel: 'Find',
+  });
+  if (query == null) return;
+  activeFlowWorkspace.find(query);
+}
+
+/** The "open a doc" flow. Asks the host for a file, detects format
+ *  from the extension, and routes: multi-doc mode hands off to the
+ *  multi-pane shell (which shows the "send to slot N" picker);
+ *  single-doc mode mounts it as the current view. */
 
 async function runCreateNativeFlow(): Promise<boolean> {
   if (multiDocActive) {

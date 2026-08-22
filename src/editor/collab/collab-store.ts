@@ -46,6 +46,9 @@ export interface PersistedSessionRecord {
   /** VersionVector.encode() covered by snapshot+increments — the
    *  persistence manager diffs from here on the next write. */
   persistedVersion: Uint8Array;
+  /** True for persistent shared `.cmir` document rooms. Older records omit it
+   *  and resume with temporary-room semantics. */
+  durableRoom?: boolean;
   docTitle: string;
   /** Persistent docId of the doc holding this session in THIS window,
    *  when known (stamped once the doc is saved). Lets the open-from-disk

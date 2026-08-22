@@ -345,6 +345,9 @@ export interface RouteChoiceOption<T extends string> {
   /** Optional second line beneath the label (mirrors the Save-dialog's
    *  "Write to the existing file, then close." style). */
   description?: string;
+  /** Optional tone for the button. Destructive actions render red; primary
+   *  actions render accent blue; omitted actions stay neutral gray. */
+  tone?: 'primary' | 'danger';
 }
 
 export interface RouteChoiceOptions<T extends string> {
