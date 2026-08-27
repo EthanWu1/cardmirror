@@ -55,6 +55,17 @@ jobs:
             "@koromix/koffi-darwin-x64@$KOFFI_VER" \
             "@koromix/koffi-darwin-arm64@$KOFFI_VER"
 
+      # Bake the relay URL/token into pairing-build.ts before packaging.
+      # Without this the DMG ships the committed placeholder (empty strings)
+      # and co-editing cannot reach the relay at all — release.yml already
+      # does this, but this workflow did not, so every dmg it produced was
+      # relay-less. No-op when the secrets are unset.
+      - name: Inject the relay token
+        env:
+          PAIRING_RELAY_URL: ${{ secrets.PAIRING_RELAY_URL }}
+          PAIRING_TOKEN: ${{ secrets.PAIRING_TOKEN }}
+        run: node apps/desktop/scripts/inject-relay-token.cjs
+
       - name: Build desktop installer
         # `dist` runs `electron-builder` with no explicit publish
         # flag. electron-builder's default in CI is to try to
