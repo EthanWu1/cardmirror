@@ -38,7 +38,7 @@ import { gzipSync } from 'node:zlib';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { createPairingKeystore, routingId, type PairingKeystore, type SealedBundle } from './pairing-crypto.js';
-import { BUILT_IN_RELAY_TOKEN } from './pairing-build.js';
+import { BUILT_IN_RELAY_TOKEN, BUILT_IN_RELAY_URL } from './pairing-build.js';
 import { RelayStream } from './relay-stream.js';
 import {
   entitlementIfValid,
@@ -75,7 +75,9 @@ const RELAY_CLIENT_ROUTING_HEADER = 'X-CardMirror-Routing';
  *  the token into the artifact. For `desktop:dev` (launched from a shell) the
  *  env var is read directly at runtime. */
 const DEFAULT_RELAY_URL =
-  process.env.PAIRING_RELAY_URL || 'https://scouting-assistant.up.railway.app/relay';
+  process.env.PAIRING_RELAY_URL ||
+  BUILT_IN_RELAY_URL ||
+  'https://scouting-assistant.up.railway.app/relay';
 const DEFAULT_RELAY_TOKEN = process.env.PAIRING_TOKEN || BUILT_IN_RELAY_TOKEN || 'dev-pairing-token';
 
 interface PairingConfig {
