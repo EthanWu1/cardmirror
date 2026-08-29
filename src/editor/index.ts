@@ -6455,6 +6455,25 @@ async function routeOpenedFile(opened: OpenedFile): Promise<void> {
     console.error('Failed to load doc:', err);
     void alertDialog(`Failed to load: ${err instanceof Error ? err.message : err}`);
   }
+
+  // Pay the co-editing seed cost now, while the user is reading, instead
+  // of on the "Start session" click. seedSnapshot caches by content
+  // digest, so this only ever moves the FIRST payment earlier — and on a
+  // big file that payment is seconds (4000 cards measured at ~3s, and the
+  // cost is super-linear). Idle-scheduled and best-effort: if it never
+  // runs, starting a session behaves exactly as before.
+  scheduleIdle(() => {
+    const activeDoc = getActiveView()?.state.doc;
+    if (!activeDoc) return;
+    // Dynamic import on purpose: collab-seed pulls in Loro (and its wasm
+    // chunk). Importing it statically here would drag that into the main
+    // bundle and slow EVERY launch to speed up one click.
+    void import('./collab/collab-seed.js')
+      .then((m) => m.warmSeedCache(activeDoc))
+      .catch(() => {
+        /* warming is best-effort */
+      });
+  }, 4_000);
 }
 
 /** The single-doc mount tail shared by a normal open and a salvage

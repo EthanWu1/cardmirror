@@ -148,3 +148,23 @@ export async function seedLoroDoc(loroDoc: LoroDoc, doc: PMNode): Promise<void> 
   loroDoc.import(await seedSnapshot(doc));
   loroDoc.commit();
 }
+
+/** Seeding a big document costs SECONDS and that cost lands entirely on
+ *  "Start session" — measured on this schema: 500 cards 170ms, 1000 263ms,
+ *  2000 764ms, 4000 2953ms. The cost is super-linear (doubling the document
+ *  roughly quadruples it), so the biggest files are exactly where the wait
+ *  is worst.
+ *
+ *  `seedSnapshot` already caches by content digest, so the second start is
+ *  instant — this just moves that first payment off the click and into idle
+ *  time after the document settles. Fire-and-forget: every failure path is
+ *  swallowed, because a cold cache only means the old (correct) behaviour.
+ *
+ *  Small documents are skipped: they seed inline in well under 100ms and
+ *  aren't cached at all, so warming them would burn CPU for nothing. */
+export function warmSeedCache(doc: PMNode): void {
+  if (doc.nodeSize <= INLINE_SEED_MAX_NODE_SIZE) return;
+  void seedSnapshot(doc).catch(() => {
+    /* warming is best-effort; the real start path reports errors */
+  });
+}
