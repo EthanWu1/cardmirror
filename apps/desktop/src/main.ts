@@ -15,21 +15,7 @@
  *     journals, and auto-update.
  */
 
-import {
-  app,
-  BrowserWindow,
-  Menu,
-  MenuItemConstructorOptions,
-  MessageChannelMain,
-  clipboard,
-  crashReporter,
-  dialog,
-  ipcMain,
-  screen,
-  shell,
-  utilityProcess,
-  session,
-} from 'electron';
+import { BrowserWindow, Menu, MenuItemConstructorOptions, MessageChannelMain, app, clipboard, crashReporter, dialog, ipcMain, nativeTheme, screen, session, shell, utilityProcess } from 'electron';
 import { autoUpdater } from 'electron-updater';
 import { bundlePathFromExe, launchSwapHelper, macBundleSelfUpdatable } from './mac-swap-update.js';
 import { registerVoiceIpc } from './voice/ipc';
@@ -372,6 +358,12 @@ function createWindow(initialDoc?: InitialDocPayload): BrowserWindow {
   const win = new BrowserWindow({
     width: 1400,
     height: 900,
+    // Electron paints an unstyled window WHITE by default, and that ground
+    // shows through until the renderer's CSS lands (and anywhere content
+    // doesn't cover). On a dark-themed app that reads as a white flash and
+    // stray white panels. Match the ground to the OS theme up front; the
+    // renderer still owns the real theming once it boots.
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#1a1a1a' : '#ffffff',
     // Explicit 0×0 minimum: Electron + Chromium will otherwise
     // advertise its own default minimum to the WM (~800×600 on some
     // Linux compositors). Pinning both to 0 advertises "no minimum"
