@@ -217,7 +217,8 @@ export function matchesAllTokens(p: string, s: string, tokens: readonly string[]
  *  Lower is better. Tiers key off the PRIMARY field (a heading's label, a
  *  file's name); a match that only lands in the SECONDARY field (a card's cite,
  *  a file's folder) is the weakest tier, so a primary hit always outranks it.
- *    0 exact · 1 prefix · 2 word-start · 3 substring · 4 secondary-only
+ *    0 exact · 1 prefix · 2 phrase at word-start · 3 phrase · 4 word-start
+ *    scatter · 5 substring scatter · 6 secondary-only
  *  `p` and `s` must already be lowercase — this runs per item per
  *  keystroke over the whole corpus, so callers precompute (files) or
  *  lower in their getter (in-file objects). Tokens contain no
@@ -233,8 +234,11 @@ function matchTier(
   if (!matchesAllTokens(p, s, tokens)) return null;
   if (p === q) return 0;
   if (p.startsWith(q)) return 1;
-  if (tokens.every((tok) => p.includes(tok))) return startsAtWordBoundary(p, t0) ? 2 : 3;
-  return 4;
+  // The query's words appearing TOGETHER, in order, beats the same words
+  // scattered across the field — see matchTierLower for the reasoning.
+  if (p.includes(q)) return startsAtWordBoundary(p, q) ? 2 : 3;
+  if (tokens.every((tok) => p.includes(tok))) return startsAtWordBoundary(p, t0) ? 4 : 5;
+  return 6;
 }
 
 /** Order-independent multi-token AND-match, ranked by relevance tier
@@ -389,10 +393,10 @@ export interface EvidenceSearchRow {
 /** Bare filename from a path/relPath (handles `/` and `\`). */
 
 export function evidenceSearchText(row: EvidenceSearchRow): string {
-  return (
-    row.searchText ??
-    `${row.text.toLowerCase()} ${row.label.toLowerCase()} ${row.fileName.toLowerCase()} ${dirName(row.relPath).toLowerCase()}`
-  );
+  // Memoized onto the row like textLower: this ran four toLowerCase calls
+  // per row per keystroke across the whole corpus before.
+  return (row.searchText ??=
+    `${row.text.toLowerCase()} ${row.label.toLowerCase()} ${row.fileName.toLowerCase()} ${dirName(row.relPath).toLowerCase()}`);
 }
 
 /** Does `tok` begin at a word boundary anywhere in `text` (both lowercased)?
@@ -410,8 +414,16 @@ function matchTierLower(
   if (!tokens.every((tok) => hay.includes(tok))) return null;
   if (p === q) return 0;
   if (p.startsWith(q)) return 1;
-  if (tokens.every((tok) => p.includes(tok))) return startsAtWordBoundary(p, t0) ? 2 : 3;
-  return 4;
+  // PHRASE tiers: the query's words appear together, in order. Without
+  // these, "climate change" in a tag ranked no higher than a 600-word body
+  // that happened to contain "climate" near the top and "change" near the
+  // bottom — and since bodies are long, scattered matches outnumbered real
+  // phrase hits and the results read as random. `p` is whitespace-normalized
+  // (see the textLower memo), so a line break in the source doesn't hide a
+  // phrase from `includes`.
+  if (p.includes(q)) return startsAtWordBoundary(p, q) ? 2 : 3;
+  if (tokens.every((tok) => p.includes(tok))) return startsAtWordBoundary(p, t0) ? 4 : 5;
+  return 6;
 }
 
 function evidenceKindForNode(type: string): EvidenceRowKind | null {
@@ -625,7 +637,7 @@ export function searchEvidenceRows(
 
   const q = tokens.join(' ');
   const t0 = tokens[0]!;
-  const buckets: EvidenceSearchRow[][] = [[], [], [], [], []];
+  const buckets: EvidenceSearchRow[][] = [[], [], [], [], [], [], []];
   const perTierLimit = Number.isFinite(finiteLimit) ? Math.max(finiteLimit * 4, finiteLimit) : Number.POSITIVE_INFINITY;
   for (let index = 0; index < scanLimit; index += 1) {
     const row = rows[index]!;
@@ -634,7 +646,7 @@ export function searchEvidenceRows(
     // query re-lowercase every scanned row's full text — a real regression
     // once `extractEvidenceRows` stopped precomputing it up front (slimmer
     // rows, field bug 2026-07-20).
-    const textLower = (row.textLower ??= row.text.toLowerCase());
+    const textLower = (row.textLower ??= row.text.toLowerCase().replace(/\s+/g, ' '));
     const tier = matchTierLower(textLower, evidenceSearchText(row), tokens, q, t0);
     if (tier === null) continue;
     const bucket = buckets[tier]!;
@@ -715,14 +727,14 @@ export async function searchEvidenceRowsAsync(
 
   const q = tokens.join(' ');
   const t0 = tokens[0]!;
-  const buckets: EvidenceSearchRow[][] = [[], [], [], [], []];
+  const buckets: EvidenceSearchRow[][] = [[], [], [], [], [], [], []];
   const perTierLimit = Number.isFinite(finiteLimit)
     ? Math.max(finiteLimit * 4, finiteLimit)
     : Number.POSITIVE_INFINITY;
   for (let index = 0; index < scanLimit; index += 1) {
     throwIfEvidenceSearchAborted(opts.signal);
     const row = rows[index]!;
-    const textLower = (row.textLower ??= row.text.toLowerCase());
+    const textLower = (row.textLower ??= row.text.toLowerCase().replace(/\s+/g, ' '));
     const tier = matchTierLower(textLower, evidenceSearchText(row), tokens, q, t0);
     if (tier !== null) {
       const bucket = buckets[tier]!;
